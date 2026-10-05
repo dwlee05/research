@@ -632,7 +632,7 @@ def test_slack_manifest_requests_only_needed_scopes():
     assert "socket_mode_enabled: true" in text
     assert "messages_tab_enabled: true" in text
     assert "messages_tab_read_only_enabled: false" in text
-    assert "  name: 비서실 고뭉치" in text and "display_name: gomungchi" in text
+    assert "  name: 비서실 고뭉치" in text and "display_name: moongchi" in text
     assert not any(line.strip() == "user:" for line in lines)  # no user-token scopes
 
 
@@ -652,13 +652,13 @@ def test_slack_manifest_bot_display_name_is_ascii_handle():
     display_name = match.group(1)
     assert display_name.isascii()
     assert re.fullmatch(r"[a-z0-9][a-z0-9._-]*", display_name)
-    assert display_name == "gomungchi"
+    assert display_name == "moongchi"
 
 
-def test_user_facing_slack_texts_use_gomungchi_name_and_handle():
+def test_user_facing_slack_texts_use_moongchi_name_and_handle():
     assert PLACEHOLDER_TEXT == "🗂️ 고뭉치가 확인 중이에요..."
     assert "고뭉치" in CRASH_TEXT
-    assert "/invite @gomungchi" in slack_bot.SLACK_ERROR_HINTS["not_in_channel"]
+    assert "/invite @moongchi" in slack_bot.SLACK_ERROR_HINTS["not_in_channel"]
     assert "@mungchi" not in slack_bot.SLACK_ERROR_HINTS["not_in_channel"]
 
 
