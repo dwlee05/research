@@ -11,7 +11,9 @@ features:
     messages_tab_enabled: true
     messages_tab_read_only_enabled: false
   bot_user:
-    display_name: 비서실 뭉치
+    # display_name은 ASCII여야 합니다. Slack이 여기서 @멘션 핸들(@mungchi)을 만들기 때문입니다.
+    # 앱 이름(display_information.name)은 한글이어도 됩니다.
+    display_name: mungchi
     always_online: true
 oauth_config:
   scopes:

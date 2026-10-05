@@ -54,7 +54,7 @@ SLACK_ERROR_HINTS = {
     "not_authed": "토큰이 없습니다. SLACK_BOT_TOKEN을 확인하세요.",
     "account_inactive": "토큰이 더 이상 유효하지 않습니다. 앱을 다시 설치하고 새 토큰을 받으세요.",
     "token_revoked": "토큰이 취소되었습니다. 앱을 다시 설치하고 새 토큰을 받으세요.",
-    "not_in_channel": "봇이 채널에 없습니다. 채널에서 /invite @비서실 뭉치 로 초대하세요.",
+    "not_in_channel": "봇이 채널에 없습니다. 채널에서 /invite @mungchi 로 초대하세요.",
     "channel_not_found": "채널을 찾을 수 없습니다. SLACK_BRIEF_CHANNEL의 채널 ID를 확인하고, 비공개 채널이면 봇을 먼저 초대하세요.",
     "missing_scope": "앱 권한이 부족합니다. slack_manifest.yaml대로 권한을 주고 앱을 다시 설치하세요.",
     "is_archived": "보관된 채널에는 올릴 수 없습니다.",

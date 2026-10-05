@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import re
 import socket
 import sys
 from datetime import datetime, timezone
@@ -631,8 +632,18 @@ def test_slack_manifest_requests_only_needed_scopes():
     assert "socket_mode_enabled: true" in text
     assert "messages_tab_enabled: true" in text
     assert "messages_tab_read_only_enabled: false" in text
-    assert "name: 비서실 뭉치" in text and "display_name: 비서실 뭉치" in text
+    assert "  name: 비서실 뭉치" in text and "display_name: mungchi" in text
     assert not any(line.strip() == "user:" for line in lines)  # no user-token scopes
+
+
+def test_slack_manifest_bot_display_name_is_ascii_handle():
+    # Slack derives the bot's @handle from display_name and rejects non-ASCII values.
+    text = (Path(__file__).resolve().parents[1] / "slack_manifest.yaml").read_text(encoding="utf-8")
+    match = re.search(r"^\s+display_name:\s*[\"']?([^\"'#\n]*?)[\"']?\s*(?:#.*)?$", text, re.MULTILINE)
+    assert match, "features.bot_user.display_name not found"
+    display_name = match.group(1)
+    assert display_name.isascii()
+    assert re.fullmatch(r"[a-z0-9][a-z0-9._-]*", display_name)
 
 
 # ---------------------------------------------------------------- secrets
