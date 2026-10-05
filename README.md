@@ -1,4 +1,4 @@
-# 뭉치 비서실
+# 고뭉치 비서실
 
 공저자들이 Dropbox와 Overleaf에서 무엇을 했는지, 오늘·내일 일정이 어떤지를 한 번에 챙겨 주는
 연구자용 비서입니다. [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview)
@@ -8,7 +8,7 @@
 
 ```
 사용자 (터미널 · Slack 멘션/DM · cron 브리핑)
- └─ 비서실장 뭉치 ─ main 에이전트. 데이터에 직접 손대지 않고 Agent 도구로 일을 맡김
+ └─ 비서실장 고뭉치 ─ main 에이전트. 데이터에 직접 손대지 않고 Agent 도구로 일을 맡김
      ├─ 업뎃 (updeot) ─ 공저자 업데이트 담당
      │    ├─ check_dropbox_updates  → Dropbox 폴더의 하위 폴더별 변경 + diff
      │    └─ check_overleaf_updates → Overleaf 프로젝트의 공저자 커밋 + diff (git)
@@ -16,15 +16,15 @@
           └─ get_schedule           → ICS 캘린더 (Google·Outlook·iCloud)
 ```
 
-- **뭉치**는 브리핑을 부탁받으면 업뎃과 빠릿에게 **동시에** 일을 맡기고, 두 보고를 합쳐
+- **고뭉치**는 브리핑을 부탁받으면 업뎃과 빠릿에게 **동시에** 일을 맡기고, 두 보고를 합쳐
   ① 공저자 업데이트 ② 일정 ③ 오늘 챙길 것 세 부분으로 된 브리핑을 씁니다.
-  뭉치가 쓸 수 있는 도구는 Agent(하위 에이전트 호출) 하나뿐입니다.
+  고뭉치가 쓸 수 있는 도구는 Agent(하위 에이전트 호출) 하나뿐입니다.
 - **업뎃**은 Dropbox·Overleaf 도구만 씁니다. 사용자 본인의 작업은 빼고 **공저자의 작업만**,
   파일 이름이 아니라 diff를 읽고 "서론 2문단 재작성", "참고문헌 3개 추가"처럼 실제로 한 일을 요약합니다.
 - **빠릿**은 캘린더 도구만 씁니다. 그날과 다음 날 일정, "지금 / 바로 다음 일정", 겹침과 빈 시간을 짧게 보고합니다.
 - 세 도구는 모두 **읽기 전용**이고, 프로그램 안에서 도는 SDK MCP 서버(`mungchi`)로 묶여 있습니다.
 - 모델은 `MUNGCHI_MODEL`(기본 `claude-opus-5-5`)이며, 업뎃·빠릿은 같은 모델을 이어받습니다(`inherit`).
-- 터미널과 Slack은 같은 뭉치를 씁니다. Slack에서 부르는 방법은 아래 [Slack에서 뭉치 부르기](#slack에서-뭉치-부르기)를 보세요.
+- 터미널과 Slack은 같은 고뭉치를 씁니다. Slack에서 부르는 방법은 아래 [Slack에서 고뭉치 부르기](#slack에서-고뭉치-부르기)를 보세요.
 
 ## 설치
 
@@ -48,7 +48,7 @@ Claude 인증은 둘 중 하나면 됩니다.
 
 ## 자격 증명 준비
 
-소스는 필요한 것만 설정해도 됩니다. 설정하지 않은 소스는 뭉치가 "설정 안 됨"과 함께
+소스는 필요한 것만 설정해도 됩니다. 설정하지 않은 소스는 고뭉치가 "설정 안 됨"과 함께
 **빠진 환경변수 이름**을 알려 줍니다.
 
 ### 1. Dropbox
@@ -90,7 +90,7 @@ Claude 인증은 둘 중 하나면 됩니다.
 4. `MY_NAMES`와 `MY_EMAILS`에 Overleaf에 표시되는 내 이름과 이메일을 적습니다(쉼표 구분, 대소문자 무시).
    이 값으로 내 커밋을 걸러 내므로 **둘 중 하나 이상은 꼭** 채워야 합니다.
 
-뭉치는 토큰을 `git -c http.extraHeader=...`로 명령마다 넘기므로 `.git/config`에 토큰이 저장되지 않습니다.
+고뭉치는 토큰을 `git -c http.extraHeader=...`로 명령마다 넘기므로 `.git/config`에 토큰이 저장되지 않습니다.
 받은 프로젝트는 `~/.cache/mungchi/overleaf/<프로젝트ID>`에 보관됩니다(`OVERLEAF_CACHE_DIR`로 변경 가능).
 
 ### 3. 캘린더 (Google 캘린더의 비공개 iCal 주소)
@@ -106,7 +106,7 @@ OAuth 없이 ICS 주소만으로 읽습니다.
 - iCloud: 캘린더 공유 설정의 **공개 캘린더** 링크(`webcal://`도 그대로 쓸 수 있음).
 
 > 비공개 주소는 **비밀번호와 같습니다**. 유출됐다면 같은 화면에서 재설정하세요.
-> 뭉치는 이 주소를 출력이나 오류 메시지에 내보내지 않습니다.
+> 고뭉치는 이 주소를 출력이나 오류 메시지에 내보내지 않습니다.
 
 ## 사용법
 
@@ -121,7 +121,7 @@ python -m mungchi --brief
 python -m mungchi "지난 48시간 동안 공저자들이 Overleaf에서 뭐 고쳤어?"
 python -m mungchi "내일 오후에 비는 시간 있어?"
 
-# Slack 봇 실행 / 오늘 브리핑을 Slack에 올리기 (아래 "Slack에서 뭉치 부르기" 참고)
+# Slack 봇 실행 / 오늘 브리핑을 Slack에 올리기 (아래 "Slack에서 고뭉치 부르기" 참고)
 python -m mungchi slack
 python -m mungchi --brief --slack
 
@@ -130,7 +130,7 @@ python -m mungchi --help
 ```
 
 `pip install -e .`를 했다면 `python -m mungchi` 대신 `mungchi`로 실행해도 됩니다.
-뭉치의 답은 표준 출력(stdout)으로 흘러나오고, `→ 업뎃에게 맡기는 중...` 같은 진행 표시는
+고뭉치의 답은 표준 출력(stdout)으로 흘러나오고, `→ 업뎃에게 맡기는 중...` 같은 진행 표시는
 표준 오류(stderr)로 나옵니다. 그래서 `python -m mungchi --brief > 오늘.md`처럼 브리핑만 파일로 저장할 수 있습니다.
 
 ### 확인 범위
@@ -145,7 +145,7 @@ python -m mungchi --help
 ## 매일 자동으로 받기 (cron)
 
 `crontab -e`로 아래 줄을 추가하면 평일 아침 7시 50분에 브리핑이 Slack 채널에 올라갑니다
-(Slack 설정은 아래 [Slack에서 뭉치 부르기](#slack에서-뭉치-부르기) 참고).
+(Slack 설정은 아래 [Slack에서 고뭉치 부르기](#slack에서-고뭉치-부르기) 참고).
 
 ```cron
 # 시간대는 시스템 기준입니다. git이 PATH에 있어야 Overleaf 확인이 됩니다.
@@ -159,31 +159,38 @@ Slack 없이 파일에 쌓으려면 `--slack`을 빼면 됩니다(브리핑은 �
 - cron에서는 Claude 로그인 정보(키체인)를 못 읽을 수 있으니 `.env`에 `ANTHROPIC_API_KEY`를 넣어 두는 편이 안전합니다.
 - Dropbox는 몇 시간 뒤 만료되는 액세스 토큰 대신 리프레시 토큰 방식을 쓰세요.
 
-## Slack에서 뭉치 부르기
+## Slack에서 고뭉치 부르기
 
-내 Slack 워크스페이스에서 두 가지 방법으로 뭉치를 쓸 수 있습니다.
+내 Slack 워크스페이스에서 두 가지 방법으로 고뭉치를 쓸 수 있습니다.
 
-- **대화형 봇** (`python -m mungchi slack`): 채널에서 `@mungchi`를 멘션하거나 봇에게 DM을 보내면 스레드로 답합니다.
+- **대화형 봇** (`python -m mungchi slack`): 채널에서 `@gomungchi`를 멘션하거나 봇에게 DM을 보내면 스레드로 답합니다.
   같은 스레드에서 이어 물으면 앞 대화를 이어 갑니다. 봇은 내 컴퓨터에서 **Socket Mode**로 돌기 때문에
   공개 URL이나 서버가 필요 없습니다.
 - **브리핑 올리기** (`python -m mungchi --brief --slack`): 오늘 브리핑을 정해 둔 채널에 올립니다(cron용).
 
-> **비용 주의**: 멘션이나 DM 한 번마다 Claude API를 호출합니다(뭉치·업뎃·빠릿 모두 모델 호출).
+> **비용 주의**: 멘션이나 DM 한 번마다 Claude API를 호출합니다(고뭉치·업뎃·빠릿 모두 모델 호출).
 > 동시에 처리하는 요청 수는 `SLACK_MAX_CONCURRENT`(기본 2)로 제한합니다.
 
 ### 1. 매니페스트로 앱 만들기
 
 1. <https://api.slack.com/apps> → **Create New App** → **From an app manifest** → 워크스페이스를 고릅니다.
 2. 저장소의 [`slack_manifest.yaml`](slack_manifest.yaml) 내용을 **YAML** 탭에 붙여 넣고 **Next** → **Create**.
-   앱 이름은 "비서실 뭉치"이고, 권한(bot scope)은 꼭 필요한 다섯 개뿐입니다.
+   앱 이름은 "비서실 고뭉치"이고, 권한(bot scope)은 꼭 필요한 다섯 개뿐입니다.
    - `app_mentions:read`: 채널에서 멘션 받기
    - `chat:write`: 답 올리기와 고치기
    - `im:history`, `im:read`, `im:write`: 봇과의 DM 읽고 쓰기
 
    이벤트는 `app_mention`, `message.im` 두 가지이고, App Home의 **Messages 탭**(DM 보내기)이 켜져 있습니다.
 
-   > Slack에서 앱은 "비서실 뭉치"로 보이지만, 멘션할 때는 `@mungchi`로 부릅니다(봇 `display_name`은 ASCII여야 해서).
-   > 앱 이름까지 거부되면 매니페스트의 `display_information.name`을 `Mungchi`로 바꾸세요.
+   > **Slack에서 보이는 이름과 멘션**
+   > - 앱은 Slack에서 "비서실 고뭉치"로 보입니다.
+   > - 멘션할 때는 `@고뭉치`라고 입력하고 자동완성에서 봇을 고르면 됩니다. 실제 핸들은 `@gomungchi`입니다
+   >   (Slack은 봇 핸들에 ASCII만 허용합니다).
+   > - (선택) App Home → **Your App's Presence in Slack** → **Edit**에서 Display Name을 "고뭉치"로 바꿔 보세요.
+   >   Slack이 받아 주면 멘션도 @고뭉치로 보입니다.
+   > - 이미 `mungchi`로 앱을 만들었다면 다시 만들 필요가 없습니다. **Basic Information** → **Display Information**에서
+   >   앱 이름을 바꾸고, App Home에서 표시 이름을 바꾸세요.
+   > - 채널 초대 예: `/invite @gomungchi`
 
 ### 2. Socket Mode 켜고 앱 토큰(xapp-) 만들기
 
@@ -200,9 +207,9 @@ Slack 없이 파일에 쌓으려면 `--slack`을 빼면 됩니다(브리핑은 �
 
 ### 4. 내 멤버 ID 넣기 (`SLACK_ALLOWED_USER_IDS`)
 
-뭉치는 Dropbox·Overleaf·캘린더의 개인 정보를 읽으므로 **`SLACK_ALLOWED_USER_IDS`에 적힌 사람에게만** 답합니다.
+고뭉치는 Dropbox·Overleaf·캘린더의 개인 정보를 읽으므로 **`SLACK_ALLOWED_USER_IDS`에 적힌 사람에게만** 답합니다.
 이 값이 비어 있으면 봇이 아예 시작하지 않습니다. 다른 사람이 봇을 부르면 스레드에
-"이 봇은 소유자만 사용할 수 있어요"라고 한 번만 답하고, 뭉치는 실행하지 않습니다.
+"이 봇은 소유자만 사용할 수 있어요"라고 한 번만 답하고, 고뭉치는 실행하지 않습니다.
 
 1. Slack에서 내 프로필 사진 → **프로필** → **⋮** → **멤버 ID 복사**.
 2. `U`로 시작하는 값을 `SLACK_ALLOWED_USER_IDS`에 넣습니다. 여러 명이면 쉼표로 구분합니다.
@@ -211,7 +218,7 @@ Slack 없이 파일에 쌓으려면 `--slack`을 빼면 됩니다(브리핑은 �
 
 1. 브리핑을 받을 채널을 엽니다. 나만 보는 **비공개 채널**을 권장합니다.
 2. 채널 이름을 누르면 나오는 창의 맨 아래 **채널 ID**(`C`로 시작)를 복사해 `SLACK_BRIEF_CHANNEL`에 넣습니다.
-3. 그 채널에서 `/invite @mungchi`를 입력해 봇을 초대합니다. 초대하지 않으면 `not_in_channel` 오류가 납니다.
+3. 그 채널에서 `/invite @gomungchi`를 입력해 봇을 초대합니다. 초대하지 않으면 `not_in_channel` 오류가 납니다.
    다른 채널에서 멘션으로 부를 때도 봇이 그 채널에 초대되어 있어야 합니다.
 
 채널 대신 내 멤버 ID(`U…`)를 `SLACK_BRIEF_CHANNEL`에 넣으면 봇과의 DM(앱의 메시지 탭)으로 받습니다.
@@ -222,11 +229,11 @@ Slack 없이 파일에 쌓으려면 `--slack`을 빼면 됩니다(브리핑은 �
 python -m mungchi slack
 ```
 
-- **채널**: `@mungchi 어제 공저자들이 뭐 고쳤어?`라고 쓰면 스레드에 "🗂️ 뭉치가 확인 중이에요..."가 먼저 뜨고,
+- **채널**: `@gomungchi 어제 공저자들이 뭐 고쳤어?`라고 쓰면 스레드에 "🗂️ 고뭉치가 확인 중이에요..."가 먼저 뜨고,
   `→ 업뎃에게 맡기는 중...` 같은 진행 상황으로 바뀌다가 답으로 바뀝니다. 답이 길면 스레드에 나눠 올립니다.
-- **내용 없이 멘션만** 하면(`@mungchi`) 오늘 브리핑을 합니다.
+- **내용 없이 멘션만** 하면(`@gomungchi`) 오늘 브리핑을 합니다.
 - **이어서 묻기**: 같은 스레드에서 다시 멘션하면 앞 대화를 이어 갑니다. 채널에서는 멘션한 메시지만 봇에게
-  전달되므로 스레드 안에서도 `@mungchi`를 붙여야 합니다.
+  전달되므로 스레드 안에서도 `@gomungchi`를 붙여야 합니다.
 - **DM**: 앱의 **메시지** 탭에서 그냥 보내면 됩니다. 답은 보낸 메시지의 스레드로 오고, 그 스레드에 답장하면 이어 갑니다.
 - 스레드와 대화의 연결은 상태 파일과 같은 폴더의 `.mungchi_slack_threads.json`에 최근 200개까지 저장되어,
   봇을 다시 켜도 이어집니다. 대화 기록은 Claude Code가 `~/.claude/projects/` 아래에 폴더별로 저장하므로
@@ -247,7 +254,7 @@ Linux에서 컴퓨터를 켤 때마다 자동으로 실행하려면 systemd 사�
 
 ```ini
 [Unit]
-Description=비서실 뭉치 Slack 봇
+Description=비서실 고뭉치 Slack 봇
 
 [Service]
 WorkingDirectory=/path/to/research
@@ -276,7 +283,7 @@ python -m mungchi --brief --slack
 
 - 첫 메시지에 굵은 제목 "☀️ 오늘의 브리핑 (2026-10-05)"(날짜는 `TIMEZONE` 기준)과 브리핑 본문이 함께 올라가서
   채널에서 바로 읽을 수 있습니다. 본문이 길면(약 3,500자 초과) 나머지는 그 메시지의 스레드에 이어 붙습니다.
-- 봇이 켜져 있으면 그 스레드에서 `@mungchi 첫 번째 항목 자세히 알려줘`처럼 멘션해 브리핑에 이어서 물을 수 있습니다.
+- 봇이 켜져 있으면 그 스레드에서 `@gomungchi 첫 번째 항목 자세히 알려줘`처럼 멘션해 브리핑에 이어서 물을 수 있습니다.
 - 브리핑을 만들지 못하면 채널에 실패 메시지를 올리고, 0이 아닌 종료 코드로 끝납니다(자세한 내용은 cron 로그에 남습니다).
 - `--slack` 없이 `--brief`만 쓰면 예전처럼 터미널(표준 출력)로 나옵니다. cron 설정은 위의 [매일 자동으로 받기](#매일-자동으로-받기-cron)를 보세요.
 
@@ -284,7 +291,7 @@ python -m mungchi --brief --slack
 
 - `[오류] Slack 봇을 시작할 수 없습니다.`: 빠진 환경변수 이름이 함께 나옵니다. `.env`를 채우세요.
 - `invalid_auth`: 토큰이 틀렸거나 `xoxb-`와 `xapp-` 토큰을 서로 바꿔 넣었습니다.
-- `not_in_channel` / `channel_not_found`: 채널 ID를 확인하고 `/invite @mungchi`로 봇을 초대하세요.
+- `not_in_channel` / `channel_not_found`: 채널 ID를 확인하고 `/invite @gomungchi`로 봇을 초대하세요.
 - 멘션해도 아무 반응이 없으면 봇 프로그램이 켜져 있는지, 그 채널에 봇이 초대되어 있는지 확인하세요.
   봇이 꺼져 있을 때 보낸 메시지는 나중에 처리되지 않을 수 있습니다.
 
@@ -292,10 +299,10 @@ python -m mungchi --brief --slack
 
 - 모든 도구는 읽기 전용입니다. Dropbox·Overleaf·캘린더의 내용을 바꾸지 않습니다.
 - 토큰과 비공개 캘린더 주소는 도구 출력·오류 메시지·로그에 나오지 않도록 지웁니다(`***`).
-- 뭉치는 Bash·파일 쓰기 같은 내장 도구를 쓸 수 없고, 데이터 도구도 직접 부를 수 없습니다.
+- 고뭉치는 Bash·파일 쓰기 같은 내장 도구를 쓸 수 없고, 데이터 도구도 직접 부를 수 없습니다.
   업뎃은 Dropbox·Overleaf 도구만, 빠릿은 캘린더 도구만 쓸 수 있습니다(PreToolUse 훅으로 강제).
 - 사용자 설정 파일(`~/.claude/settings.json` 등)은 읽지 않아 도구 구성이 바뀌지 않습니다.
-- Slack 봇은 `SLACK_ALLOWED_USER_IDS`에 있는 사람의 메시지만 뭉치에게 넘기고, 이 값이 비어 있으면 시작하지 않습니다.
+- Slack 봇은 `SLACK_ALLOWED_USER_IDS`에 있는 사람의 메시지만 고뭉치에게 넘기고, 이 값이 비어 있으면 시작하지 않습니다.
   봇 자신이나 다른 봇의 메시지, 수정·입장 같은 시스템 메시지, 중복으로 들어온 이벤트는 무시합니다.
 - Slack에 올리는 오류 메시지에는 오류 종류만 적습니다. 자세한 내용은 봇을 실행한 터미널(표준 오류)에만 남기고,
   Slack 토큰을 포함한 비밀값은 그 로그에서도 지웁니다.
@@ -315,7 +322,7 @@ python -m mungchi --brief --slack
   (cron 출력 파일을 메일로 보내는 식으로 붙일 수 있습니다).
 - Slack 채널에서는 권한을 최소로 하려고 채널 메시지 읽기 권한을 받지 않습니다. 그래서 봇은 멘션한 메시지만 보고,
   스레드의 다른 메시지는 읽지 않습니다.
-- 한 번 실행할 때 뭉치·업뎃·빠릿이 모두 모델을 호출하므로 API 비용이 듭니다. Slack 멘션·DM도 한 번마다 비용이 듭니다.
+- 한 번 실행할 때 고뭉치·업뎃·빠릿이 모두 모델을 호출하므로 API 비용이 듭니다. Slack 멘션·DM도 한 번마다 비용이 듭니다.
 
 ## 개발
 
@@ -335,7 +342,7 @@ src/mungchi/
 ├── main.py            # ClaudeAgentOptions 구성, 한 턴 실행(run_turn), CLI, 출력 스트리밍
 ├── slack_bot.py       # Slack 봇(Socket Mode), 권한 확인, 진행 표시, --brief --slack
 ├── slack_format.py    # Slack용 프롬프트, 멘션 제거, mrkdwn 변환, 메시지 나누기
-├── agents.py          # 뭉치 시스템 프롬프트, 업뎃·빠릿 AgentDefinition, 도구 권한 훅
+├── agents.py          # 고뭉치 시스템 프롬프트, 업뎃·빠릿 AgentDefinition, 도구 권한 훅
 ├── config.py          # 환경변수 읽기, 설정 누락 안내 문구
 ├── state.py           # 마지막 확인 시각(.mungchi_state.json), Slack 스레드↔대화(.mungchi_slack_threads.json)
 └── tools/

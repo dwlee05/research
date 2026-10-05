@@ -10,7 +10,7 @@ from typing import Callable
 # Slack recommends keeping message text well under 4,000 characters.
 MAX_CHUNK_CHARS = 3_500
 
-PLACEHOLDER_TEXT = "🗂️ 뭉치가 확인 중이에요..."
+PLACEHOLDER_TEXT = "🗂️ 고뭉치가 확인 중이에요..."
 BRIEF_HEADER = "☀️ *오늘의 브리핑 ({date})*"
 
 SLACK_FORMAT_PROMPT = """\
@@ -101,7 +101,7 @@ _BOLD_ITALIC_RE = re.compile(r"\*\*\*(?=\S)(.+?)(?<=\S)\*\*\*")
 _BOLD_RE = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*")
 _STRIKE_RE = re.compile(r"~~(?=\S)(.+?)(?<=\S)~~")
 _LINK_RE = re.compile(r"\[([^\[\]\n]+)\]\(((?:https?://|mailto:)[^\s()<>]+)\)")
-# @channel/@here/@everyone pings and user-group pings are never sent by 뭉치.
+# @channel/@here/@everyone pings and user-group pings are never sent by 고뭉치.
 _BROADCAST_RE = re.compile(r"<!(here|channel|everyone)(?:\|[^>]*)?>")
 _SUBTEAM_RE = re.compile(r"<!subteam\^[A-Z0-9]+(?:\|([^>]*))?>")
 

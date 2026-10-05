@@ -1,4 +1,4 @@
-"""CLI entry point: options for 뭉치, the shared turn runner and the terminal front end."""
+"""CLI entry point: options for 고뭉치, the shared turn runner and the terminal front end."""
 
 from __future__ import annotations
 
@@ -104,10 +104,10 @@ def build_options(
     resume: str | None = None,
     extra_system_prompt: str = "",
 ) -> ClaudeAgentOptions:
-    """The single place where 뭉치's options are built (CLI and Slack).
+    """The single place where 고뭉치's options are built (CLI and Slack).
 
     ``resume`` continues an earlier session by id; ``extra_system_prompt`` is
-    appended to 뭉치's system prompt (e.g. Slack formatting rules).
+    appended to 고뭉치's system prompt (e.g. Slack formatting rules).
     """
     tz = config.get_timezone(env)
     now = (now or datetime.now(tz)).astimezone(tz)
@@ -119,8 +119,8 @@ def build_options(
         system_prompt=system_prompt,
         # Built-in tool availability: only the subagent-invocation tool.
         tools=[SUBAGENT_TOOL],
-        # 뭉치's only pre-approved tool. Data tools are approved per subagent
-        # by the PreToolUse hook (``tool_gate``) and denied for 뭉치 itself.
+        # 고뭉치's only pre-approved tool. Data tools are approved per subagent
+        # by the PreToolUse hook (``tool_gate``) and denied for 고뭉치 itself.
         allowed_tools=[SUBAGENT_TOOL],
         disallowed_tools=list(BLOCKED_BUILTINS),
         permission_mode="dontAsk",
@@ -136,7 +136,7 @@ def build_options(
 
 
 class Renderer:
-    """Streams 뭉치's text to ``out`` and short status lines to ``status``.
+    """Streams 고뭉치's text to ``out`` and short status lines to ``status``.
 
     It also records what a non-terminal front end needs: the status lines,
     the answer text, the session id and a short Korean error. With
@@ -213,7 +213,7 @@ class Renderer:
             self._write(delta.get("text", ""))
 
     def _on_assistant(self, message: AssistantMessage) -> None:
-        if message.parent_tool_use_id:  # subagent output reaches the user via 뭉치
+        if message.parent_tool_use_id:  # subagent output reaches the user via 고뭉치
             return
         if message.session_id:
             self.session_id = message.session_id
@@ -280,7 +280,7 @@ async def run_turn(
     extra_system_prompt: str = "",
     renderer: Renderer | None = None,
 ) -> TurnResult:
-    """Run one turn of 뭉치 in a fresh session (or ``resume`` an earlier one).
+    """Run one turn of 고뭉치 in a fresh session (or ``resume`` an earlier one).
 
     Shared by the CLI (one-shot, ``--brief``) and the Slack front end.
     ``on_status`` receives the same status lines the CLI prints, e.g.
@@ -299,7 +299,7 @@ async def run_once(prompt: str) -> int:
 
 async def run_chat(options: ClaudeAgentOptions) -> int:
     # One long-lived client keeps the whole conversation in a single session.
-    print("뭉치 비서실입니다. 무엇을 도와드릴까요? (끝내려면 exit 또는 종료)")
+    print("고뭉치 비서실입니다. 무엇을 도와드릴까요? (끝내려면 exit 또는 종료)")
     async with ClaudeSDKClient(options=options) as client:
         while True:
             try:
@@ -314,7 +314,7 @@ async def run_chat(options: ClaudeAgentOptions) -> int:
                 break
             print()
             await stream_turn(client, prompt, Renderer())
-    print("뭉치: 수고하셨습니다!")
+    print("고뭉치: 수고하셨습니다!")
     return 0
 
 
@@ -332,7 +332,7 @@ class KoreanArgumentParser(argparse.ArgumentParser):
 def build_parser() -> argparse.ArgumentParser:
     parser = KoreanArgumentParser(
         prog="mungchi",
-        description="뭉치 비서실: 업뎃(공저자 업데이트)과 빠릿(일정)에게 일을 맡기는 연구 비서.",
+        description="고뭉치 비서실: 업뎃(공저자 업데이트)과 빠릿(일정)에게 일을 맡기는 연구 비서.",
         epilog=(
             "예시:\n"
             "  python -m mungchi                       # 대화 모드\n"
@@ -342,7 +342,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  python -m mungchi --brief --slack       # 오늘 브리핑을 Slack 채널에 올리기 (cron용)\n"
             "\n"
             "질문 자리에 slack 한 단어만 쓰면 질문이 아니라 Slack 봇 실행 명령으로 처리합니다.\n"
-            "Slack 설정(SLACK_BOT_TOKEN 등)은 README의 'Slack에서 뭉치 부르기'를 보세요."
+            "Slack 설정(SLACK_BOT_TOKEN 등)은 README의 'Slack에서 고뭉치 부르기'를 보세요."
         ),
         formatter_class=KoreanHelpFormatter,
         add_help=False,
@@ -352,7 +352,7 @@ def build_parser() -> argparse.ArgumentParser:
         "question",
         nargs="?",
         metavar="질문",
-        help="뭉치에게 한 번만 물어볼 질문. slack 이라고만 쓰면 Slack 봇을 실행합니다",
+        help="고뭉치에게 한 번만 물어볼 질문. slack 이라고만 쓰면 Slack 봇을 실행합니다",
     )
     opts = parser.add_argument_group("옵션")
     opts.add_argument("--brief", action="store_true", help="오늘 브리핑을 한 번 받고 끝냅니다 (cron용)")
@@ -399,10 +399,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return asyncio.run(run_once(args.question))
         return asyncio.run(run_chat(build_options()))
     except KeyboardInterrupt:
-        print("\n뭉치: 중단했습니다.", file=sys.stderr)
+        print("\n고뭉치: 중단했습니다.", file=sys.stderr)
         return 130
     except Exception as exc:  # noqa: BLE001 - show a clean Korean message, never a token
-        print(f"[오류] 뭉치를 실행하지 못했습니다: {scrub(f'{type(exc).__name__}: {exc}')}", file=sys.stderr)
+        print(f"[오류] 고뭉치를 실행하지 못했습니다: {scrub(f'{type(exc).__name__}: {exc}')}", file=sys.stderr)
         return 1
 
 

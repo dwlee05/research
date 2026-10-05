@@ -462,7 +462,7 @@ def test_slack_command_without_env_prints_korean_error_and_exits_nonzero(monkeyp
     err = capsys.readouterr().err
     assert "[오류] Slack 봇을 시작할 수 없습니다." in err
     assert "빠진 환경변수: SLACK_BOT_TOKEN, SLACK_APP_TOKEN, SLACK_ALLOWED_USER_IDS" in err
-    assert "Slack에서 뭉치 부르기" in err
+    assert "Slack에서 고뭉치 부르기" in err
 
 
 def test_slack_command_refuses_to_start_with_empty_allow_list(monkeypatch, capsys):
@@ -632,8 +632,16 @@ def test_slack_manifest_requests_only_needed_scopes():
     assert "socket_mode_enabled: true" in text
     assert "messages_tab_enabled: true" in text
     assert "messages_tab_read_only_enabled: false" in text
-    assert "  name: 비서실 뭉치" in text and "display_name: mungchi" in text
+    assert "  name: 비서실 고뭉치" in text and "display_name: gomungchi" in text
     assert not any(line.strip() == "user:" for line in lines)  # no user-token scopes
+
+
+def test_slack_manifest_app_name_is_korean_persona():
+    # PyYAML is not a dependency, so read display_information.name with a regex.
+    text = (Path(__file__).resolve().parents[1] / "slack_manifest.yaml").read_text(encoding="utf-8")
+    match = re.search(r"^display_information:\n(?:[ \t]+.*\n)*?[ \t]+name:[ \t]*(.+?)[ \t]*$", text, re.MULTILINE)
+    assert match, "display_information.name not found"
+    assert match.group(1).strip("\"'") == "비서실 고뭉치"
 
 
 def test_slack_manifest_bot_display_name_is_ascii_handle():
@@ -644,6 +652,14 @@ def test_slack_manifest_bot_display_name_is_ascii_handle():
     display_name = match.group(1)
     assert display_name.isascii()
     assert re.fullmatch(r"[a-z0-9][a-z0-9._-]*", display_name)
+    assert display_name == "gomungchi"
+
+
+def test_user_facing_slack_texts_use_gomungchi_name_and_handle():
+    assert PLACEHOLDER_TEXT == "🗂️ 고뭉치가 확인 중이에요..."
+    assert "고뭉치" in CRASH_TEXT
+    assert "/invite @gomungchi" in slack_bot.SLACK_ERROR_HINTS["not_in_channel"]
+    assert "@mungchi" not in slack_bot.SLACK_ERROR_HINTS["not_in_channel"]
 
 
 # ---------------------------------------------------------------- secrets

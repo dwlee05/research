@@ -248,7 +248,7 @@ def calendar_hint(missing: list[str]) -> str:
 # DM ids with D. A member id as the briefing target posts to the app's DM.
 _SLACK_USER_ID_RE = re.compile(r"^[UW][A-Z0-9]{2,}$")
 _SLACK_CHANNEL_ID_RE = re.compile(r"^[CGDUW][A-Z0-9]{2,}$")
-SLACK_README_HINT = "설정 방법은 README의 'Slack에서 뭉치 부르기'를 보세요."
+SLACK_README_HINT = "설정 방법은 README의 'Slack에서 고뭉치 부르기'를 보세요."
 
 
 @dataclass
@@ -295,7 +295,7 @@ def _bot_token_problems(cfg: SlackConfig) -> list[str]:
 def slack_bot_problems(cfg: SlackConfig) -> list[str]:
     """Korean problem lines that keep ``python -m mungchi slack`` from starting.
 
-    An empty allow-list is a hard error: 뭉치 reads private Dropbox, Overleaf
+    An empty allow-list is a hard error: 고뭉치 reads private Dropbox, Overleaf
     and calendar data and must never answer anyone but its owner.
     """
     missing = [
@@ -322,7 +322,7 @@ def slack_bot_problems(cfg: SlackConfig) -> list[str]:
         )
     if not cfg.allowed_user_ids:
         problems.append(
-            "SLACK_ALLOWED_USER_IDS가 비어 있어 봇을 시작하지 않습니다. 뭉치는 Dropbox·Overleaf·캘린더의 "
+            "SLACK_ALLOWED_USER_IDS가 비어 있어 봇을 시작하지 않습니다. 고뭉치는 Dropbox·Overleaf·캘린더의 "
             "개인 정보를 읽기 때문에, 답해도 되는 사람(보통 나 혼자)의 멤버 ID를 쉼표로 구분해 넣어야 합니다."
         )
     return problems

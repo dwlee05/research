@@ -38,9 +38,9 @@ log = logging.getLogger("mungchi.slack")
 RunTurn = Callable[..., Awaitable[TurnResult]]
 
 REFUSAL_TEXT = "죄송하지만 이 봇은 소유자만 사용할 수 있어요."
-EMPTY_ANSWER_TEXT = "뭉치가 빈 답을 보냈어요. 다시 물어봐 주세요."
-FAILED_TEXT = "⚠️ 뭉치가 답을 끝내지 못했어요."
-CRASH_TEXT = "⚠️ 뭉치를 실행하지 못했어요 ({kind}). 잠시 후 다시 시도해 주세요."
+EMPTY_ANSWER_TEXT = "고뭉치가 빈 답을 보냈어요. 다시 물어봐 주세요."
+FAILED_TEXT = "⚠️ 고뭉치가 답을 끝내지 못했어요."
+CRASH_TEXT = "⚠️ 고뭉치를 실행하지 못했어요 ({kind}). 잠시 후 다시 시도해 주세요."
 FRESH_SESSION_NOTE = "이 스레드의 이전 대화는 이어 갈 수 없어서, 다음 메시지부터는 새 대화로 시작해요."
 BRIEF_CRASH_TEXT = "⚠️ 오늘 브리핑을 만들지 못했어요 ({kind}). 실행 로그를 확인해 주세요."
 
@@ -54,7 +54,7 @@ SLACK_ERROR_HINTS = {
     "not_authed": "토큰이 없습니다. SLACK_BOT_TOKEN을 확인하세요.",
     "account_inactive": "토큰이 더 이상 유효하지 않습니다. 앱을 다시 설치하고 새 토큰을 받으세요.",
     "token_revoked": "토큰이 취소되었습니다. 앱을 다시 설치하고 새 토큰을 받으세요.",
-    "not_in_channel": "봇이 채널에 없습니다. 채널에서 /invite @mungchi 로 초대하세요.",
+    "not_in_channel": "봇이 채널에 없습니다. 채널에서 /invite @gomungchi 로 초대하세요.",
     "channel_not_found": "채널을 찾을 수 없습니다. SLACK_BRIEF_CHANNEL의 채널 ID를 확인하고, 비공개 채널이면 봇을 먼저 초대하세요.",
     "missing_scope": "앱 권한이 부족합니다. slack_manifest.yaml대로 권한을 주고 앱을 다시 설치하세요.",
     "is_archived": "보관된 채널에는 올릴 수 없습니다.",
@@ -235,7 +235,7 @@ class StatusUpdater:
 
 
 class SlackHandler:
-    """Turns Slack events into 뭉치 turns and posts the replies in threads."""
+    """Turns Slack events into 고뭉치 turns and posts the replies in threads."""
 
     def __init__(
         self,
@@ -250,7 +250,7 @@ class SlackHandler:
     ):
         self.allowed_user_ids = frozenset(allowed_user_ids)
         if not self.allowed_user_ids:
-            # Never run without an allow-list: 뭉치 reads private data.
+            # Never run without an allow-list: 고뭉치 reads private data.
             raise ValueError("allowed_user_ids must not be empty")
         self.client = client
         self.sessions = sessions
@@ -355,7 +355,7 @@ class SlackHandler:
                 await updater.close()
 
         if result is None:
-            _log_exception("뭉치 실행 중 오류가 났습니다.", crash or RuntimeError("no result"))
+            _log_exception("고뭉치 실행 중 오류가 났습니다.", crash or RuntimeError("no result"))
             reply = CRASH_TEXT.format(kind=type(crash).__name__)
             if resume:
                 # The stored session may be unusable (e.g. its transcript is
@@ -372,7 +372,7 @@ class SlackHandler:
             remember_session(self.sessions, channel, thread_ts, None)
             reply += "\n" + FRESH_SESSION_NOTE
         if result.failed:
-            log.warning("뭉치가 답을 끝내지 못했습니다: %s", scrub(result.error or ""))
+            log.warning("고뭉치가 답을 끝내지 못했습니다: %s", scrub(result.error or ""))
         await self._finish(channel, thread_ts, placeholder, to_slack_chunks(reply))
         log.info("스레드 %s:%s 답변 완료", channel, thread_ts)
 
@@ -455,7 +455,7 @@ async def run_bot(cfg: config.SlackConfig) -> int:
     handler.bot_user_id = auth.get("user_id")
     socket_mode = AsyncSocketModeHandler(app, cfg.app_token)
     print(
-        f"뭉치 Slack 봇을 시작했습니다 (Socket Mode, 허용된 사용자 {len(cfg.allowed_user_ids)}명). "
+        f"고뭉치 Slack 봇을 시작했습니다 (Socket Mode, 허용된 사용자 {len(cfg.allowed_user_ids)}명). "
         "멈추려면 Ctrl+C를 누르세요.",
         file=sys.stderr,
     )
