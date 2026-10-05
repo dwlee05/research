@@ -4,7 +4,7 @@ import json
 from datetime import datetime, timedelta, timezone
 
 from mungchi import config
-from mungchi.state import StateStore, ensure_aware, resolve_since
+from mungchi.state import MAX_SLACK_THREADS, StateStore, ThreadSessions, ensure_aware, resolve_since
 
 NOW = datetime(2026, 10, 5, 0, 0, tzinfo=timezone.utc)
 
@@ -67,3 +67,54 @@ def test_state_path_and_lookback_are_env_overridable(tmp_path):
     assert config.get_lookback_days(env) == 3
     assert config.get_lookback_days({"LOOKBACK_DAYS": "abc"}) == 7
     assert config.get_state_path({}).name == ".mungchi_state.json"
+
+
+# ---------------------------------------------------------------- Slack threads
+
+SID_A = "aaaaaaaa-0000-0000-0000-000000000001"
+SID_B = "bbbbbbbb-0000-0000-0000-000000000002"
+
+
+def test_thread_sessions_roundtrip_across_instances(tmp_path):
+    path = tmp_path / "threads.json"
+    store = ThreadSessions(path)
+    assert store.get("C1", "1.0") is None
+    store.set("C1", "1.0", SID_A)
+    store.set("D1", "2.0", SID_B)
+    reopened = ThreadSessions(path)  # e.g. after a bot restart
+    assert reopened.get("C1", "1.0") == SID_A
+    assert reopened.get("D1", "2.0") == SID_B
+    assert reopened.get("C1", "2.0") is None
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data == {"threads": {"C1:1.0": SID_A, "D1:2.0": SID_B}}
+    reopened.forget("C1", "1.0")
+    assert ThreadSessions(path).get("C1", "1.0") is None
+
+
+def test_thread_sessions_cap_keeps_most_recent(tmp_path):
+    store = ThreadSessions(tmp_path / "threads.json", max_threads=3)
+    for i in range(5):
+        store.set("C1", f"{i}.0", f"session-{i:04d}")
+    assert list(store.threads()) == ["C1:2.0", "C1:3.0", "C1:4.0"]
+    # Updating an old thread makes it the most recent one.
+    store.set("C1", "2.0", "session-new0")
+    store.set("C1", "5.0", "session-0005")
+    assert list(store.threads()) == ["C1:4.0", "C1:2.0", "C1:5.0"]
+    assert MAX_SLACK_THREADS == 200
+
+
+def test_thread_sessions_ignore_corrupt_or_unsafe_values(tmp_path):
+    path = tmp_path / "threads.json"
+    path.write_text("{not json", encoding="utf-8")
+    store = ThreadSessions(path)
+    assert store.get("C1", "1.0") is None
+    store.set("C1", "1.0", "--bad value; rm -rf /")  # never stored or passed to --resume
+    assert store.get("C1", "1.0") is None
+    path.write_text(json.dumps({"threads": {"C1:1.0": "--flag", "C1:2.0": SID_A}}), encoding="utf-8")
+    assert store.threads() == {"C1:2.0": SID_A}
+
+
+def test_slack_threads_file_sits_next_to_state_file(tmp_path):
+    env = {"MUNGCHI_STATE_FILE": str(tmp_path / "x" / "state.json")}
+    assert config.get_slack_threads_path(env) == tmp_path / "x" / ".mungchi_slack_threads.json"
+    assert config.get_slack_threads_path({}).name == ".mungchi_slack_threads.json"

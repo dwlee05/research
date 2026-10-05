@@ -17,7 +17,9 @@ DEFAULT_MODEL = "claude-opus-5-5"
 DEFAULT_TIMEZONE = "Asia/Seoul"
 DEFAULT_LOOKBACK_DAYS = 7
 DEFAULT_STATE_FILE = ".mungchi_state.json"
+SLACK_THREADS_FILE = ".mungchi_slack_threads.json"
 DEFAULT_OVERLEAF_CACHE = Path("~/.cache/mungchi/overleaf")
+DEFAULT_SLACK_MAX_CONCURRENT = 2
 
 # Overleaf project ids are hex strings; be a little lenient but never allow
 # characters that could escape the URL path or the cache directory.
@@ -67,6 +69,11 @@ def get_lookback_days(env: Mapping[str, str] | None = None) -> int:
 def get_state_path(env: Mapping[str, str] | None = None) -> Path:
     raw = _get(env, "MUNGCHI_STATE_FILE")
     return Path(raw).expanduser() if raw else Path.cwd() / DEFAULT_STATE_FILE
+
+
+def get_slack_threads_path(env: Mapping[str, str] | None = None) -> Path:
+    """Slack thread -> session map, stored next to the state file."""
+    return get_state_path(env).with_name(SLACK_THREADS_FILE)
 
 
 def get_my_names(env: Mapping[str, str] | None = None) -> list[str]:
@@ -235,6 +242,108 @@ def calendar_hint(missing: list[str]) -> str:
     )
 
 
+# ---------------------------------------------------------------- Slack
+
+# Member ids start with U (or W on Enterprise Grid); channel ids with C/G,
+# DM ids with D. A member id as the briefing target posts to the app's DM.
+_SLACK_USER_ID_RE = re.compile(r"^[UW][A-Z0-9]{2,}$")
+_SLACK_CHANNEL_ID_RE = re.compile(r"^[CGDUW][A-Z0-9]{2,}$")
+SLACK_README_HINT = "설정 방법은 README의 'Slack에서 뭉치 부르기'를 보세요."
+
+
+@dataclass
+class SlackConfig:
+    # Tokens stay out of repr() so a logged config never leaks them.
+    bot_token: str = field(default="", repr=False)
+    app_token: str = field(default="", repr=False)
+    allowed_user_ids: frozenset[str] = frozenset()
+    invalid_user_ids: list[str] = field(default_factory=list)
+    brief_channel: str = ""
+    max_concurrent: int = DEFAULT_SLACK_MAX_CONCURRENT
+
+
+def load_slack_config(env: Mapping[str, str] | None = None) -> SlackConfig:
+    allowed: set[str] = set()
+    invalid: list[str] = []
+    for entry in split_csv(_get(env, "SLACK_ALLOWED_USER_IDS")):
+        if _SLACK_USER_ID_RE.match(entry):
+            allowed.add(entry)
+        else:
+            invalid.append(entry)
+    raw_max = _get(env, "SLACK_MAX_CONCURRENT")
+    try:
+        max_concurrent = int(raw_max) if raw_max else DEFAULT_SLACK_MAX_CONCURRENT
+    except ValueError:
+        max_concurrent = DEFAULT_SLACK_MAX_CONCURRENT
+    return SlackConfig(
+        bot_token=_get(env, "SLACK_BOT_TOKEN"),
+        app_token=_get(env, "SLACK_APP_TOKEN"),
+        allowed_user_ids=frozenset(allowed),
+        invalid_user_ids=invalid,
+        brief_channel=_get(env, "SLACK_BRIEF_CHANNEL"),
+        max_concurrent=max_concurrent if max_concurrent > 0 else DEFAULT_SLACK_MAX_CONCURRENT,
+    )
+
+
+def _bot_token_problems(cfg: SlackConfig) -> list[str]:
+    if cfg.bot_token and not cfg.bot_token.startswith("xoxb-"):
+        swapped = " (xapp-로 시작하는 토큰은 SLACK_APP_TOKEN에 넣으세요)" if cfg.bot_token.startswith("xapp-") else ""
+        return [f"SLACK_BOT_TOKEN 값은 xoxb-로 시작하는 Bot User OAuth Token이어야 합니다{swapped}."]
+    return []
+
+
+def slack_bot_problems(cfg: SlackConfig) -> list[str]:
+    """Korean problem lines that keep ``python -m mungchi slack`` from starting.
+
+    An empty allow-list is a hard error: 뭉치 reads private Dropbox, Overleaf
+    and calendar data and must never answer anyone but its owner.
+    """
+    missing = [
+        name
+        for name, value in (
+            ("SLACK_BOT_TOKEN", cfg.bot_token),
+            ("SLACK_APP_TOKEN", cfg.app_token),
+            ("SLACK_ALLOWED_USER_IDS", cfg.allowed_user_ids or cfg.invalid_user_ids),
+        )
+        if not value
+    ]
+    problems = [f"빠진 환경변수: {', '.join(missing)}"] if missing else []
+    problems += _bot_token_problems(cfg)
+    if cfg.app_token and not cfg.app_token.startswith("xapp-"):
+        swapped = " (xoxb-로 시작하는 토큰은 SLACK_BOT_TOKEN에 넣으세요)" if cfg.app_token.startswith("xoxb-") else ""
+        problems.append(
+            f"SLACK_APP_TOKEN 값은 xapp-로 시작하는 App-Level Token(connections:write 권한)이어야 합니다{swapped}."
+        )
+    if cfg.invalid_user_ids:
+        problems.append(
+            "SLACK_ALLOWED_USER_IDS에 멤버 ID가 아닌 값이 있습니다: "
+            f"{', '.join(cfg.invalid_user_ids)} — 멤버 ID는 U로 시작하는 영문 대문자·숫자입니다 "
+            "(Slack 프로필 → ⋮ → 멤버 ID 복사)."
+        )
+    if not cfg.allowed_user_ids:
+        problems.append(
+            "SLACK_ALLOWED_USER_IDS가 비어 있어 봇을 시작하지 않습니다. 뭉치는 Dropbox·Overleaf·캘린더의 "
+            "개인 정보를 읽기 때문에, 답해도 되는 사람(보통 나 혼자)의 멤버 ID를 쉼표로 구분해 넣어야 합니다."
+        )
+    return problems
+
+
+def slack_brief_problems(cfg: SlackConfig) -> list[str]:
+    """Korean problem lines that keep ``--brief --slack`` from posting."""
+    missing = [
+        name
+        for name, value in (("SLACK_BOT_TOKEN", cfg.bot_token), ("SLACK_BRIEF_CHANNEL", cfg.brief_channel))
+        if not value
+    ]
+    problems = [f"빠진 환경변수: {', '.join(missing)}"] if missing else []
+    problems += _bot_token_problems(cfg)
+    if cfg.brief_channel and not _SLACK_CHANNEL_ID_RE.match(cfg.brief_channel):
+        problems.append(
+            "SLACK_BRIEF_CHANNEL 값은 채널 이름(#general)이 아니라 채널 ID(C로 시작하는 영문 대문자·숫자)여야 합니다."
+        )
+    return problems
+
+
 # ---------------------------------------------------------------- Secrets
 
 
@@ -245,6 +354,8 @@ SECRET_ENV_VARS = (
     "DROPBOX_APP_KEY",
     "OVERLEAF_GIT_TOKEN",
     "ANTHROPIC_API_KEY",
+    "SLACK_BOT_TOKEN",
+    "SLACK_APP_TOKEN",
 )
 
 

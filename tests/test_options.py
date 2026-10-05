@@ -5,16 +5,19 @@ import io
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import pytest
 from claude_agent_sdk import (
     AgentDefinition,
     AssistantMessage,
     ClaudeAgentOptions,
     ResultMessage,
     StreamEvent,
+    SystemMessage,
     TextBlock,
     ToolUseBlock,
 )
 
+from mungchi import main as main_module
 from mungchi.agents import (
     AGENT_LABELS,
     MUNGCHI_SYSTEM_PROMPT,
@@ -23,7 +26,7 @@ from mungchi.agents import (
     gate_decision,
     tool_gate,
 )
-from mungchi.main import BLOCKED_BUILTINS, Renderer, build_options, build_parser
+from mungchi.main import BLOCKED_BUILTINS, Renderer, TurnResult, build_options, build_parser, main, run_turn
 from mungchi.tools import CALENDAR_TOOL, DATA_TOOLS, DROPBOX_TOOL, OVERLEAF_TOOL, SERVER_NAME
 
 NOW = datetime(2026, 10, 5, 8, 0, tzinfo=ZoneInfo("Asia/Seoul"))
@@ -153,3 +156,156 @@ def test_cli_parser():
     assert parser.parse_args(["오늘 일정?"]).question == "오늘 일정?"
     assert "사용법" in parser.format_help()
     assert set(AGENT_LABELS.values()) == {"업뎃", "빠릿"}
+
+
+# ---------------------------------------------------------------- shared runner
+
+
+SCRIPT = [
+    SystemMessage(subtype="init", data={"type": "system", "subtype": "init", "session_id": "sess-init"}),
+    AssistantMessage(
+        content=[
+            TextBlock(text="업뎃에게 맡길게요."),
+            ToolUseBlock(id="t1", name="Agent", input={"subagent_type": "updeot", "prompt": "..."}),
+        ],
+        model="m",
+    ),
+    AssistantMessage(content=[TextBlock(text="업뎃 내부 보고")], model="m", parent_tool_use_id="t1"),
+    AssistantMessage(content=[TextBlock(text="*① 공저자 업데이트*\n• 변경 없음")], model="m"),
+    ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1, is_error=False, num_turns=2, session_id="sess-final"),
+]
+
+
+class FakeSDKClient:
+    """Replaces ClaudeSDKClient: records options/prompts and replays SCRIPT per query."""
+
+    instances: list["FakeSDKClient"] = []
+
+    def __init__(self, options=None, transport=None):
+        self.options = options
+        self.prompts: list[str] = []
+        FakeSDKClient.instances.append(self)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def query(self, prompt, session_id="default"):
+        self.prompts.append(prompt)
+
+    async def receive_response(self):
+        for message in SCRIPT:
+            yield message
+
+
+@pytest.fixture
+def fake_sdk(monkeypatch):
+    FakeSDKClient.instances = []
+    monkeypatch.setattr(main_module, "ClaudeSDKClient", FakeSDKClient)
+    return FakeSDKClient
+
+
+SAFETY_FIELDS = ("tools", "allowed_tools", "disallowed_tools", "permission_mode", "setting_sources", "env", "model")
+
+
+def test_run_turn_resumes_reports_status_and_returns_answer(fake_sdk, capsys):
+    seen: list[str] = []
+
+    async def on_status(line):
+        seen.append(line)
+
+    result = asyncio.run(run_turn("질문", resume="sess-0", on_status=on_status, extra_system_prompt="## Slack 규칙"))
+    assert isinstance(result, TurnResult)
+    # Preamble before the delegation and subagent-internal text are not part of the answer.
+    assert result.text == "*① 공저자 업데이트*\n• 변경 없음"
+    assert result.session_id == "sess-final"
+    assert not result.failed and result.error is None
+    assert seen == ["→ 업뎃에게 맡기는 중..."]
+    [client] = fake_sdk.instances
+    assert client.prompts == ["질문"]
+    opts = client.options
+    assert opts.resume == "sess-0"
+    assert opts.system_prompt.rstrip().endswith("## Slack 규칙")
+    # Every safety setting is exactly what the CLI uses.
+    baseline = build_options()
+    for field in SAFETY_FIELDS:
+        assert getattr(opts, field) == getattr(baseline, field), field
+    assert opts.hooks["PreToolUse"][0].hooks == [tool_gate]
+    assert set(opts.agents) == {"updeot", "ppalit"}
+    assert set(opts.mcp_servers) == {SERVER_NAME}
+    # Quiet by default: nothing printed.
+    assert capsys.readouterr() == ("", "")
+
+
+def test_run_turn_accepts_sync_and_failing_status_callbacks(fake_sdk, capsys):
+    seen: list[str] = []
+    asyncio.run(run_turn("q", on_status=seen.append))
+    assert seen == ["→ 업뎃에게 맡기는 중..."]
+
+    def broken(line):
+        raise RuntimeError("display down")
+
+    result = asyncio.run(run_turn("q", on_status=broken))
+    assert result.text.endswith("변경 없음")  # the turn still completes
+    assert "진행 상황을 전하지 못했습니다" in capsys.readouterr().err
+
+
+def test_build_options_defaults_have_no_resume_and_no_extra_prompt():
+    opts = options()
+    assert opts.resume is None
+    assert "Slack" not in opts.system_prompt
+    assert build_options(env={}, now=NOW, resume="abc-123").resume == "abc-123"
+
+
+def test_cli_one_shot_output_is_unchanged(fake_sdk, capsys):
+    assert main(["어제 공저자들이 뭐 고쳤어?"]) == 0
+    out, err = capsys.readouterr()
+    assert out == "업뎃에게 맡길게요.\n*① 공저자 업데이트*\n• 변경 없음\n"
+    assert err == "→ 업뎃에게 맡기는 중...\n"
+    [client] = fake_sdk.instances
+    assert client.prompts == ["어제 공저자들이 뭐 고쳤어?"]
+    assert client.options.resume is None
+    assert "Slack 출력" not in client.options.system_prompt
+
+
+def test_cli_brief_and_chat_modes_still_work(fake_sdk, capsys, monkeypatch):
+    assert main(["--brief"]) == 0
+    assert "브리핑" in fake_sdk.instances[-1].prompts[0]
+
+    lines = iter(["안녕", "", "내일 일정은?", "종료"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(lines))
+    fake_sdk.instances = []
+    assert main([]) == 0
+    [client] = fake_sdk.instances  # one client for the whole conversation
+    assert client.prompts == ["안녕", "내일 일정은?"]
+    assert "수고하셨습니다" in capsys.readouterr().out
+
+
+def test_renderer_result_carries_korean_error():
+    renderer = Renderer(echo=False)
+    renderer.handle(AssistantMessage(content=[], model="m", error="rate_limit"))
+    result = renderer.result()
+    assert result.failed and result.error.startswith("요청 한도에 걸렸습니다")
+    assert renderer.status_lines == ["[오류] 요청 한도에 걸렸습니다. 잠시 후 다시 시도하세요."]
+
+
+def test_cli_parser_slack_options():
+    parser = build_parser()
+    assert parser.parse_args(["--brief", "--slack"]).slack is True
+    assert parser.parse_args(["slack"]).question == "slack"
+    help_text = parser.format_help()
+    assert "python -m mungchi slack" in help_text
+    assert "--brief --slack" in help_text
+    assert "slack 한 단어" in help_text
+
+
+def test_api_error_text_is_not_part_of_the_answer():
+    out, status = io.StringIO(), io.StringIO()
+    renderer = Renderer(out=out, status=status)
+    renderer.handle(AssistantMessage(content=[TextBlock(text='API Error: 429 {"type":"error"}')], model="m", error="rate_limit"))
+    result = renderer.result()
+    assert result.text == ""
+    assert result.failed and result.error.startswith("요청 한도")
+    assert "API Error: 429" in out.getvalue()  # the terminal still shows it, as before

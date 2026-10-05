@@ -1,9 +1,11 @@
-"""Persisted "last checked" timestamps per source (``.mungchi_state.json``)."""
+"""Persisted state: "last checked" timestamps per source (``.mungchi_state.json``)
+and the Slack thread -> Agent SDK session map (``.mungchi_slack_threads.json``)."""
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -12,6 +14,26 @@ from typing import Any
 # Tool handlers run in worker threads and may run concurrently
 # (e.g. Dropbox and Overleaf checks in parallel), so serialize file updates.
 _LOCK = threading.Lock()
+
+MAX_SLACK_THREADS = 200
+# Session ids are UUIDs; anything else in the file is ignored rather than
+# passed to the CLI as ``--resume``.
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+
+
+def _write_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def utcnow() -> datetime:
@@ -39,11 +61,7 @@ class StateStore:
         self.path = Path(path)
 
     def load(self) -> dict[str, Any]:
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return {}
-        return data if isinstance(data, dict) else {}
+        return _read_json(self.path)
 
     def last_checked(self, source: str) -> datetime | None:
         return _parse_iso(self.load().get("last_checked", {}).get(source))
@@ -56,10 +74,55 @@ class StateStore:
                 stamps = {}
             stamps[source] = ensure_aware(when).astimezone(timezone.utc).isoformat()
             data["last_checked"] = stamps
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_name(self.path.name + ".tmp")
-            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-            os.replace(tmp, self.path)
+            _write_json(self.path, data)
+
+
+class ThreadSessions:
+    """Slack thread -> Agent SDK session id: ``{"threads": {"<channel>:<thread_ts>": "<session_id>"}}``.
+
+    Entries are kept oldest first and capped at ``max_threads``. The file is
+    re-read on every access so the bot sees threads started by a cron
+    ``--brief --slack`` run without restarting.
+    """
+
+    def __init__(self, path: Path | str, max_threads: int = MAX_SLACK_THREADS):
+        self.path = Path(path)
+        self.max_threads = max_threads
+
+    @staticmethod
+    def key(channel: str, thread_ts: str) -> str:
+        return f"{channel}:{thread_ts}"
+
+    def threads(self) -> dict[str, str]:
+        raw = _read_json(self.path).get("threads")
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            key: value
+            for key, value in raw.items()
+            if isinstance(key, str) and isinstance(value, str) and _SESSION_ID_RE.match(value)
+        }
+
+    def get(self, channel: str, thread_ts: str) -> str | None:
+        return self.threads().get(self.key(channel, thread_ts))
+
+    def set(self, channel: str, thread_ts: str, session_id: str) -> None:
+        if not _SESSION_ID_RE.match(session_id or ""):
+            return
+        key = self.key(channel, thread_ts)
+        with _LOCK:
+            threads = self.threads()
+            threads.pop(key, None)  # re-insert as the most recent thread
+            threads[key] = session_id
+            while len(threads) > self.max_threads:
+                del threads[next(iter(threads))]
+            _write_json(self.path, {"threads": threads})
+
+    def forget(self, channel: str, thread_ts: str) -> None:
+        with _LOCK:
+            threads = self.threads()
+            if threads.pop(self.key(channel, thread_ts), None) is not None:
+                _write_json(self.path, {"threads": threads})
 
 
 def resolve_since(

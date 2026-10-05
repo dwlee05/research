@@ -125,3 +125,13 @@ def test_tool_result_scrubbing_never_breaks_json():
     assert data["subject"] == "see https://example.com/page"
     assert "abcdef123456" not in data["diff"]
     assert "the bearer of news" in data["diff"]
+
+
+def test_scrub_removes_slack_tokens_by_shape_and_by_env(monkeypatch):
+    # Fake tokens are assembled at runtime so no token-shaped literal is committed.
+    bot = "-".join(["xoxb", "123456789012", "123456789012", "AbCdEfGhIjKlMnOpQrStUvWx"])
+    app = "-".join(["xapp", "1", "A0123456789", "1234567890123", "abcdef0123456789"])
+    cleaned = scrub(f"auth failed: {bot} / {app}", secrets=[])
+    assert bot not in cleaned and app not in cleaned
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "custom-slack-secret-value")
+    assert "custom-slack-secret-value" not in scrub("token=custom-slack-secret-value")

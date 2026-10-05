@@ -1,0 +1,33 @@
+# 비서실 뭉치 Slack 앱 매니페스트
+# api.slack.com/apps → Create New App → From an app manifest → 워크스페이스 선택 → 이 내용을 붙여 넣기.
+# Socket Mode를 쓰므로 공개 URL(Request URL)이 필요 없습니다.
+display_information:
+  name: 비서실 뭉치
+  description: 공저자 업데이트와 일정을 챙겨 주는 연구 비서 (뭉치·업뎃·빠릿)
+  background_color: "#3b4a5a"
+features:
+  app_home:
+    home_tab_enabled: false
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+  bot_user:
+    display_name: 비서실 뭉치
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read
+      - chat:write
+      - im:history
+      - im:read
+      - im:write
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      - message.im
+  interactivity:
+    is_enabled: false
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false

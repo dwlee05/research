@@ -16,6 +16,9 @@ dependencies = [
     "recurring-ical-events>=3.0",
     "httpx>=0.27",
     "python-dotenv>=1.0",
+    "slack_bolt>=1.30",
+    "slack_sdk>=3.45",
+    "aiohttp>=3.9",
 ]
 
 [project.optional-dependencies]
