@@ -1,0 +1,199 @@
+# 뭉치 비서실
+
+공저자들이 Dropbox와 Overleaf에서 무엇을 했는지, 오늘·내일 일정이 어떤지를 한 번에 챙겨 주는
+연구자용 비서입니다. [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview)
+(`claude-agent-sdk`)로 만든 멀티 에이전트 프로그램입니다.
+
+## 구조
+
+```
+사용자 (터미널)
+ └─ 비서실장 뭉치 ─ main 에이전트. 데이터에 직접 손대지 않고 Agent 도구로 일을 맡김
+     ├─ 업뎃 (updeot) ─ 공저자 업데이트 담당
+     │    ├─ check_dropbox_updates  → Dropbox 폴더의 하위 폴더별 변경 + diff
+     │    └─ check_overleaf_updates → Overleaf 프로젝트의 공저자 커밋 + diff (git)
+     └─ 빠릿 (ppalit) ─ 일정 담당
+          └─ get_schedule           → ICS 캘린더 (Google·Outlook·iCloud)
+```
+
+- **뭉치**는 브리핑을 부탁받으면 업뎃과 빠릿에게 **동시에** 일을 맡기고, 두 보고를 합쳐
+  ① 공저자 업데이트 ② 일정 ③ 오늘 챙길 것 세 부분으로 된 브리핑을 씁니다.
+  뭉치가 쓸 수 있는 도구는 Agent(하위 에이전트 호출) 하나뿐입니다.
+- **업뎃**은 Dropbox·Overleaf 도구만 씁니다. 사용자 본인의 작업은 빼고 **공저자의 작업만**,
+  파일 이름이 아니라 diff를 읽고 "서론 2문단 재작성", "참고문헌 3개 추가"처럼 실제로 한 일을 요약합니다.
+- **빠릿**은 캘린더 도구만 씁니다. 그날과 다음 날 일정, "지금 / 바로 다음 일정", 겹침과 빈 시간을 짧게 보고합니다.
+- 세 도구는 모두 **읽기 전용**이고, 프로그램 안에서 도는 SDK MCP 서버(`mungchi`)로 묶여 있습니다.
+- 모델은 `MUNGCHI_MODEL`(기본 `claude-opus-5-5`)이며, 업뎃·빠릿은 같은 모델을 이어받습니다(`inherit`).
+
+## 설치
+
+Python 3.10 이상과 `git`이 필요합니다.
+
+```bash
+git clone <이 저장소 주소> research
+cd research
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .            # 개발/테스트까지: pip install -e '.[dev]'
+cp .env.example .env        # 그다음 .env를 채웁니다 (아래 참고)
+```
+
+Claude 인증은 둘 중 하나면 됩니다.
+
+- `.env`의 `ANTHROPIC_API_KEY`에 [Claude Console](https://console.anthropic.com)에서 만든 API 키를 넣거나,
+- Claude Code CLI로 미리 로그인해 둡니다(`claude` 실행 후 `/login`).
+
+> 실행할 때마다 Claude API를 호출하므로 사용량에 따라 비용이 듭니다.
+
+## 자격 증명 준비
+
+소스는 필요한 것만 설정해도 됩니다. 설정하지 않은 소스는 뭉치가 "설정 안 됨"과 함께
+**빠진 환경변수 이름**을 알려 줍니다.
+
+### 1. Dropbox
+
+1. <https://www.dropbox.com/developers/apps> → **Create app** → **Scoped access** →
+   **Full Dropbox**(공저자와 공유한 폴더를 보려면 필요) → 앱 이름을 정하고 만듭니다.
+2. **Permissions** 탭에서 아래 네 가지를 체크하고 **Submit** 합니다.
+   - `files.metadata.read`
+   - `files.content.read`
+   - `sharing.read`
+   - `account_info.read`
+   > 권한을 바꾼 뒤에는 토큰을 새로 받아야 반영됩니다.
+3. 토큰 받기 (둘 중 하나)
+   - **간단히 시험해 보기**: **Settings** 탭 → *Generated access token* → **Generate** →
+     `DROPBOX_ACCESS_TOKEN`에 넣습니다. 이 토큰은 몇 시간 뒤 만료됩니다.
+   - **매일 쓰기 (권장)**: 만료되지 않는 리프레시 토큰을 받습니다.
+     1. **Settings** 탭의 *App key*, *App secret*을 `DROPBOX_APP_KEY`, `DROPBOX_APP_SECRET`에 넣습니다.
+     2. 브라우저에서 아래 주소를 열고(`<APP_KEY>` 바꾸기) 허용한 뒤 나오는 코드를 복사합니다.
+        ```
+        https://www.dropbox.com/oauth2/authorize?client_id=<APP_KEY>&response_type=code&token_access_type=offline
+        ```
+     3. 터미널에서 코드를 토큰으로 바꿉니다. 응답의 `refresh_token` 값을 `DROPBOX_REFRESH_TOKEN`에 넣습니다.
+        ```bash
+        curl https://api.dropboxapi.com/oauth2/token \
+          -d code=<복사한_코드> -d grant_type=authorization_code \
+          -u <APP_KEY>:<APP_SECRET>
+        ```
+4. `DROPBOX_ROOT_FOLDER`에 확인할 폴더를 적습니다(예: `/Research/Papers`).
+   이 폴더 바로 아래 하위 폴더(논문별 폴더 등)를 단위로 묶어서 보고합니다.
+
+### 2. Overleaf
+
+1. Overleaf의 **Git 연동은 유료 플랜(또는 기관 프리미엄) 기능**입니다. 먼저 계정에서 쓸 수 있는지 확인하세요.
+2. Overleaf → **Account Settings** → **Git Integration** → **Generate token** →
+   `OVERLEAF_GIT_TOKEN`에 넣습니다(토큰은 만들 때 한 번만 보입니다).
+3. 프로젝트 ID는 프로젝트 주소 `https://www.overleaf.com/project/<프로젝트ID>`의 끝부분입니다
+   (프로젝트 메뉴 → Git에 나오는 `https://git.overleaf.com/<프로젝트ID>`와 같습니다).
+   `OVERLEAF_PROJECTS=논문A=<ID>,논문B=<ID>`처럼 쉼표로 구분해 적습니다. 이름 없이 ID만 써도 됩니다.
+4. `MY_NAMES`와 `MY_EMAILS`에 Overleaf에 표시되는 내 이름과 이메일을 적습니다(쉼표 구분, 대소문자 무시).
+   이 값으로 내 커밋을 걸러 내므로 **둘 중 하나 이상은 꼭** 채워야 합니다.
+
+뭉치는 토큰을 `git -c http.extraHeader=...`로 명령마다 넘기므로 `.git/config`에 토큰이 저장되지 않습니다.
+받은 프로젝트는 `~/.cache/mungchi/overleaf/<프로젝트ID>`에 보관됩니다(`OVERLEAF_CACHE_DIR`로 변경 가능).
+
+### 3. 캘린더 (Google 캘린더의 비공개 iCal 주소)
+
+OAuth 없이 ICS 주소만으로 읽습니다.
+
+1. 컴퓨터에서 [Google 캘린더](https://calendar.google.com) → 오른쪽 위 톱니바퀴 → **설정**.
+2. 왼쪽 **내 캘린더의 설정**에서 캘린더를 고릅니다.
+3. **캘린더 통합** 항목의 **iCal 형식의 비공개 주소**(비공개 주소, iCal 형식)를 복사해 `CALENDAR_ICS_URLS`에 넣습니다.
+   캘린더가 여러 개면 쉼표로 구분합니다. (회사·학교 계정은 관리자가 이 기능을 꺼 두었을 수 있습니다.)
+
+- Outlook: 설정 → 캘린더 → 공유 캘린더 → **캘린더 게시**에서 ICS 링크.
+- iCloud: 캘린더 공유 설정의 **공개 캘린더** 링크(`webcal://`도 그대로 쓸 수 있음).
+
+> 비공개 주소는 **비밀번호와 같습니다**. 유출됐다면 같은 화면에서 재설정하세요.
+> 뭉치는 이 주소를 출력이나 오류 메시지에 내보내지 않습니다.
+
+## 사용법
+
+```bash
+# 대화 모드: 여러 번 주고받기. exit 또는 종료 를 입력하면 끝납니다.
+python -m mungchi
+
+# 오늘 브리핑 한 번 (① 공저자 업데이트 ② 일정 ③ 오늘 챙길 것)
+python -m mungchi --brief
+
+# 질문 한 번
+python -m mungchi "지난 48시간 동안 공저자들이 Overleaf에서 뭐 고쳤어?"
+python -m mungchi "내일 오후에 비는 시간 있어?"
+
+# 도움말
+python -m mungchi --help
+```
+
+`pip install -e .`를 했다면 `python -m mungchi` 대신 `mungchi`로 실행해도 됩니다.
+뭉치의 답은 표준 출력(stdout)으로 흘러나오고, `→ 업뎃에게 맡기는 중...` 같은 진행 표시는
+표준 오류(stderr)로 나옵니다. 그래서 `python -m mungchi --brief > 오늘.md`처럼 브리핑만 파일로 저장할 수 있습니다.
+
+### 확인 범위
+
+- 업뎃의 도구는 기본적으로 **마지막으로 확인한 시각 이후**의 변경만 봅니다.
+  확인 시각은 소스(Dropbox, Overleaf 프로젝트별)마다 `.mungchi_state.json`에 저장됩니다(`MUNGCHI_STATE_FILE`로 경로 변경).
+- 기록이 없으면 최근 `LOOKBACK_DAYS`일(기본 7일)을 봅니다.
+- "지난 48시간"처럼 기간을 말하면 그 범위로 봅니다.
+- diff는 텍스트 파일(`.tex .bib .md .txt .py .r .m .sty .cls .csv`)만, 200KB 이하 파일만 만듭니다.
+  파일마다 약 80줄, 한 번에 약 30,000자까지만 보내고, 잘린 부분은 보고에 "일부만 확인함"으로 표시됩니다.
+
+## 매일 자동으로 받기 (cron)
+
+`crontab -e`로 아래 줄을 추가하면 평일 아침 7시 50분에 브리핑이 파일에 쌓입니다.
+
+```cron
+# 시간대는 시스템 기준입니다. git이 PATH에 있어야 Overleaf 확인이 됩니다.
+PATH=/usr/local/bin:/usr/bin:/bin
+50 7 * * 1-5  cd /path/to/research && .venv/bin/python -m mungchi --brief >> "$HOME/mungchi-briefing.log" 2>&1
+```
+
+- cron에서는 `cd`로 저장소 폴더에 들어가야 `.env`와 `.mungchi_state.json`을 찾습니다.
+- cron에서는 Claude 로그인 정보(키체인)를 못 읽을 수 있으니 `.env`에 `ANTHROPIC_API_KEY`를 넣어 두는 편이 안전합니다.
+- Dropbox는 몇 시간 뒤 만료되는 액세스 토큰 대신 리프레시 토큰 방식을 쓰세요.
+
+## 보안
+
+- 모든 도구는 읽기 전용입니다. Dropbox·Overleaf·캘린더의 내용을 바꾸지 않습니다.
+- 토큰과 비공개 캘린더 주소는 도구 출력·오류 메시지·로그에 나오지 않도록 지웁니다(`***`).
+- 뭉치는 Bash·파일 쓰기 같은 내장 도구를 쓸 수 없고, 데이터 도구도 직접 부를 수 없습니다.
+  업뎃은 Dropbox·Overleaf 도구만, 빠릿은 캘린더 도구만 쓸 수 있습니다(PreToolUse 훅으로 강제).
+- 사용자 설정 파일(`~/.claude/settings.json` 등)은 읽지 않아 도구 구성이 바뀌지 않습니다.
+
+## 알려진 한계
+
+- **Dropbox의 `modified_by`(마지막 수정자)는 공유 폴더 안의 파일에만 있습니다.**
+  공유되지 않은 폴더의 파일은 누가 고쳤는지 알 수 없어 보고에서 빠집니다.
+  공유 폴더인데도 수정자 정보가 없으면 "수정자 미상"으로 표시합니다.
+- Dropbox diff는 **직전 리비전과의 차이(마지막 수정분)** 입니다. 확인 기간 동안 여러 번 저장했다면
+  앞선 수정은 diff에 보이지 않을 수 있습니다. 또 공저자가 고친 뒤 내가 다시 저장하면 마지막 수정자가 나라서 빠집니다.
+- **Overleaf Git 연동은 유료 플랜 기능**이고, **커밋 작성자 정보는 Overleaf 히스토리에서 옵니다.**
+  Overleaf가 여러 사람의 편집을 한 커밋으로 묶거나 계정 이름으로 표시할 수 있어서,
+  `MY_NAMES`/`MY_EMAILS`를 Overleaf에 보이는 값과 맞춰야 내 커밋이 정확히 빠집니다.
+- **알림은 지금은 터미널(표준 출력)로만 나옵니다.** Slack·이메일 전달은 나중에 붙일 수 있습니다
+  (예: cron 출력 파일을 메일로 보내거나 Slack 웹훅으로 보내기).
+- 한 번 실행할 때 뭉치·업뎃·빠릿이 모두 모델을 호출하므로 API 비용이 듭니다.
+
+## 개발
+
+```bash
+pip install -e '.[dev]'
+pytest -q
+```
+
+테스트는 네트워크를 쓰지 않습니다. Dropbox 클라이언트와 git 실행은 가짜 객체로 대신하고,
+캘린더는 테스트 안의 ICS 문자열과 고정된 시계로 확인합니다.
+
+```
+src/mungchi/
+├── __main__.py        # python -m mungchi
+├── main.py            # ClaudeAgentOptions 구성, CLI, 출력 스트리밍
+├── agents.py          # 뭉치 시스템 프롬프트, 업뎃·빠릿 AgentDefinition, 도구 권한 훅
+├── config.py          # 환경변수 읽기, 설정 누락 안내 문구
+├── state.py           # 마지막 확인 시각 저장(.mungchi_state.json)
+└── tools/
+    ├── __init__.py    # SDK MCP 서버(mungchi)와 도구 이름
+    ├── common.py      # diff 자르기, 출력 한도, 비밀값 지우기
+    ├── dropbox_tool.py
+    ├── overleaf_tool.py
+    └── calendar_tool.py
+```
