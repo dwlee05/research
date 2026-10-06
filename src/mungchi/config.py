@@ -20,14 +20,9 @@ DEFAULT_TIMEZONE = "Asia/Seoul"
 DEFAULT_LOOKBACK_DAYS = 7
 DEFAULT_STATE_FILE = ".mungchi_state.json"
 SLACK_THREADS_FILE = ".mungchi_slack_threads.json"
-DEFAULT_OVERLEAF_CACHE = Path("~/.cache/mungchi/overleaf")
 DEFAULT_SLACK_MAX_CONCURRENT = 2
 # Dropbox folder checked when DROPBOX_ROOT_FOLDER is unset or empty.
 DEFAULT_DROPBOX_ROOT_FOLDER = "/20_연구-진행"
-
-# Overleaf project ids are hex strings; be a little lenient but never allow
-# characters that could escape the URL path or the cache directory.
-_PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,64}$")
 
 
 def _env(env: Mapping[str, str] | None) -> Mapping[str, str]:
@@ -116,14 +111,6 @@ def get_slack_threads_path(env: Mapping[str, str] | None = None) -> Path:
     return get_state_path(env).with_name(SLACK_THREADS_FILE)
 
 
-def get_my_names(env: Mapping[str, str] | None = None) -> list[str]:
-    return split_csv(_get(env, "MY_NAMES"))
-
-
-def get_my_emails(env: Mapping[str, str] | None = None) -> list[str]:
-    return split_csv(_get(env, "MY_EMAILS"))
-
-
 # ---------------------------------------------------------------- Dropbox
 
 
@@ -172,81 +159,6 @@ def dropbox_hint(missing: list[str]) -> str:
         "토큰을 발급해 .env에 넣으세요 (DROPBOX_ACCESS_TOKEN 하나 또는 "
         "DROPBOX_REFRESH_TOKEN+DROPBOX_APP_KEY+DROPBOX_APP_SECRET). "
         f"확인할 폴더는 DROPBOX_ROOT_FOLDER(기본 {DEFAULT_DROPBOX_ROOT_FOLDER})입니다."
-    )
-
-
-# ---------------------------------------------------------------- Overleaf
-
-
-@dataclass
-class OverleafProject:
-    name: str
-    project_id: str
-
-
-@dataclass
-class OverleafConfig:
-    token: str = ""
-    projects: list[OverleafProject] = field(default_factory=list)
-    invalid_entries: list[str] = field(default_factory=list)
-    my_names: list[str] = field(default_factory=list)
-    my_emails: list[str] = field(default_factory=list)
-    cache_dir: Path = DEFAULT_OVERLEAF_CACHE
-    missing: list[str] = field(default_factory=list)
-
-    @property
-    def configured(self) -> bool:
-        return not self.missing
-
-
-def parse_overleaf_projects(raw: str) -> tuple[list[OverleafProject], list[str]]:
-    """Parse ``name=project_id`` or bare ``project_id`` entries.
-
-    Returns ``(projects, invalid_entries)``.
-    """
-    projects: list[OverleafProject] = []
-    invalid: list[str] = []
-    for entry in split_csv(raw):
-        if "=" in entry:
-            name, _, pid = entry.partition("=")
-            name, pid = name.strip(), pid.strip()
-        else:
-            name, pid = entry, entry
-        if not _PROJECT_ID_RE.match(pid):
-            invalid.append(entry)
-            continue
-        projects.append(OverleafProject(name=name or pid, project_id=pid))
-    return projects, invalid
-
-
-def load_overleaf_config(env: Mapping[str, str] | None = None) -> OverleafConfig:
-    projects, invalid = parse_overleaf_projects(_get(env, "OVERLEAF_PROJECTS"))
-    cache_raw = _get(env, "OVERLEAF_CACHE_DIR")
-    cfg = OverleafConfig(
-        token=_get(env, "OVERLEAF_GIT_TOKEN"),
-        projects=projects,
-        invalid_entries=invalid,
-        my_names=get_my_names(env),
-        my_emails=get_my_emails(env),
-        cache_dir=(Path(cache_raw) if cache_raw else DEFAULT_OVERLEAF_CACHE).expanduser(),
-    )
-    if not cfg.token:
-        cfg.missing.append("OVERLEAF_GIT_TOKEN")
-    if not cfg.projects:
-        cfg.missing.append("OVERLEAF_PROJECTS")
-    if not cfg.my_names and not cfg.my_emails:
-        # Without these we cannot tell the user's own commits apart, and the
-        # report must never attribute the user's work to a co-author.
-        cfg.missing.extend(["MY_NAMES", "MY_EMAILS"])
-    return cfg
-
-
-def overleaf_hint(missing: list[str]) -> str:
-    names = ", ".join(missing)
-    return (
-        f"Overleaf 설정 누락: {names} — Overleaf 계정 설정 > Git 연동에서 토큰을 만들고 "
-        "(Git 연동이 되는 유료 플랜 필요), OVERLEAF_PROJECTS에 '이름=프로젝트ID'를, "
-        "MY_NAMES 또는 MY_EMAILS(둘 중 하나 이상)에 내 이름/이메일을 .env에 넣으세요."
     )
 
 
@@ -434,7 +346,7 @@ def slack_bot_problems(cfg: SlackConfig) -> list[str]:
 
     Each bot (고뭉치, 업뎃, 일정) is optional, but at least one must have both
     tokens and none may have only one. An empty allow-list is a hard error:
-    the bots read private Dropbox, Overleaf and calendar data and must never
+    the bots read private Dropbox and calendar data and must never
     answer anyone but their owner.
     """
     bots = cfg.bots
@@ -469,7 +381,7 @@ def slack_bot_problems(cfg: SlackConfig) -> list[str]:
         )
     if not cfg.allowed_user_ids:
         problems.append(
-            "SLACK_ALLOWED_USER_IDS가 비어 있어 봇을 시작하지 않습니다. 고뭉치·업뎃·일정은 Dropbox·Overleaf·캘린더의 "
+            "SLACK_ALLOWED_USER_IDS가 비어 있어 봇을 시작하지 않습니다. 고뭉치·업뎃·일정은 Dropbox·캘린더의 "
             "개인 정보를 읽기 때문에, 답해도 되는 사람(보통 나 혼자)의 멤버 ID를 쉼표로 구분해 넣어야 합니다."
         )
     return problems
@@ -499,7 +411,6 @@ SECRET_ENV_VARS = (
     "DROPBOX_REFRESH_TOKEN",
     "DROPBOX_APP_SECRET",
     "DROPBOX_APP_KEY",
-    "OVERLEAF_GIT_TOKEN",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "SLACK_BOT_TOKEN",
@@ -513,16 +424,11 @@ SECRET_ENV_VARS = (
 
 def secret_values(env: Mapping[str, str] | None = None) -> list[str]:
     """Every configured secret string that must never appear in output."""
-    import base64
-
     values: list[str] = []
     for key in SECRET_ENV_VARS:
         value = _get(env, key)
         if value:
             values.append(value)
-    token = _get(env, "OVERLEAF_GIT_TOKEN")
-    if token:
-        values.append(base64.b64encode(f"git:{token}".encode()).decode())
     # Private (Google) and public (iCloud) ICS addresses embed a secret key
     # in the URL itself, both as configured and as the https:// form fetched.
     for url in split_csv(_get(env, "CALENDAR_ICS_URLS")):

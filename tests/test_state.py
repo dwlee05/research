@@ -47,11 +47,11 @@ def test_state_store_roundtrip_and_independent_sources(tmp_path):
     store = StateStore(tmp_path / "state.json")
     assert store.last_checked("dropbox") is None
     store.mark_checked("dropbox", NOW)
-    store.mark_checked("overleaf:abc123", NOW - timedelta(hours=1))
+    store.mark_checked("other:abc123", NOW - timedelta(hours=1))
     assert store.last_checked("dropbox") == NOW
-    assert store.last_checked("overleaf:abc123") == NOW - timedelta(hours=1)
+    assert store.last_checked("other:abc123") == NOW - timedelta(hours=1)
     data = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
-    assert set(data["last_checked"]) == {"dropbox", "overleaf:abc123"}
+    assert set(data["last_checked"]) == {"dropbox", "other:abc123"}
 
 
 def test_corrupt_state_file_is_treated_as_empty(tmp_path):

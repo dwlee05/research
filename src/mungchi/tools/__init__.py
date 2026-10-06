@@ -8,12 +8,11 @@ from claude_agent_sdk import McpSdkServerConfig, SdkMcpTool, create_sdk_mcp_serv
 
 from .calendar_tool import get_schedule
 from .dropbox_tool import check_dropbox_updates
-from .overleaf_tool import check_overleaf_updates
 
 SERVER_NAME = "mungchi"
 SERVER_VERSION = "0.1.0"
 
-ALL_TOOLS = [check_dropbox_updates, check_overleaf_updates, get_schedule]
+ALL_TOOLS = [check_dropbox_updates, get_schedule]
 
 
 def mcp_tool_name(tool_name: str) -> str:
@@ -22,11 +21,10 @@ def mcp_tool_name(tool_name: str) -> str:
 
 
 DROPBOX_TOOL = mcp_tool_name(check_dropbox_updates.name)
-OVERLEAF_TOOL = mcp_tool_name(check_overleaf_updates.name)
 CALENDAR_TOOL = mcp_tool_name(get_schedule.name)
 
 # 업뎃 (``update``) and 일정 (``schedule``) each own their tools.
-UPDATE_TOOLS = [DROPBOX_TOOL, OVERLEAF_TOOL]
+UPDATE_TOOLS = [DROPBOX_TOOL]
 SCHEDULE_TOOLS = [CALENDAR_TOOL]
 DATA_TOOLS = UPDATE_TOOLS + SCHEDULE_TOOLS
 
@@ -38,7 +36,7 @@ def tools_named(names: Iterable[str]) -> list[SdkMcpTool]:
 
 
 def build_server(tools: Iterable[SdkMcpTool] | None = None) -> McpSdkServerConfig:
-    """The ``mungchi`` server with ``tools`` (default: all three data tools)."""
+    """The ``mungchi`` server with ``tools`` (default: every data tool)."""
     selected = ALL_TOOLS if tools is None else list(tools)
     return create_sdk_mcp_server(name=SERVER_NAME, version=SERVER_VERSION, tools=selected)
 
@@ -48,7 +46,6 @@ __all__ = [
     "CALENDAR_TOOL",
     "DATA_TOOLS",
     "DROPBOX_TOOL",
-    "OVERLEAF_TOOL",
     "SCHEDULE_TOOLS",
     "SERVER_NAME",
     "UPDATE_TOOLS",

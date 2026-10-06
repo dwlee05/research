@@ -4,7 +4,7 @@
 # 토큰은 SLACK_UPDATE_BOT_TOKEN(xoxb-)과 SLACK_UPDATE_APP_TOKEN(xapp-)에 넣습니다.
 display_information:
   name: 업뎃
-  description: 공저자가 Dropbox·Overleaf에서 바꾼 파일과 프로젝트 목록을 바로 알려 주는 비서실 업뎃
+  description: 공저자가 Dropbox에서 바꾼 파일 목록을 바로 알려 주는 비서실 업뎃
   background_color: "#2f5d50"
 features:
   app_home:

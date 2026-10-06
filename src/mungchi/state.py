@@ -14,7 +14,7 @@ from typing import Any
 from .personas import MUNGCHI, PERSONAS
 
 # Tool handlers run in worker threads and may run concurrently
-# (e.g. Dropbox and Overleaf checks in parallel), so serialize file updates.
+# (e.g. two Slack bots checking Dropbox at once), so serialize file updates.
 _LOCK = threading.Lock()
 
 MAX_SLACK_THREADS = 200

@@ -41,7 +41,6 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(?i)\b(https?://)[^/\s:@]+:[^/\s@]+@"), r"\1***@"),
     # Well-known token shapes.
     (re.compile(r"\bsl\.[A-Za-z0-9_-]{20,}"), "***"),  # Dropbox short-lived token
-    (re.compile(r"\bolp_[A-Za-z0-9]{10,}"), "***"),  # Overleaf git token
     (re.compile(r"\bsk-ant-[A-Za-z0-9_-]{10,}"), "***"),  # Anthropic API key
     (re.compile(r"\bxox[a-z]-[A-Za-z0-9-]{10,}"), "***"),  # Slack bot/user/refresh token
     (re.compile(r"\bxapp-[A-Za-z0-9-]{10,}"), "***"),  # Slack app-level token

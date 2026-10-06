@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
+import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pytest
+from dotenv import dotenv_values
 from claude_agent_sdk import (
     AgentDefinition,
     AssistantMessage,
@@ -17,10 +20,12 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
+from mungchi import config
 from mungchi import main as main_module
 from mungchi.agents import (
     AGENT_LABELS,
     MUNGCHI_SYSTEM_PROMPT,
+    PERSONA_TOOLS,
     TOOL_GATES,
     build_schedule_prompt,
     build_update_prompt,
@@ -29,9 +34,12 @@ from mungchi.agents import (
 )
 from mungchi.personas import SCHEDULE, UPDATE
 from mungchi.main import BLOCKED_BUILTINS, Renderer, TurnResult, build_options, build_parser, main, run_turn
-from mungchi.tools import CALENDAR_TOOL, DATA_TOOLS, DROPBOX_TOOL, OVERLEAF_TOOL, SERVER_NAME
+from mungchi.tools import ALL_TOOLS, CALENDAR_TOOL, DATA_TOOLS, DROPBOX_TOOL, SERVER_NAME, UPDATE_TOOLS
+from mungchi.tools.dropbox_tool import check_dropbox_updates
 
 NOW = datetime(2026, 10, 5, 8, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+# The Overleaf check was removed; its old tool name must stay unusable.
+REMOVED_TOOL_NAMES = ("check_overleaf_updates", "mcp__mungchi__check_overleaf_updates")
 
 
 def options() -> ClaudeAgentOptions:
@@ -44,7 +52,7 @@ def test_agents_have_ascii_keys_and_own_tools_only():
     assert all(key.isascii() for key in opts.agents)
     update, schedule = opts.agents["update"], opts.agents["schedule"]
     assert isinstance(update, AgentDefinition) and isinstance(schedule, AgentDefinition)
-    assert sorted(update.tools) == sorted([DROPBOX_TOOL, OVERLEAF_TOOL])
+    assert update.tools == [DROPBOX_TOOL]
     assert schedule.tools == [CALENDAR_TOOL]
     for agent in (update, schedule):
         assert agent.model == "inherit"
@@ -76,7 +84,6 @@ def test_data_tools_are_gated_per_subagent():
         assert decision(tool) == "deny"
     # Each subagent may call only its own tools.
     assert decision(DROPBOX_TOOL, UPDATE, "a1") == "allow"
-    assert decision(OVERLEAF_TOOL, UPDATE, "a1") == "allow"
     assert decision(CALENDAR_TOOL, UPDATE, "a1") == "deny"
     assert decision(CALENDAR_TOOL, SCHEDULE, "a2") == "allow"
     assert decision(DROPBOX_TOOL, SCHEDULE, "a2") == "deny"
@@ -315,16 +322,16 @@ def test_api_error_text_is_not_part_of_the_answer():
     assert status.getvalue().count("API Error: 429") == 1
 
 
-def test_prompts_never_promise_overleaf_content_summaries():
+def test_prompts_never_promise_content_summaries():
     from mungchi.agents import UPDATE_DESCRIPTION, UPDATE_PROMPT
 
     for text in (MUNGCHI_SYSTEM_PROMPT, UPDATE_PROMPT, UPDATE_DESCRIPTION):
         assert "diff" not in text.replace("diff는 없다", "")
         assert "요약한다" not in text
-    assert "프로젝트 열기" in MUNGCHI_SYSTEM_PROMPT and "프로젝트 열기" in UPDATE_PROMPT
+    assert "폴더 열기" in MUNGCHI_SYSTEM_PROMPT and "폴더 열기" in UPDATE_PROMPT
     assert "내용은 직접 확인해 주세요." in MUNGCHI_SYSTEM_PROMPT
     assert "내용은 직접 확인해 주세요." in UPDATE_PROMPT
-    for key in ("edited_by", "last_edit", "edits", "unchanged", "errors"):
+    for key in ("groups", "by", "path", "modified", "omitted", "total_files", "link"):
         assert key in UPDATE_PROMPT
 
 
@@ -333,7 +340,7 @@ def test_prompts_never_promise_overleaf_content_summaries():
 
 @pytest.fixture
 def server_spy(monkeypatch):
-    """Records which tools each built MCP server gets (None = all three)."""
+    """Records which tools each built MCP server gets (None = every data tool)."""
     built: list[list[str] | None] = []
     real = main_module.build_server
 
@@ -346,17 +353,17 @@ def server_spy(monkeypatch):
     return built
 
 
-def test_direct_update_gets_only_its_two_data_tools(server_spy):
+def test_direct_update_gets_only_the_dropbox_tool(server_spy):
     opts = build_options(env={}, now=NOW, persona="update")
     assert opts.tools == []  # no built-in tools at all, not even Agent
-    assert opts.allowed_tools == [DROPBOX_TOOL, OVERLEAF_TOOL]
+    assert opts.allowed_tools == [DROPBOX_TOOL]
     assert "Agent" not in opts.allowed_tools and "Agent" in opts.disallowed_tools
     assert not opts.agents
     assert set(BLOCKED_BUILTINS) <= set(opts.disallowed_tools)
     assert opts.permission_mode == "dontAsk"
     assert opts.setting_sources == []
     assert opts.env == options().env
-    assert server_spy[0] == ["check_dropbox_updates", "check_overleaf_updates"]
+    assert server_spy[0] == ["check_dropbox_updates"]
     assert opts.hooks["PreToolUse"][0].hooks == [TOOL_GATES["update"]]
     assert set(opts.mcp_servers) == {SERVER_NAME}
 
@@ -381,7 +388,7 @@ def test_mungchi_options_are_unchanged_by_personas(server_spy):
     assert set(explicit.agents) == {"update", "schedule"}
     assert explicit.hooks["PreToolUse"][0].hooks == [tool_gate]
     assert TOOL_GATES["mungchi"] is tool_gate
-    assert server_spy == [None, None]  # 고뭉치's server keeps all three tools for its subagents
+    assert server_spy == [None, None]  # 고뭉치's server keeps every data tool for its subagents
 
 
 def test_unknown_persona_is_rejected():
@@ -395,11 +402,9 @@ def test_direct_gates_allow_only_the_personas_own_tools():
         return out["hookSpecificOutput"]["permissionDecision"]
 
     assert decision("update", DROPBOX_TOOL) == "allow"
-    assert decision("update", OVERLEAF_TOOL) == "allow"
     assert decision("update", CALENDAR_TOOL) == "deny"
     assert decision("schedule", CALENDAR_TOOL) == "allow"
     assert decision("schedule", DROPBOX_TOOL) == "deny"
-    assert decision("schedule", OVERLEAF_TOOL) == "deny"
     for persona in ("update", "schedule"):
         for tool in ("Agent", "Task"):
             for subagent in ("update", "schedule", "general-purpose"):
@@ -429,7 +434,7 @@ def test_direct_and_subagent_prompts_share_the_same_rules():
     sub, direct = build_update_prompt(), build_update_prompt(direct=True)
     assert "고뭉치에게 한국어로 보고" in sub and "고뭉치" not in direct.split("## 대화")[0]
     assert "사용자에게 직접" in direct and "사용자에게 직접" not in sub
-    rules = sub[sub.index("## 공통 규칙") : sub.index("## 보고 형식")]
+    rules = sub[sub.index("## 규칙") : sub.index("## 보고 형식")]
     assert rules.replace("고뭉치에게", "사용자에게") in direct
     assert sub.split("## 보고 형식")[1] == direct.split("## 답 형식")[1]
 
@@ -458,7 +463,7 @@ def test_run_turn_runs_the_requested_persona(fake_sdk):
     opts = client.options
     assert opts.resume == "sess-0"
     assert opts.tools == [] and not opts.agents
-    assert opts.allowed_tools == [DROPBOX_TOOL, OVERLEAF_TOOL]
+    assert opts.allowed_tools == [DROPBOX_TOOL]
     assert opts.hooks["PreToolUse"][0].hooks == [TOOL_GATES["update"]]
     assert opts.system_prompt.rstrip().endswith("## Slack 규칙")
 
@@ -476,10 +481,10 @@ def test_renderer_answer_starts_after_last_data_tool_call():
 
 
 def test_cli_agent_one_shot_and_chat(fake_sdk, capsys, monkeypatch):
-    assert main(["--agent", "update", "누가 Overleaf 고쳤어?"]) == 0
+    assert main(["--agent", "update", "누가 무슨 파일 고쳤어?"]) == 0
     [client] = fake_sdk.instances
-    assert client.prompts == ["누가 Overleaf 고쳤어?"]
-    assert client.options.allowed_tools == [DROPBOX_TOOL, OVERLEAF_TOOL] and not client.options.agents
+    assert client.prompts == ["누가 무슨 파일 고쳤어?"]
+    assert client.options.allowed_tools == [DROPBOX_TOOL] and not client.options.agents
 
     fake_sdk.instances = []
     lines = iter(["내일 일정은?", "종료"])
@@ -502,3 +507,91 @@ def test_cli_agent_argument_rules(capsys):
     assert "slack 명령은 --agent와 함께 쓸 수 없습니다" in err
     help_text = build_parser().format_help()
     assert "--agent" in help_text and "update" in help_text and "schedule" in help_text
+
+
+# ---------------------------------------------------------------- removed Overleaf check
+
+
+def test_update_has_exactly_one_data_tool():
+    assert UPDATE_TOOLS == [DROPBOX_TOOL]
+    assert PERSONA_TOOLS[UPDATE] == [DROPBOX_TOOL]
+    assert DATA_TOOLS == [DROPBOX_TOOL, CALENDAR_TOOL]
+    assert [t.name for t in ALL_TOOLS] == ["check_dropbox_updates", "get_schedule"]
+
+
+def test_removed_tool_names_are_unknown_or_denied():
+    def decision(tool, persona="mungchi", agent_type=None, agent_id=None):
+        out = gate_decision(tool, {}, agent_type, agent_id, persona=persona)
+        return out.get("hookSpecificOutput", {}).get("permissionDecision")
+
+    mungchi = options()
+    for name in REMOVED_TOOL_NAMES:
+        # Unknown: not on the server, not a data tool, not given to anyone.
+        assert name not in DATA_TOOLS
+        assert name not in {t.name for t in ALL_TOOLS}
+        assert name not in mungchi.allowed_tools
+        assert all(name not in agent.tools for agent in mungchi.agents.values())
+        # Never allowed by 고뭉치's gate, from the main agent or inside a subagent.
+        assert decision(name) != "allow"
+        for agent_type in (UPDATE, SCHEDULE):
+            assert decision(name, agent_type=agent_type, agent_id="a1") != "allow"
+        # 업뎃 / 일정 answering directly: explicitly denied.
+        for persona in (UPDATE, SCHEDULE):
+            assert name not in build_options(env={}, now=NOW, persona=persona).allowed_tools
+            assert decision(name, persona=persona) == "deny"
+
+
+def test_user_facing_texts_never_mention_overleaf():
+    from mungchi.agents import UPDATE_DESCRIPTION
+    from mungchi.slack_format import SLACK_FORMAT_PROMPT
+
+    texts = [
+        MUNGCHI_SYSTEM_PROMPT,
+        build_update_prompt(),
+        build_update_prompt(direct=True),
+        UPDATE_DESCRIPTION,
+        build_options(env={}, now=NOW, persona="update").system_prompt,
+        SLACK_FORMAT_PROMPT,
+        build_parser().format_help(),
+        *main_module.CHAT_GREETINGS.values(),
+        *config.slack_bot_problems(config.SlackConfig()),
+    ]
+    for text in texts:
+        assert "overleaf" not in text.lower()
+
+
+OLD_ENV = """\
+MUNGCHI_MODEL=claude-opus-5-5
+MY_NAMES=홍길동,Gildong Hong
+MY_EMAILS=gildong@example.com
+OVERLEAF_GIT_TOKEN=olp_not-a-real-token
+OVERLEAF_PROJECTS=논문A=0123456789abcdef01234567
+OVERLEAF_CACHE_DIR=
+"""
+
+
+def test_old_env_with_overleaf_and_my_lines_still_works(tmp_path, monkeypatch, fake_sdk, capsys):
+    """An .env written before the Overleaf removal: the leftover lines are loaded but never read."""
+    env_file = tmp_path / ".env"  # conftest made tmp_path the working directory
+    env_file.write_text(OLD_ENV, encoding="utf-8")
+    for key in dotenv_values(env_file):
+        # Recorded by monkeypatch, so whatever main() loads from .env is removed after the test.
+        monkeypatch.setenv(key, "")
+        monkeypatch.delenv(key)
+
+    assert main(["--agent", "update", "공저자 업데이트 확인해줘"]) == 0
+    assert os.environ["OVERLEAF_GIT_TOKEN"] == "olp_not-a-real-token"  # loaded from .env, then ignored
+    [client] = fake_sdk.instances
+    assert client.options.allowed_tools == [DROPBOX_TOOL]
+    assert "overleaf" not in client.options.system_prompt.lower()
+    assert main(["--brief"]) == 0  # 고뭉치 as well
+
+    # The Dropbox check and the Slack checks only talk about their own settings.
+    result = asyncio.run(check_dropbox_updates.handler({}))
+    data = json.loads(result["content"][0]["text"])
+    assert data["configured"] is False and data["missing"] == ["DROPBOX_ACCESS_TOKEN"]
+    text = json.dumps(data, ensure_ascii=False) + "\n".join(config.slack_bot_problems(config.load_slack_config()))
+    for name in ("OVERLEAF", "MY_NAMES", "MY_EMAILS"):
+        assert name not in text
+    err = capsys.readouterr().err
+    assert "[오류]" not in err and "OVERLEAF" not in err

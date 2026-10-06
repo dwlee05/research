@@ -64,7 +64,7 @@ CLI_ENV = {
     "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
     # Subagents must not spawn further subagents.
     "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": "1",
-    # Only three small tools: load their schemas upfront instead of deferring.
+    # Only a few small tools: load their schemas upfront instead of deferring.
     "ENABLE_TOOL_SEARCH": "false",
 }
 
@@ -75,7 +75,7 @@ SLACK_COMMAND = "slack"
 
 CHAT_GREETINGS = {
     MUNGCHI: "고뭉치 비서실입니다. 무엇을 도와드릴까요? (끝내려면 exit 또는 종료)",
-    UPDATE: "업뎃입니다. 공저자 업데이트(Dropbox·Overleaf)를 확인해 드릴게요. (끝내려면 exit 또는 종료)",
+    UPDATE: "업뎃입니다. 공저자 업데이트(Dropbox)를 확인해 드릴게요. (끝내려면 exit 또는 종료)",
     SCHEDULE: "'일정'입니다. 캘린더 일정을 확인해 드릴게요. (끝내려면 exit 또는 종료)",
 }
 
@@ -493,7 +493,7 @@ def build_parser() -> argparse.ArgumentParser:
             '  python -m mungchi "어제 공저자들이 뭐 고쳤어?"   # 질문 한 번\n'
             "  python -m mungchi slack                 # Slack 봇 실행 (Socket Mode)\n"
             "  python -m mungchi --brief --slack       # 오늘 브리핑을 Slack 채널에 올리기 (cron용)\n"
-            '  python -m mungchi --agent update "누가 Overleaf 고쳤어?"   # 업뎃에게 바로 묻기\n'
+            '  python -m mungchi --agent update "누가 무슨 파일 고쳤어?"   # 업뎃에게 바로 묻기\n'
             "  python -m mungchi --agent schedule      # '일정'과 바로 대화\n"
             "  python -m mungchi --list-models         # 쓸 수 있는 모델 ID 확인 (MUNGCHI_MODEL 고르기)\n"
             "\n"

@@ -15,10 +15,10 @@ def test_int_arg_coerces_and_clamps():
 
 
 def test_scrub_removes_configured_secrets_and_known_shapes():
-    token = "olp_abcdefghijklmnopqrstuvwxyz0123"
-    basic = base64.b64encode(f"git:{token}".encode()).decode()
+    token = "tok_abcdefghijklmnopqrstuvwxyz0123"
+    basic = base64.b64encode(f"user:{token}".encode()).decode()
     message = (
-        f"fatal: auth failed for https://git:{token}@git.overleaf.com/abc "
+        f"fatal: auth failed for https://user:{token}@git.example.com/abc "
         f"(Authorization: Basic {basic}) bearer sl.ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"
     )
     cleaned = scrub(message, secrets=[token, basic])
@@ -39,10 +39,10 @@ def test_scrub_can_redact_urls():
 
 
 def test_safe_error_scrubs_exception_text(monkeypatch):
-    monkeypatch.setenv("OVERLEAF_GIT_TOKEN", "olp_supersecrettoken123")
-    err = RuntimeError("bad credentials olp_supersecrettoken123")
+    monkeypatch.setenv("DROPBOX_APP_SECRET", "supersecretappsecret123")
+    err = RuntimeError("bad credentials supersecretappsecret123")
     text = safe_error(err)
-    assert "olp_supersecrettoken123" not in text
+    assert "supersecretappsecret123" not in text
     assert text.startswith("RuntimeError")
 
 
