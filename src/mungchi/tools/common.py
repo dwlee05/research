@@ -47,7 +47,7 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bxapp-[A-Za-z0-9-]{10,}"), "***"),  # Slack app-level token
 )
 
-_URL_RE = re.compile(r"(?i)\b(?:https?|webcal)://\S+")
+_URL_RE = re.compile(r"(?i)\b(?:https?|webcals?)://\S+")
 
 
 def scrub(text: str, secrets: Iterable[str] | None = None, redact_urls: bool = False) -> str:

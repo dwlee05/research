@@ -1,4 +1,5 @@
-"""``get_schedule``: events from private ICS feeds (Google, Outlook, iCloud)."""
+"""``get_schedule``: events from ICS feeds (Google private address, iCloud public
+calendar ``webcal://`` link, Outlook published calendar)."""
 
 from __future__ import annotations
 
@@ -192,10 +193,9 @@ def build_schedule(
 
 
 def fetch_ics(url: str) -> bytes:
-    if url.lower().startswith("webcal://"):
-        url = "https://" + url[len("webcal://") :]
+    # webcal:// / webcals:// (iCloud public calendars) are fetched over https://.
     with httpx.Client(timeout=FETCH_TIMEOUT_SECONDS, follow_redirects=True) as client:
-        response = client.get(url)
+        response = client.get(config.ics_fetch_url(url))
         response.raise_for_status()
         return response.content
 

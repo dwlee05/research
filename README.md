@@ -36,23 +36,107 @@
 
 ## 설치
 
-Python 3.10 이상과 `git`이 필요합니다.
+**Python 3.10 이상**과 `git`이 필요합니다. 먼저 터미널에서 버전을 확인하세요.
+
+```bash
+python3 --version    # Python 3.10 이상이면 됩니다 (예: Python 3.14.2)
+```
+
+> macOS에는 `python` 명령이 없고 `python3`만 있는 경우가 많습니다. 그래서 가상환경(venv)은 `python3`로 만듭니다.
+> **Mac에서 `python` 명령은 가상환경이 켜져 있을 때만 있습니다.**
 
 ```bash
 git clone <이 저장소 주소> research
 cd research
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .            # 개발/테스트까지: pip install -e '.[dev]'
-cp .env.example .env        # 그다음 .env를 채웁니다 (아래 참고)
+python3 -m venv .venv        # 가상환경 만들기 (처음 한 번만)
+source .venv/bin/activate    # 가상환경 켜기
+pip install -e .             # 설치 (개발/테스트까지: pip install -e '.[dev]')
+cp .env.example .env         # 그다음 .env를 채웁니다 (아래 참고)
 ```
 
-Claude 인증은 둘 중 하나면 됩니다.
+가상환경이 켜지면 프롬프트 맨 앞에 **`(.venv)`** 가 붙습니다(예: `(.venv) gildong@MacBook research %`).
+이 표시가 있을 때만 `python`, `pip`, `mungchi` 명령이 이 저장소의 가상환경을 씁니다. 이 문서의 `python -m mungchi ...` 명령은
+모두 가상환경을 켠 상태에서 실행합니다.
 
-- `.env`의 `ANTHROPIC_API_KEY`에 [Claude Console](https://console.anthropic.com)에서 만든 API 키를 넣거나,
-- Claude Code CLI로 미리 로그인해 둡니다(`claude` 실행 후 `/login`).
+**터미널을 새로 열 때마다** 저장소 폴더로 가서 가상환경을 다시 켜야 합니다.
+
+```bash
+cd research                  # 저장소를 받은 폴더
+source .venv/bin/activate    # 프롬프트 앞에 (.venv)가 붙으면 준비 끝
+```
+
+> macOS에서 python.org 설치 파일로 Python을 깔았다면 인증서가 없어 처음 Slack 연결이 `CERTIFICATE_VERIFY_FAILED`로
+> 실패할 수 있습니다. 미리 `/Applications/Python 3.x/Install Certificates.command`를 한 번 실행해 두세요
+> (자세한 내용은 [문제 해결](#문제-해결)).
+
+## Claude 인증
+
+고뭉치는 Claude API를 부르는 프로그램이라, 아래 **둘 중 하나**를 `.env`에 설정해야 합니다.
 
 > 실행할 때마다 Claude API를 호출하므로 사용량에 따라 비용이 듭니다.
+>
+> Claude 구독(Pro·Max)이나 `claude` CLI 로그인으로는 쓰지 않습니다. Anthropic은 Agent SDK로 만든 프로그램에
+> API 키 인증이나 지원되는 게이트웨이·클라우드 제공자를 쓰도록 안내합니다.
+
+### 방법 1. Anthropic API 키 (공식 방법)
+
+1. [Claude Console](https://platform.claude.com)에 로그인해 **API Keys**에서 키를 만듭니다(`sk-ant-`로 시작).
+2. `.env`에 넣습니다.
+   ```
+   ANTHROPIC_API_KEY=sk-ant-...
+   MUNGCHI_MODEL=claude-opus-5-5
+   ```
+3. 요금은 쓴 만큼 Console 계정에 청구됩니다. Console 설정의 **Limits**에서 월 사용 한도(spend limit)를 정해 두면
+   예상보다 많이 나오는 것을 막을 수 있습니다.
+
+### 방법 2. Anthropic 호환 LLM 게이트웨이 (예: 대학에서 제공하는 게이트웨이)
+
+학교나 기관이 Claude를 쓸 수 있는 LLM 게이트웨이를 제공하면, Anthropic API 키 대신 그 게이트웨이 키로 쓸 수 있습니다.
+
+- 게이트웨이가 **Anthropic Messages 형식(`/v1/messages`)** 을 지원해야 합니다. OpenAI 호환 형식(`/v1/chat/completions`)만
+  지원하는 게이트웨이는 그대로는 쓸 수 없습니다.
+- 고뭉치가 읽은 데이터(Slack 메시지, 파일 이름, 캘린더 일정 제목 등)가 **게이트웨이 운영 기관을 거쳐** Claude로 갑니다.
+  쓰기 전에 게이트웨이의 이용 정책(데이터 보관·활용 범위)을 확인하세요.
+
+**예시: Chat KHU (운영: Mindlogic)**
+
+```
+ANTHROPIC_API_KEY=
+ANTHROPIC_BASE_URL=https://factchat-cloud.mindlogic.ai/v1/gateway/claude
+ANTHROPIC_AUTH_TOKEN=<게이트웨이에서 발급한 키>
+MUNGCHI_MODEL=<게이트웨이에서 쓸 수 있는 모델 ID>
+ANTHROPIC_DEFAULT_HAIKU_MODEL=<게이트웨이의 Haiku 모델 ID, 선택>
+```
+
+- `ANTHROPIC_API_KEY`는 **반드시 비워 두세요**. 값이 있으면 게이트웨이 인증이 실패합니다.
+  셸에서 `export ANTHROPIC_API_KEY=...`를 해 두었다면 `unset ANTHROPIC_API_KEY`로 지우세요(셸의 값이 `.env`보다 우선합니다).
+- 게이트웨이 화면에는 주소가 `https://factchat-cloud.mindlogic.ai/v1/gateway`로 나오지만, Claude용 주소는 끝에 `/claude`를 붙인
+  `.../v1/gateway/claude`입니다.
+- 게이트웨이의 모델 ID는 Anthropic과 다를 수 있습니다. 아래 [모델 확인](#모델-확인---list-models)으로 목록을 보고
+  `MUNGCHI_MODEL`에 그대로 적으세요.
+- `ANTHROPIC_DEFAULT_HAIKU_MODEL`은 Claude Code가 가벼운 보조 작업에 쓰는 Haiku 모델입니다. 게이트웨이에 Haiku가 있으면
+  그 ID를 적습니다(선택).
+
+### 모델 확인 (`--list-models`)
+
+`.env` 설정 그대로 Claude API(또는 게이트웨이)에 쓸 수 있는 모델 목록을 물어봅니다. 에이전트를 실행하지 않고
+`GET {ANTHROPIC_BASE_URL}/v1/models`(기본 `https://api.anthropic.com/v1/models`)만 호출하므로 모델 사용 요금이 들지 않습니다.
+
+```bash
+python -m mungchi --list-models
+```
+
+```
+모델 목록 확인: GET https://factchat-cloud.mindlogic.ai/v1/gateway/claude/v1/models (인증: ANTHROPIC_AUTH_TOKEN)
+HTTP 200: 모델 2개
+  claude-opus-4-1
+* claude-sonnet-4-5   ← 지금 MUNGCHI_MODEL
+```
+
+- 응답 상태와 모델 ID를 한 줄에 하나씩 보여 주고, 지금 `MUNGCHI_MODEL`과 같은 ID에 `*`를 붙입니다(위 ID는 예시입니다).
+- 키 값은 출력하지 않고, 어느 변수(`ANTHROPIC_AUTH_TOKEN` 또는 `ANTHROPIC_API_KEY`)를 썼는지만 보여 줍니다.
+- 실패하면(401, 404 등) 응답 일부와 무엇을 확인할지 한국어로 알려 줍니다. 게이트웨이가 모델 목록을 지원하지 않으면
+  404가 나올 수 있으니, 그때는 게이트웨이 안내 문서에서 모델 ID를 확인하세요.
 
 ## 자격 증명 준비
 
@@ -108,20 +192,49 @@ Claude 인증은 둘 중 하나면 됩니다.
 고뭉치는 토큰을 `git -c http.extraHeader=...`로 명령마다 넘기므로 `.git/config`에 토큰이 저장되지 않습니다.
 받은 프로젝트는 `~/.cache/mungchi/overleaf/<프로젝트ID>`에 보관됩니다(`OVERLEAF_CACHE_DIR`로 변경 가능).
 
-### 3. 캘린더 (Google 캘린더의 비공개 iCal 주소)
+### 3. 캘린더 (macOS 캘린더 앱 · Google 캘린더 · Outlook)
 
-OAuth 없이 ICS 주소만으로 읽습니다.
+OAuth 없이 캘린더의 구독 주소(ICS, `webcal://…` 또는 `https://…`)만으로 읽습니다.
+**캘린더가 여러 개면** 주소를 쉼표로 구분해 `CALENDAR_ICS_URLS`에 모두 넣습니다.
+
+```
+CALENDAR_ICS_URLS=webcal://p01-caldav.icloud.com/published/2/...,https://calendar.google.com/calendar/ical/.../basic.ics
+```
+
+#### 먼저: 캘린더가 어느 계정에 있는지 확인 (macOS 캘린더 앱)
+
+캘린더 앱 왼쪽 사이드바를 보면 캘린더가 **iCloud**, **Google**, **Exchange**, **나의 Mac에** 같은 계정별로 묶여 있습니다.
+쓰려는 캘린더가 어느 묶음 아래에 있는지에 따라 주소를 얻는 방법이 다릅니다.
+
+#### iCloud 캘린더
+
+1. 캘린더 앱 사이드바에서 캘린더를 Control-클릭(또는 오른쪽 클릭)하고 **캘린더 공유…** 를 고릅니다.
+2. **공개 캘린더**를 켭니다.
+3. 나오는 `webcal://…` 주소를 복사해 `CALENDAR_ICS_URLS`에 **그대로** 붙여 넣습니다.
+   `webcal://`(또는 `webcals://`) 주소는 고뭉치가 알아서 `https://`로 바꿔 읽습니다.
+
+> ⚠️ 공개 캘린더는 **주소를 아는 사람이면 누구나** 일정을 볼 수 있습니다. 이 주소를 다른 사람과 공유하거나
+> 커밋하지 마세요. 유출됐다면 같은 화면에서 **공개 캘린더**를 꺼서 공유를 멈추세요.
+
+#### Google 캘린더 (비공개 iCal 주소)
 
 1. 컴퓨터에서 [Google 캘린더](https://calendar.google.com) → 오른쪽 위 톱니바퀴 → **설정**.
 2. 왼쪽 **내 캘린더의 설정**에서 캘린더를 고릅니다.
 3. **캘린더 통합** 항목의 **iCal 형식의 비공개 주소**(비공개 주소, iCal 형식)를 복사해 `CALENDAR_ICS_URLS`에 넣습니다.
-   캘린더가 여러 개면 쉼표로 구분합니다. (회사·학교 계정은 관리자가 이 기능을 꺼 두었을 수 있습니다.)
-
-- Outlook: 설정 → 캘린더 → 공유 캘린더 → **캘린더 게시**에서 ICS 링크.
-- iCloud: 캘린더 공유 설정의 **공개 캘린더** 링크(`webcal://`도 그대로 쓸 수 있음).
+   (회사·학교 계정은 관리자가 이 기능을 꺼 두었을 수 있습니다.)
 
 > 비공개 주소는 **비밀번호와 같습니다**. 유출됐다면 같은 화면에서 재설정하세요.
-> 고뭉치는 이 주소를 출력이나 오류 메시지에 내보내지 않습니다.
+
+#### Exchange·Outlook 캘린더
+
+Outlook 웹의 설정 → 캘린더 → 공유 캘린더 → **캘린더 게시**에서 ICS 링크를 받습니다(기관에서 막아 두었을 수 있습니다).
+
+#### "나의 Mac에" 캘린더
+
+이 컴퓨터에만 저장된 로컬 캘린더라 구독 주소가 없습니다. **아직 지원하지 않습니다.** 고뭉치에게 보여 주려면
+그 일정을 iCloud나 Google 캘린더로 옮긴 뒤 위 방법으로 주소를 넣어야 합니다.
+
+> 고뭉치는 캘린더 주소를 출력이나 오류 메시지, 로그에 내보내지 않습니다(`webcal://` 형식과 바꾼 `https://` 형식 모두).
 
 ## 사용법
 
@@ -143,6 +256,9 @@ python -m mungchi --agent schedule
 # Slack 봇 실행 / 오늘 브리핑을 Slack에 올리기 (아래 "Slack에서 부르기" 참고)
 python -m mungchi slack
 python -m mungchi --brief --slack
+
+# 쓸 수 있는 모델 ID 확인 (에이전트 실행 없음, 위 "모델 확인" 참고)
+python -m mungchi --list-models
 
 # 도움말
 python -m mungchi --help
@@ -177,7 +293,9 @@ PATH=/usr/local/bin:/usr/bin:/bin
 Slack 없이 파일에 쌓으려면 `--slack`을 빼면 됩니다(브리핑은 로그 파일에 들어갑니다).
 
 - cron에서는 `cd`로 저장소 폴더에 들어가야 `.env`와 `.mungchi_state.json`을 찾습니다.
-- cron에서는 Claude 로그인 정보(키체인)를 못 읽을 수 있으니 `.env`에 `ANTHROPIC_API_KEY`를 넣어 두는 편이 안전합니다.
+- cron은 `.venv/bin/python`으로 가상환경의 Python을 바로 부르므로 `source .venv/bin/activate`가 필요 없습니다.
+- Claude 인증은 `.env`의 설정(API 키 또는 게이트웨이 설정)을 그대로 씁니다. 셸에서만 `export`한 값은 cron이 읽지 못하니
+  `.env`에 넣어 두세요.
 - Dropbox는 몇 시간 뒤 만료되는 액세스 토큰 대신 리프레시 토큰 방식을 쓰세요.
 
 ## Slack에서 부르기
@@ -350,7 +468,9 @@ python -m mungchi --brief --slack
 - 브리핑을 만들지 못하면 채널에 실패 메시지를 올리고, 0이 아닌 종료 코드로 끝납니다(자세한 내용은 cron 로그에 남습니다).
 - `--slack` 없이 `--brief`만 쓰면 예전처럼 터미널(표준 출력)로 나옵니다. cron 설정은 위의 [매일 자동으로 받기](#매일-자동으로-받기-cron)를 보세요.
 
-### 문제 해결
+### Slack 문제 해결
+
+설치·인증·인증서 문제는 아래 [문제 해결](#문제-해결)을 보세요.
 
 - `[오류] Slack 봇을 시작할 수 없습니다.`: 빠진 환경변수 이름이 함께 나옵니다. `.env`를 채우세요.
   토큰을 하나만 넣은 봇이 있으면 그 봇의 빠진 변수를 알려 줍니다.
@@ -361,10 +481,57 @@ python -m mungchi --brief --slack
 - 멘션해도 아무 반응이 없으면 봇 프로그램이 켜져 있는지, 그 채널에 봇이 초대되어 있는지 확인하세요.
   봇이 꺼져 있을 때 보낸 메시지는 나중에 처리되지 않을 수 있습니다.
 
+## 문제 해결
+
+### `zsh: command not found: python`
+
+가상환경이 꺼져 있습니다(Mac에는 `python3`만 있고, `python`은 가상환경 안에만 있습니다).
+저장소 폴더에서 가상환경을 켜고 다시 실행하세요. 프롬프트 앞에 `(.venv)`가 붙어야 합니다.
+
+```bash
+cd research
+source .venv/bin/activate
+```
+
+`.venv` 폴더가 없다는 오류가 나면 아직 가상환경을 만들지 않은 것이니 [설치](#설치)의 `python3 -m venv .venv`부터 하세요.
+
+### `CERTIFICATE_VERIFY_FAILED` (`unable to get local issuer certificate`)
+
+예: 처음 Slack에 연결할 때 `ClientConnectorCertificateError ... CERTIFICATE_VERIFY_FAILED`.
+python.org에서 받은 macOS용 Python은 인증서(CA) 묶음 없이 설치되기 때문입니다. 설치한 버전 폴더의
+`Install Certificates.command`를 한 번 실행하세요(`/Applications/Python 3.x/Install Certificates.command`에서
+`3.x`는 설치한 버전입니다. Finder의 응용 프로그램 폴더에서 더블클릭해도 됩니다).
+
+```bash
+open "/Applications/Python 3.14/Install Certificates.command"    # Python 3.14를 설치했다면
+```
+
+그래도 안 되면 가상환경을 켠 상태에서 인증서 파일을 직접 지정합니다(터미널을 열 때마다, 또는 `~/.zshrc`에 추가).
+
+```bash
+export SSL_CERT_FILE="$(python -m certifi)"
+```
+
+### `There's an issue with the selected model (...)`
+
+고뭉치는 이때 `[오류] 모델 설정에 문제가 있습니다.`와 함께 `→ .env의 MUNGCHI_MODEL과 ANTHROPIC_BASE_URL을 확인하세요`를 보여 줍니다.
+
+- `MUNGCHI_MODEL`이 그 API(또는 게이트웨이)에 없는 모델 ID입니다. `python -m mungchi --list-models`로 목록을 보고
+  맞는 ID를 넣으세요.
+- 게이트웨이를 쓴다면 `ANTHROPIC_BASE_URL` 경로도 확인하세요. Chat KHU는 화면에 보이는 `.../v1/gateway`가 아니라
+  `.../v1/gateway/claude`입니다.
+
+### 401 / `authentication_error` / `[오류] 인증에 실패했습니다.`
+
+- Anthropic API 키를 쓴다면 `ANTHROPIC_API_KEY` 값이 맞는지 확인하세요.
+- 게이트웨이를 쓴다면 `ANTHROPIC_AUTH_TOKEN`에 게이트웨이 키를 넣고, **`ANTHROPIC_API_KEY`는 비워 두세요**.
+  셸에서 `export`해 둔 값이 있으면 `unset ANTHROPIC_API_KEY`로 지웁니다.
+- `python -m mungchi --list-models`로 키가 통하는지 에이전트를 실행하지 않고 바로 확인할 수 있습니다.
+
 ## 보안
 
 - 모든 도구는 읽기 전용입니다. Dropbox·Overleaf·캘린더의 내용을 바꾸지 않습니다.
-- 토큰과 비공개 캘린더 주소는 도구 출력·오류 메시지·로그에 나오지 않도록 지웁니다(`***`).
+- 토큰·키와 캘린더 주소(Google 비공개 주소, iCloud 공개 캘린더 주소)는 도구 출력·오류 메시지·로그에 나오지 않도록 지웁니다(`***`).
 - 고뭉치는 Bash·파일 쓰기 같은 내장 도구를 쓸 수 없고, 데이터 도구도 직접 부를 수 없습니다.
   업뎃은 Dropbox·Overleaf 도구만, 일정은 캘린더 도구만 쓸 수 있습니다(PreToolUse 훅으로 강제).
 - 업뎃·일정을 직접 부를 때(Slack 봇, `--agent`)는 내장 도구와 Agent 도구가 아예 없고, 자기 데이터 도구만 보이고
@@ -372,8 +539,10 @@ python -m mungchi --brief --slack
 - 사용자 설정 파일(`~/.claude/settings.json` 등)은 읽지 않아 도구 구성이 바뀌지 않습니다.
 - 세 Slack 봇 모두 `SLACK_ALLOWED_USER_IDS`에 있는 사람의 메시지만 에이전트에게 넘기고, 이 값이 비어 있으면 시작하지 않습니다.
   봇 자신이나 우리 봇들끼리, 다른 봇의 메시지, 수정·입장 같은 시스템 메시지, 중복으로 들어온 이벤트는 무시합니다.
-- Slack에 올리는 오류 메시지에는 오류 종류만 적습니다. 자세한 내용은 봇을 실행한 터미널(표준 오류)에만 남기고,
-  Slack 토큰을 포함한 비밀값은 그 로그에서도 지웁니다.
+- Slack에 올리는 오류 메시지에는 오류 종류와 확인할 설정만 적습니다(Claude API 오류는 API가 준 오류 문구 일부도 함께).
+  프로그램 오류의 자세한 내용은 봇을 실행한 터미널(표준 오류)에만 남기고, Slack 토큰·Claude 키를 포함한 비밀값은
+  어디에서나 지웁니다.
+- 게이트웨이(방법 2)를 쓰면 에이전트가 읽은 데이터가 게이트웨이 운영 기관을 거쳐 갑니다. 이용 정책을 확인하세요.
 - Slack에 올리는 답에서는 `@channel`·`@here` 같은 전체 알림을 막고, 링크 미리보기(unfurl)를 끕니다.
 
 ## 알려진 한계
@@ -406,13 +575,14 @@ pytest -q
 
 테스트는 네트워크를 쓰지 않습니다. Dropbox 클라이언트와 git 실행은 가짜 객체로 대신하고,
 캘린더는 테스트 안의 ICS 문자열과 고정된 시계로 확인합니다. Slack은 가짜 웹 클라이언트와 가짜 `run_turn`으로
-확인하므로 실제 Slack이나 Claude에 연결하지 않습니다.
+확인하므로 실제 Slack이나 Claude에 연결하지 않습니다. `--list-models`는 가짜 httpx 전송(`MockTransport`)으로 확인합니다.
 
 ```
 slack_manifests/       # Slack 앱 매니페스트, 봇마다 하나 (moongchi.yaml · update.yaml · schedule.yaml)
 src/mungchi/
 ├── __main__.py        # python -m mungchi
-├── main.py            # 페르소나별 ClaudeAgentOptions 구성, 한 턴 실행(run_turn), CLI(--agent 포함), 출력 스트리밍
+├── main.py            # 페르소나별 ClaudeAgentOptions 구성, 한 턴 실행(run_turn), CLI(--agent 포함), 출력 스트리밍, 오류 문구
+├── model_list.py      # --list-models: 모델 목록 확인 (GET /v1/models)
 ├── personas.py        # 페르소나 키(mungchi·update·schedule), 한글 이름, Slack 핸들
 ├── slack_bot.py       # Slack 봇 세 개(한 프로세스, Socket Mode), 권한 확인, 진행 표시, --brief --slack
 ├── slack_format.py    # Slack용 프롬프트, 봇별 첫 답, 멘션 제거, mrkdwn 변환, 메시지 나누기

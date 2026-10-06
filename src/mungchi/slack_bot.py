@@ -58,7 +58,8 @@ EMPTY_MENTION_PROMPTS = {
 
 STATUS_INTERVAL_SECONDS = 1.0
 MAX_STATUS_LINES = 6
-MAX_ERROR_CHARS = 300
+# Room for the reason, an excerpt of the API's error text and a "→ ..." hint.
+MAX_ERROR_CHARS = 600
 MAX_REMEMBERED_EVENTS = 1_000
 
 

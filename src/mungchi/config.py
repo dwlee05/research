@@ -49,6 +49,42 @@ def get_model(env: Mapping[str, str] | None = None) -> str:
     return _get(env, "MUNGCHI_MODEL") or DEFAULT_MODEL
 
 
+# ---------------------------------------------------------------- Claude auth
+
+DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
+
+# Claude settings the bundled Claude Code CLI reads from the environment it
+# inherits. Empty ones (e.g. ``ANTHROPIC_API_KEY=`` copied from .env.example)
+# are removed before the CLI starts; see ``main.drop_empty_claude_env``.
+CLAUDE_ENV_VARS = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+)
+
+# One-line hints appended to Claude errors (run errors and --list-models).
+MODEL_HINT = "→ .env의 MUNGCHI_MODEL과 ANTHROPIC_BASE_URL을 확인하세요 (모델 목록: python -m mungchi --list-models)"
+AUTH_HINT = (
+    "→ .env의 ANTHROPIC_API_KEY(Anthropic 키) 또는 ANTHROPIC_AUTH_TOKEN(게이트웨이 키)을 확인하세요. "
+    "게이트웨이를 쓸 땐 ANTHROPIC_API_KEY를 비우세요."
+)
+
+
+def get_anthropic_base_url(env: Mapping[str, str] | None = None) -> str:
+    """API root without a trailing slash (``ANTHROPIC_BASE_URL`` or Anthropic's API)."""
+    return (_get(env, "ANTHROPIC_BASE_URL") or DEFAULT_ANTHROPIC_BASE_URL).rstrip("/")
+
+
+def get_anthropic_api_key(env: Mapping[str, str] | None = None) -> str:
+    return _get(env, "ANTHROPIC_API_KEY")
+
+
+def get_anthropic_auth_token(env: Mapping[str, str] | None = None) -> str:
+    """Gateway key (sent as ``Authorization: Bearer``)."""
+    return _get(env, "ANTHROPIC_AUTH_TOKEN")
+
+
 def get_timezone_name(env: Mapping[str, str] | None = None) -> str:
     return _get(env, "TIMEZONE") or DEFAULT_TIMEZONE
 
@@ -228,9 +264,23 @@ class CalendarConfig:
         return not self.missing
 
 
+_WEBCAL_RE = re.compile(r"^webcals?://", re.IGNORECASE)
+
+
+def ics_fetch_url(url: str) -> str:
+    """The https:// address to fetch for a calendar subscription URL.
+
+    iCloud's public calendar link (and other subscription links) use
+    ``webcal://`` or ``webcals://``, which are plain HTTPS feeds. Other URLs
+    are returned unchanged (apart from surrounding whitespace).
+    """
+    url = (url or "").strip()
+    return _WEBCAL_RE.sub("https://", url, count=1)
+
+
 def load_calendar_config(env: Mapping[str, str] | None = None) -> CalendarConfig:
     cfg = CalendarConfig(
-        urls=split_csv(_get(env, "CALENDAR_ICS_URLS")),
+        urls=[ics_fetch_url(url) for url in split_csv(_get(env, "CALENDAR_ICS_URLS"))],
         timezone_name=get_timezone_name(env),
     )
     if not cfg.urls:
@@ -242,7 +292,8 @@ def calendar_hint(missing: list[str]) -> str:
     names = ", ".join(missing)
     return (
         f"캘린더 설정 누락: {names} — Google 캘린더 설정 > 내 캘린더의 설정 > 캘린더 통합의 "
-        "'iCal 형식의 비공개 주소'(Outlook·iCloud의 ICS 주소도 가능)를 복사해 쉼표로 구분해 .env에 넣으세요."
+        "'iCal 형식의 비공개 주소', macOS 캘린더 앱 iCloud 캘린더의 '캘린더 공유… > 공개 캘린더' 주소(webcal://), "
+        "Outlook의 ICS 주소 가운데 쓰는 것을 복사해 쉼표로 구분해 .env에 넣으세요."
     )
 
 
@@ -450,6 +501,7 @@ SECRET_ENV_VARS = (
     "DROPBOX_APP_KEY",
     "OVERLEAF_GIT_TOKEN",
     "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
     "SLACK_BOT_TOKEN",
     "SLACK_APP_TOKEN",
     "SLACK_UPDATE_BOT_TOKEN",
@@ -471,9 +523,15 @@ def secret_values(env: Mapping[str, str] | None = None) -> list[str]:
     token = _get(env, "OVERLEAF_GIT_TOKEN")
     if token:
         values.append(base64.b64encode(f"git:{token}".encode()).decode())
-    # Private ICS addresses embed a secret key in the URL itself.
+    # Private (Google) and public (iCloud) ICS addresses embed a secret key
+    # in the URL itself, both as configured and as the https:// form fetched.
     for url in split_csv(_get(env, "CALENDAR_ICS_URLS")):
         values.append(url)
-        if url.lower().startswith("webcal://"):
-            values.append("https://" + url[len("webcal://"):])
+        fetched = ics_fetch_url(url)
+        if fetched != url:
+            values.append(fetched)
+        # The same address without its scheme (host/path), as some errors print it.
+        _scheme, sep, rest = fetched.partition("://")
+        if sep and rest:
+            values.append(rest)
     return values

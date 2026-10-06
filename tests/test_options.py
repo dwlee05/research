@@ -310,7 +310,9 @@ def test_api_error_text_is_not_part_of_the_answer():
     result = renderer.result()
     assert result.text == ""
     assert result.failed and result.error.startswith("요청 한도")
-    assert "API Error: 429" in out.getvalue()  # the terminal still shows it, as before
+    # The terminal still shows it, once, inside the [오류] lines (stderr) instead of the answer (stdout).
+    assert "API Error: 429" not in out.getvalue()
+    assert status.getvalue().count("API Error: 429") == 1
 
 
 def test_prompts_never_promise_overleaf_content_summaries():

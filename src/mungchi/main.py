@@ -6,10 +6,11 @@ import argparse
 import asyncio
 import inspect
 import os
+import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Awaitable, Callable, Mapping, Sequence, TextIO
+from typing import Any, Awaitable, Callable, Mapping, MutableMapping, Sequence, TextIO
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -79,13 +80,39 @@ CHAT_GREETINGS = {
 }
 
 ERROR_MESSAGES = {
-    "authentication_failed": "인증에 실패했습니다. ANTHROPIC_API_KEY 또는 Claude 로그인을 확인하세요.",
+    "authentication_failed": "인증에 실패했습니다.",
     "billing_error": "결제/사용 한도 문제로 요청이 거절되었습니다.",
     "rate_limit": "요청 한도에 걸렸습니다. 잠시 후 다시 시도하세요.",
-    "invalid_request": "잘못된 요청입니다. MUNGCHI_MODEL 값을 확인하세요.",
+    "invalid_request": "잘못된 요청입니다.",
     "server_error": "API 서버 오류입니다. 잠시 후 다시 시도하세요.",
     "unknown": "알 수 없는 오류가 발생했습니다.",
 }
+
+# ResultMessage subtypes that explain a failed turn (never shown raw; "success"
+# with is_error=True means an API error and has no note of its own).
+RESULT_SUBTYPE_NOTES = {
+    "error_max_turns": "최대 턴 수 도달",
+    "error_during_execution": "실행 중 오류",
+    "error_max_budget_usd": "비용 한도 도달",
+    "error_max_structured_output_retries": "구조화된 출력 재시도 한도 도달",
+}
+
+# Problems we can point at a setting for: wrong model / base URL, or wrong key.
+_AUTH_ERROR_RE = re.compile(
+    r"(?i)\b401\b|authenticat|unauthori[sz]ed|invalid[\s_-]*(?:x-)?api[\s_-]*key"
+    r"|invalid[\s_-]*(?:bearer|auth(?:entication)?)[\s_-]*token"
+)
+_MODEL_ERROR_RE = re.compile(
+    r"(?i)issue with the selected model|\b404\b|not_found_error"
+    r"|model\b[^.\n]{0,60}?(?:not found|does not exist|may not exist|not available|unavailable|not supported)"
+    r"|\b(?:unknown|invalid|unsupported)[\s_-]*model\b"
+)
+ERROR_HINTS = {"auth": config.AUTH_HINT, "model": config.MODEL_HINT}
+# What a recognised problem is called when the SDK only says "unknown".
+CATEGORY_MESSAGES = {"auth": ERROR_MESSAGES["authentication_failed"], "model": "모델 설정에 문제가 있습니다."}
+# SDK error kinds that already name the problem.
+KIND_CATEGORIES = {"authentication_failed": "auth", "invalid_request": "model"}
+MAX_ERROR_DETAIL_CHARS = 200
 
 
 StatusCallback = Callable[[str], "Awaitable[None] | None"]
@@ -93,12 +120,79 @@ StatusCallback = Callable[[str], "Awaitable[None] | None"]
 
 @dataclass
 class TurnResult:
-    """Outcome of one turn. ``error`` is a short Korean message, already scrubbed."""
+    """Outcome of one turn.
+
+    ``error`` is a short Korean message, already scrubbed: a reason, then
+    possibly an excerpt of the API's own error text and a "→ ..." hint, one
+    per line.
+    """
 
     text: str
     session_id: str | None = None
     failed: bool = False
     error: str | None = None
+
+
+# ---------------------------------------------------------------- error messages
+
+
+def _flatten(text: str | None) -> str:
+    return " ".join((text or "").split())
+
+
+def error_excerpt(text: str | None, limit: int = MAX_ERROR_DETAIL_CHARS) -> str:
+    """One scrubbed line of the API's error text, at most ``limit`` characters."""
+    flat = scrub(_flatten(text))  # scrub before cutting so no partial secret survives
+    return flat if len(flat) <= limit else flat[: limit - 1].rstrip() + "…"
+
+
+def error_category(text: str | None, status: int | None = None) -> str | None:
+    """``"auth"`` or ``"model"`` when the error points at a setting, else None."""
+    if status == 401:
+        return "auth"
+    if status == 404:
+        return "model"
+    text = text or ""
+    if _AUTH_ERROR_RE.search(text):
+        return "auth"
+    if _MODEL_ERROR_RE.search(text):
+        return "model"
+    return None
+
+
+def describe_error(
+    reason: str, detail: str | None = None, *, kind: str | None = None, status: int | None = None
+) -> str:
+    """Korean error text: ``reason``, an excerpt of ``detail`` and a hint, one per line."""
+    lines = [reason]
+    excerpt = error_excerpt(detail)
+    if excerpt:
+        lines.append(excerpt)
+    category = error_category(detail, status) or KIND_CATEGORIES.get(kind or "")
+    if category:
+        lines.append(ERROR_HINTS[category])
+    return scrub("\n".join(lines))
+
+
+def describe_assistant_error(kind: str, text: str | None = None) -> str:
+    """Message for an assistant message flagged with an SDK error ``kind``.
+
+    ``text`` is the API error text the CLI put in that message, e.g.
+    "There's an issue with the selected model (...)".
+    """
+    reason = ERROR_MESSAGES.get(kind, ERROR_MESSAGES["unknown"])
+    if kind not in ERROR_MESSAGES or kind in ("unknown", "invalid_request"):
+        category = error_category(text)
+        if category:
+            reason = CATEGORY_MESSAGES[category]
+    return describe_error(reason, text, kind=kind)
+
+
+def describe_result_error(subtype: str | None, detail: str | None = None, status: int | None = None) -> str:
+    """Message for a failed ``ResultMessage``; the bare subtype is never shown."""
+    notes = [note for note in (RESULT_SUBTYPE_NOTES.get(subtype or ""), f"HTTP {status}" if status else "") if note]
+    reason = "응답을 마치지 못했습니다" + (f"({', '.join(notes)})" if notes else "") + "."
+    return describe_error(reason, detail, status=status)
 
 
 def briefing_prompt(now: datetime | None = None, env: Mapping[str, str] | None = None) -> str:
@@ -187,6 +281,8 @@ class Renderer:
         self._announced: set[str] = set()
         self.failed = False
         self.error: str | None = None
+        # API error texts already shown, so the closing ResultMessage does not repeat them.
+        self._reported_details: list[str] = []
         self.session_id: str | None = None
         self.status_lines: list[str] = []
         self._texts: list[str] = []
@@ -211,11 +307,20 @@ class Renderer:
         self.status.write(text + "\n")
         self.status.flush()
 
-    def _fail(self, error: str) -> None:
+    def _fail(self, error: str, detail: str | None = None) -> None:
         self.failed = True
         if self.error is None:
             self.error = error
+        flat = _flatten(detail)
+        if flat:
+            self._reported_details.append(flat)
         self._status_line("[오류] " + error)
+
+    def _already_reported(self, detail: str | None) -> bool:
+        flat = _flatten(detail)
+        if not flat:
+            return True
+        return any(flat in seen or seen in flat for seen in self._reported_details)
 
     @property
     def answer(self) -> str:
@@ -254,11 +359,15 @@ class Renderer:
         if message.session_id:
             self.session_id = message.session_id
         if message.error:
-            self._fail(ERROR_MESSAGES.get(message.error, ERROR_MESSAGES["unknown"]))
+            # The text of an error message is the API's error, not an answer:
+            # it is shown once, inside the [오류] lines, with a hint.
+            raw = "\n".join(block.text for block in message.content if isinstance(block, TextBlock))
+            self._fail(describe_assistant_error(message.error, raw), detail=raw)
         for block in message.content:
             if isinstance(block, TextBlock):
-                if not message.error:  # raw API error text is not an answer
-                    self._texts.append(block.text)
+                if message.error:
+                    continue
+                self._texts.append(block.text)
                 if not self._streamed_text:  # not already shown via partial messages
                     self._write(block.text)
             elif isinstance(block, ToolUseBlock) and block.name in DATA_TOOLS:
@@ -279,8 +388,13 @@ class Renderer:
         if not self._at_line_start:
             self._write("\n")
         if message.is_error:
-            details = "; ".join(message.errors or []) or message.subtype
-            self._fail(f"응답을 마치지 못했습니다: {scrub(details)}")
+            # On an API error the CLI reports subtype "success" with the error
+            # text in ``result``; ``errors`` is filled for execution errors.
+            detail = "; ".join(e for e in (message.errors or []) if e) or (message.result or "")
+            status = getattr(message, "api_error_status", None)
+            if self.failed and message.subtype not in RESULT_SUBTYPE_NOTES and self._already_reported(detail):
+                return  # the assistant error above already said all of this
+            self._fail(describe_result_error(message.subtype, detail, status), detail=detail)
 
 
 async def _notify(on_status: StatusCallback, line: str) -> None:
@@ -381,6 +495,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  python -m mungchi --brief --slack       # 오늘 브리핑을 Slack 채널에 올리기 (cron용)\n"
             '  python -m mungchi --agent update "누가 Overleaf 고쳤어?"   # 업뎃에게 바로 묻기\n'
             "  python -m mungchi --agent schedule      # '일정'과 바로 대화\n"
+            "  python -m mungchi --list-models         # 쓸 수 있는 모델 ID 확인 (MUNGCHI_MODEL 고르기)\n"
             "\n"
             "질문 자리에 slack 한 단어만 쓰면 질문이 아니라 Slack 봇 실행 명령으로 처리합니다.\n"
             "Slack 봇은 고뭉치·업뎃·일정 가운데 토큰을 넣은 봇이 한 프로세스에서 함께 켜집니다.\n"
@@ -409,13 +524,38 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="{update,schedule}",
         help="고뭉치 대신 업뎃(update) 또는 '일정'(schedule)과 바로 이야기합니다 (질문 한 번 또는 대화 모드)",
     )
+    opts.add_argument(
+        "--list-models",
+        action="store_true",
+        help=(
+            "Claude API(또는 ANTHROPIC_BASE_URL의 게이트웨이)에서 쓸 수 있는 모델 ID를 보여 주고 끝냅니다 "
+            "(에이전트는 실행하지 않음)"
+        ),
+    )
     opts.add_argument("-h", "--help", action="help", help="이 도움말을 보여 주고 끝냅니다")
     return parser
+
+
+def drop_empty_claude_env(environ: MutableMapping[str, str] | None = None) -> None:
+    """Remove empty Claude settings such as ``ANTHROPIC_API_KEY=`` from the environment.
+
+    The bundled Claude Code CLI inherits this process's environment when the
+    SDK starts it, so this must run before any agent turn. With a gateway
+    (``ANTHROPIC_BASE_URL`` + ``ANTHROPIC_AUTH_TOKEN``) an empty-but-set
+    ``ANTHROPIC_API_KEY`` copied from .env.example could interfere with the
+    gateway's auth, and an empty ``ANTHROPIC_BASE_URL`` is not an address.
+    """
+    environ = os.environ if environ is None else environ
+    for name in config.CLAUDE_ENV_VARS:
+        if name in environ and not environ[name].strip():
+            del environ[name]
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.list_models and (args.question or args.brief or args.slack or args.agent):
+        parser.error("--list-models는 질문이나 다른 옵션(--brief, --slack, --agent, slack)과 함께 쓸 수 없습니다.")
     start_slack_bot = args.question == SLACK_COMMAND
     if start_slack_bot and (args.brief or args.slack):
         parser.error("slack 명령은 --brief, --slack과 함께 쓸 수 없습니다.")
@@ -433,12 +573,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     from dotenv import find_dotenv, load_dotenv
 
     load_dotenv(find_dotenv(usecwd=True))
-    # An empty ANTHROPIC_API_KEY= line copied from .env.example must not
-    # shadow a `claude` CLI login.
-    if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
-        os.environ.pop("ANTHROPIC_API_KEY", None)
+    # Before any SDK subprocess starts (CLI turns, Slack bots, --brief --slack):
+    # an empty ANTHROPIC_API_KEY= line must not get in the way of gateway auth.
+    drop_empty_claude_env()
 
     try:
+        if args.list_models:
+            from .model_list import list_models
+
+            return list_models()
         if start_slack_bot:
             from .slack_bot import run_bot_cli
 
