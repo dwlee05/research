@@ -7,10 +7,18 @@ import re
 from datetime import datetime
 from typing import Callable
 
+from .personas import MUNGCHI, SCHEDULE, UPDATE
+
 # Slack recommends keeping message text well under 4,000 characters.
 MAX_CHUNK_CHARS = 3_500
 
-PLACEHOLDER_TEXT = "🗂️ 고뭉치가 확인 중이에요..."
+# First reply of each bot while its agent works (Korean particles: 고뭉치가, 업뎃이, 일정이).
+PLACEHOLDERS = {
+    MUNGCHI: "🗂️ 고뭉치가 확인 중이에요...",
+    UPDATE: "📝 업뎃이 확인 중이에요...",
+    SCHEDULE: "⏰ 일정이 확인 중이에요...",
+}
+PLACEHOLDER_TEXT = PLACEHOLDERS[MUNGCHI]
 BRIEF_HEADER = "☀️ *오늘의 브리핑 ({date})*"
 
 SLACK_FORMAT_PROMPT = """\
@@ -101,7 +109,7 @@ _BOLD_ITALIC_RE = re.compile(r"\*\*\*(?=\S)(.+?)(?<=\S)\*\*\*")
 _BOLD_RE = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*")
 _STRIKE_RE = re.compile(r"~~(?=\S)(.+?)(?<=\S)~~")
 _LINK_RE = re.compile(r"\[([^\[\]\n]+)\]\(((?:https?://|mailto:)[^\s()<>]+)\)")
-# @channel/@here/@everyone pings and user-group pings are never sent by 고뭉치.
+# @channel/@here/@everyone pings and user-group pings are never sent by the bots.
 _BROADCAST_RE = re.compile(r"<!(here|channel|everyone)(?:\|[^>]*)?>")
 _SUBTEAM_RE = re.compile(r"<!subteam\^[A-Z0-9]+(?:\|([^>]*))?>")
 

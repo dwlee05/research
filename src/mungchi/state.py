@@ -11,6 +11,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from .personas import MUNGCHI, PERSONAS
+
 # Tool handlers run in worker threads and may run concurrently
 # (e.g. Dropbox and Overleaf checks in parallel), so serialize file updates.
 _LOCK = threading.Lock()
@@ -78,10 +80,16 @@ class StateStore:
 
 
 class ThreadSessions:
-    """Slack thread -> Agent SDK session id: ``{"threads": {"<channel>:<thread_ts>": "<session_id>"}}``.
+    """Slack thread -> Agent SDK session id, per persona (bot).
 
-    Entries are kept oldest first and capped at ``max_threads``. The file is
-    re-read on every access so the bot sees threads started by a cron
+    File format: ``{"threads": {"<persona>:<channel>:<thread_ts>": "<session_id>"}}``.
+    The persona is part of the key, so different bots answering in the same
+    thread never resume each other's sessions. Entries written before there
+    were several bots (``"<channel>:<thread_ts>"``) belong to 고뭉치 and are
+    read as ``mungchi`` entries; the next write stores them in the new form.
+
+    Entries are kept oldest first and capped at ``max_threads`` in total. The
+    file is re-read on every access so the bots see threads started by a cron
     ``--brief --slack`` run without restarting.
     """
 
@@ -90,26 +98,34 @@ class ThreadSessions:
         self.max_threads = max_threads
 
     @staticmethod
-    def key(channel: str, thread_ts: str) -> str:
-        return f"{channel}:{thread_ts}"
+    def key(persona: str, channel: str, thread_ts: str) -> str:
+        if persona not in PERSONAS:
+            raise ValueError(f"unknown persona: {persona!r}")
+        return f"{persona}:{channel}:{thread_ts}"
 
     def threads(self) -> dict[str, str]:
         raw = _read_json(self.path).get("threads")
         if not isinstance(raw, dict):
             return {}
-        return {
-            key: value
-            for key, value in raw.items()
-            if isinstance(key, str) and isinstance(value, str) and _SESSION_ID_RE.match(value)
-        }
+        threads: dict[str, str] = {}
+        for key, value in raw.items():
+            if not (isinstance(key, str) and isinstance(value, str) and _SESSION_ID_RE.match(value)):
+                continue
+            parts = key.split(":")
+            if len(parts) == 2:  # legacy entry from the single-bot version
+                key = self.key(MUNGCHI, *parts)
+            elif len(parts) != 3 or parts[0] not in PERSONAS:
+                continue
+            threads[key] = value
+        return threads
 
-    def get(self, channel: str, thread_ts: str) -> str | None:
-        return self.threads().get(self.key(channel, thread_ts))
+    def get(self, channel: str, thread_ts: str, *, persona: str) -> str | None:
+        return self.threads().get(self.key(persona, channel, thread_ts))
 
-    def set(self, channel: str, thread_ts: str, session_id: str) -> None:
+    def set(self, channel: str, thread_ts: str, session_id: str, *, persona: str) -> None:
         if not _SESSION_ID_RE.match(session_id or ""):
             return
-        key = self.key(channel, thread_ts)
+        key = self.key(persona, channel, thread_ts)
         with _LOCK:
             threads = self.threads()
             threads.pop(key, None)  # re-insert as the most recent thread
@@ -118,10 +134,11 @@ class ThreadSessions:
                 del threads[next(iter(threads))]
             _write_json(self.path, {"threads": threads})
 
-    def forget(self, channel: str, thread_ts: str) -> None:
+    def forget(self, channel: str, thread_ts: str, *, persona: str) -> None:
+        key = self.key(persona, channel, thread_ts)
         with _LOCK:
             threads = self.threads()
-            if threads.pop(self.key(channel, thread_ts), None) is not None:
+            if threads.pop(key, None) is not None:
                 _write_json(self.path, {"threads": threads})
 
 

@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Mapping
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .personas import MUNGCHI, PERSONA_LABELS, PERSONAS, SCHEDULE, SLACK_HANDLES, UPDATE
+
 DEFAULT_MODEL = "claude-opus-5-5"
 DEFAULT_TIMEZONE = "Asia/Seoul"
 DEFAULT_LOOKBACK_DAYS = 7
@@ -250,18 +252,79 @@ def calendar_hint(missing: list[str]) -> str:
 # DM ids with D. A member id as the briefing target posts to the app's DM.
 _SLACK_USER_ID_RE = re.compile(r"^[UW][A-Z0-9]{2,}$")
 _SLACK_CHANNEL_ID_RE = re.compile(r"^[CGDUW][A-Z0-9]{2,}$")
-SLACK_README_HINT = "설정 방법은 README의 'Slack에서 고뭉치 부르기'를 보세요."
+SLACK_README_HINT = "설정 방법은 README의 'Slack에서 부르기'를 보세요."
+
+# One Slack app per persona: (bot token env, app-level token env). Every pair
+# is optional; 고뭉치 keeps the original names for backward compatibility.
+SLACK_BOT_ENV: dict[str, tuple[str, str]] = {
+    MUNGCHI: ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"),
+    UPDATE: ("SLACK_UPDATE_BOT_TOKEN", "SLACK_UPDATE_APP_TOKEN"),
+    SCHEDULE: ("SLACK_SCHEDULE_BOT_TOKEN", "SLACK_SCHEDULE_APP_TOKEN"),
+}
+
+
+@dataclass
+class SlackBotConfig:
+    """One Slack app (bot): the persona it speaks as and its token pair."""
+
+    persona: str
+    bot_env: str
+    app_env: str
+    # Tokens stay out of repr() so a logged config never leaks them.
+    bot_token: str = field(default="", repr=False)
+    app_token: str = field(default="", repr=False)
+
+    @property
+    def label(self) -> str:
+        return PERSONA_LABELS[self.persona]
+
+    @property
+    def handle(self) -> str:
+        return SLACK_HANDLES[self.persona]
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.bot_token and self.app_token)
+
+    @property
+    def partial(self) -> bool:
+        return bool(self.bot_token) != bool(self.app_token)
 
 
 @dataclass
 class SlackConfig:
-    # Tokens stay out of repr() so a logged config never leaks them.
+    # 고뭉치's tokens (SLACK_BOT_TOKEN / SLACK_APP_TOKEN), also used by --brief --slack.
     bot_token: str = field(default="", repr=False)
     app_token: str = field(default="", repr=False)
     allowed_user_ids: frozenset[str] = frozenset()
     invalid_user_ids: list[str] = field(default_factory=list)
     brief_channel: str = ""
     max_concurrent: int = DEFAULT_SLACK_MAX_CONCURRENT
+    # Every persona's bot in PERSONAS order, configured or not.
+    bots: list[SlackBotConfig] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not self.bots:  # built by hand: only 고뭉치's tokens are known
+            self.bots = [
+                SlackBotConfig(
+                    persona=persona,
+                    bot_env=SLACK_BOT_ENV[persona][0],
+                    app_env=SLACK_BOT_ENV[persona][1],
+                    bot_token=self.bot_token if persona == MUNGCHI else "",
+                    app_token=self.app_token if persona == MUNGCHI else "",
+                )
+                for persona in PERSONAS
+            ]
+
+    def bot(self, persona: str) -> SlackBotConfig:
+        for bot in self.bots:
+            if bot.persona == persona:
+                return bot
+        raise KeyError(persona)
+
+    @property
+    def configured_bots(self) -> list[SlackBotConfig]:
+        return [bot for bot in self.bots if bot.configured]
 
 
 def load_slack_config(env: Mapping[str, str] | None = None) -> SlackConfig:
@@ -277,45 +340,76 @@ def load_slack_config(env: Mapping[str, str] | None = None) -> SlackConfig:
         max_concurrent = int(raw_max) if raw_max else DEFAULT_SLACK_MAX_CONCURRENT
     except ValueError:
         max_concurrent = DEFAULT_SLACK_MAX_CONCURRENT
+    bots = [
+        SlackBotConfig(
+            persona=persona,
+            bot_env=SLACK_BOT_ENV[persona][0],
+            app_env=SLACK_BOT_ENV[persona][1],
+            bot_token=_get(env, SLACK_BOT_ENV[persona][0]),
+            app_token=_get(env, SLACK_BOT_ENV[persona][1]),
+        )
+        for persona in PERSONAS
+    ]
     return SlackConfig(
-        bot_token=_get(env, "SLACK_BOT_TOKEN"),
-        app_token=_get(env, "SLACK_APP_TOKEN"),
+        bot_token=bots[0].bot_token,
+        app_token=bots[0].app_token,
         allowed_user_ids=frozenset(allowed),
         invalid_user_ids=invalid,
         brief_channel=_get(env, "SLACK_BRIEF_CHANNEL"),
         max_concurrent=max_concurrent if max_concurrent > 0 else DEFAULT_SLACK_MAX_CONCURRENT,
+        bots=bots,
     )
 
 
+def _token_shape_problems(bot_env: str, bot_token: str, app_env: str, app_token: str) -> list[str]:
+    problems: list[str] = []
+    if bot_token and not bot_token.startswith("xoxb-"):
+        swapped = f" (xapp-로 시작하는 토큰은 {app_env}에 넣으세요)" if bot_token.startswith("xapp-") else ""
+        problems.append(f"{bot_env} 값은 xoxb-로 시작하는 Bot User OAuth Token이어야 합니다{swapped}.")
+    if app_token and not app_token.startswith("xapp-"):
+        swapped = f" (xoxb-로 시작하는 토큰은 {bot_env}에 넣으세요)" if app_token.startswith("xoxb-") else ""
+        problems.append(
+            f"{app_env} 값은 xapp-로 시작하는 App-Level Token(connections:write 권한)이어야 합니다{swapped}."
+        )
+    return problems
+
+
 def _bot_token_problems(cfg: SlackConfig) -> list[str]:
-    if cfg.bot_token and not cfg.bot_token.startswith("xoxb-"):
-        swapped = " (xapp-로 시작하는 토큰은 SLACK_APP_TOKEN에 넣으세요)" if cfg.bot_token.startswith("xapp-") else ""
-        return [f"SLACK_BOT_TOKEN 값은 xoxb-로 시작하는 Bot User OAuth Token이어야 합니다{swapped}."]
-    return []
+    return _token_shape_problems("SLACK_BOT_TOKEN", cfg.bot_token, "SLACK_APP_TOKEN", "")
 
 
 def slack_bot_problems(cfg: SlackConfig) -> list[str]:
     """Korean problem lines that keep ``python -m mungchi slack`` from starting.
 
-    An empty allow-list is a hard error: 고뭉치 reads private Dropbox, Overleaf
-    and calendar data and must never answer anyone but its owner.
+    Each bot (고뭉치, 업뎃, 일정) is optional, but at least one must have both
+    tokens and none may have only one. An empty allow-list is a hard error:
+    the bots read private Dropbox, Overleaf and calendar data and must never
+    answer anyone but their owner.
     """
-    missing = [
-        name
-        for name, value in (
-            ("SLACK_BOT_TOKEN", cfg.bot_token),
-            ("SLACK_APP_TOKEN", cfg.app_token),
-            ("SLACK_ALLOWED_USER_IDS", cfg.allowed_user_ids or cfg.invalid_user_ids),
-        )
-        if not value
-    ]
+    bots = cfg.bots
+    missing = [bot.app_env if bot.bot_token else bot.bot_env for bot in bots if bot.partial]
+    if not (cfg.allowed_user_ids or cfg.invalid_user_ids):
+        missing.append("SLACK_ALLOWED_USER_IDS")
     problems = [f"빠진 환경변수: {', '.join(missing)}"] if missing else []
-    problems += _bot_token_problems(cfg)
-    if cfg.app_token and not cfg.app_token.startswith("xapp-"):
-        swapped = " (xoxb-로 시작하는 토큰은 SLACK_BOT_TOKEN에 넣으세요)" if cfg.app_token.startswith("xoxb-") else ""
-        problems.append(
-            f"SLACK_APP_TOKEN 값은 xapp-로 시작하는 App-Level Token(connections:write 권한)이어야 합니다{swapped}."
-        )
+    if not any(bot.bot_token or bot.app_token for bot in bots):
+        pairs = ", ".join(f"{bot.label} 봇 {bot.bot_env}+{bot.app_env}" for bot in bots)
+        problems.append(f"Slack 봇 토큰이 하나도 없습니다. 쓰려는 봇마다 토큰 두 개를 넣으세요(봇 하나 이상): {pairs}.")
+    for bot in bots:
+        if bot.partial:
+            problems.append(
+                f"{bot.label} 봇의 토큰이 하나만 있습니다. {bot.bot_env}과 {bot.app_env}을 둘 다 넣거나 둘 다 비우세요."
+            )
+        problems += _token_shape_problems(bot.bot_env, bot.bot_token, bot.app_env, bot.app_token)
+    used: dict[str, list[str]] = {}
+    for bot in bots:
+        for name, value in ((bot.bot_env, bot.bot_token), (bot.app_env, bot.app_token)):
+            if value:
+                used.setdefault(value, []).append(name)
+    for names in used.values():
+        if len(names) > 1:
+            problems.append(
+                f"같은 토큰이 여러 변수에 들어 있습니다: {', '.join(names)} — 봇마다 따로 만든 Slack 앱의 토큰을 넣으세요."
+            )
     if cfg.invalid_user_ids:
         problems.append(
             "SLACK_ALLOWED_USER_IDS에 멤버 ID가 아닌 값이 있습니다: "
@@ -324,14 +418,14 @@ def slack_bot_problems(cfg: SlackConfig) -> list[str]:
         )
     if not cfg.allowed_user_ids:
         problems.append(
-            "SLACK_ALLOWED_USER_IDS가 비어 있어 봇을 시작하지 않습니다. 고뭉치는 Dropbox·Overleaf·캘린더의 "
+            "SLACK_ALLOWED_USER_IDS가 비어 있어 봇을 시작하지 않습니다. 고뭉치·업뎃·일정은 Dropbox·Overleaf·캘린더의 "
             "개인 정보를 읽기 때문에, 답해도 되는 사람(보통 나 혼자)의 멤버 ID를 쉼표로 구분해 넣어야 합니다."
         )
     return problems
 
 
 def slack_brief_problems(cfg: SlackConfig) -> list[str]:
-    """Korean problem lines that keep ``--brief --slack`` from posting."""
+    """Korean problem lines that keep ``--brief --slack`` (고뭉치's bot token) from posting."""
     missing = [
         name
         for name, value in (("SLACK_BOT_TOKEN", cfg.bot_token), ("SLACK_BRIEF_CHANNEL", cfg.brief_channel))
@@ -358,6 +452,10 @@ SECRET_ENV_VARS = (
     "ANTHROPIC_API_KEY",
     "SLACK_BOT_TOKEN",
     "SLACK_APP_TOKEN",
+    "SLACK_UPDATE_BOT_TOKEN",
+    "SLACK_UPDATE_APP_TOKEN",
+    "SLACK_SCHEDULE_BOT_TOKEN",
+    "SLACK_SCHEDULE_APP_TOKEN",
 )
 
 

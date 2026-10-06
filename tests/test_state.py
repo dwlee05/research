@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from mungchi import config
 from mungchi.state import MAX_SLACK_THREADS, StateStore, ThreadSessions, ensure_aware, resolve_since
 
@@ -78,40 +80,79 @@ SID_B = "bbbbbbbb-0000-0000-0000-000000000002"
 def test_thread_sessions_roundtrip_across_instances(tmp_path):
     path = tmp_path / "threads.json"
     store = ThreadSessions(path)
-    assert store.get("C1", "1.0") is None
-    store.set("C1", "1.0", SID_A)
-    store.set("D1", "2.0", SID_B)
+    assert store.get("C1", "1.0", persona="mungchi") is None
+    store.set("C1", "1.0", SID_A, persona="mungchi")
+    store.set("D1", "2.0", SID_B, persona="update")
     reopened = ThreadSessions(path)  # e.g. after a bot restart
-    assert reopened.get("C1", "1.0") == SID_A
-    assert reopened.get("D1", "2.0") == SID_B
-    assert reopened.get("C1", "2.0") is None
+    assert reopened.get("C1", "1.0", persona="mungchi") == SID_A
+    assert reopened.get("D1", "2.0", persona="update") == SID_B
+    assert reopened.get("C1", "2.0", persona="mungchi") is None
     data = json.loads(path.read_text(encoding="utf-8"))
-    assert data == {"threads": {"C1:1.0": SID_A, "D1:2.0": SID_B}}
-    reopened.forget("C1", "1.0")
-    assert ThreadSessions(path).get("C1", "1.0") is None
+    assert data == {"threads": {"mungchi:C1:1.0": SID_A, "update:D1:2.0": SID_B}}
+    reopened.forget("C1", "1.0", persona="mungchi")
+    assert ThreadSessions(path).get("C1", "1.0", persona="mungchi") is None
+
+
+def test_thread_sessions_are_isolated_per_persona(tmp_path):
+    store = ThreadSessions(tmp_path / "threads.json")
+    store.set("C1", "1.0", SID_A, persona="mungchi")
+    store.set("C1", "1.0", SID_B, persona="update")
+    # Same channel and thread, different bot -> different session (or none).
+    assert store.get("C1", "1.0", persona="mungchi") == SID_A
+    assert store.get("C1", "1.0", persona="update") == SID_B
+    assert store.get("C1", "1.0", persona="schedule") is None
+    store.forget("C1", "1.0", persona="update")
+    assert store.get("C1", "1.0", persona="mungchi") == SID_A
+    with pytest.raises(ValueError):
+        store.get("C1", "1.0", persona="nobody")
+    with pytest.raises(TypeError):
+        store.get("C1", "1.0")  # the persona is never implied
+
+
+def test_legacy_entries_are_migrated_to_mungchi(tmp_path):
+    path = tmp_path / "threads.json"
+    path.write_text(
+        json.dumps({"threads": {"C1:1.0": SID_A, "update:C1:2.0": SID_B, "nobody:C1:3.0": SID_A, "a:b:c:d": SID_A}}),
+        encoding="utf-8",
+    )
+    store = ThreadSessions(path)
+    assert store.threads() == {"mungchi:C1:1.0": SID_A, "update:C1:2.0": SID_B}
+    assert store.get("C1", "1.0", persona="mungchi") == SID_A  # a briefing thread from the single-bot version
+    assert store.get("C1", "1.0", persona="update") is None
+    store.set("D1", "9.0", SID_B, persona="schedule")  # the next write stores the new form
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data == {"threads": {"mungchi:C1:1.0": SID_A, "update:C1:2.0": SID_B, "schedule:D1:9.0": SID_B}}
 
 
 def test_thread_sessions_cap_keeps_most_recent(tmp_path):
     store = ThreadSessions(tmp_path / "threads.json", max_threads=3)
     for i in range(5):
-        store.set("C1", f"{i}.0", f"session-{i:04d}")
-    assert list(store.threads()) == ["C1:2.0", "C1:3.0", "C1:4.0"]
+        store.set("C1", f"{i}.0", f"session-{i:04d}", persona="mungchi" if i % 2 else "schedule")
+    assert list(store.threads()) == ["schedule:C1:2.0", "mungchi:C1:3.0", "schedule:C1:4.0"]
     # Updating an old thread makes it the most recent one.
-    store.set("C1", "2.0", "session-new0")
-    store.set("C1", "5.0", "session-0005")
-    assert list(store.threads()) == ["C1:4.0", "C1:2.0", "C1:5.0"]
+    store.set("C1", "2.0", "session-new0", persona="schedule")
+    store.set("C1", "5.0", "session-0005", persona="update")
+    assert list(store.threads()) == ["schedule:C1:4.0", "schedule:C1:2.0", "update:C1:5.0"]
     assert MAX_SLACK_THREADS == 200
+
+
+def test_thread_sessions_cap_counts_migrated_legacy_entries(tmp_path):
+    path = tmp_path / "threads.json"
+    path.write_text(json.dumps({"threads": {f"C1:{i}.0": f"session-{i:04d}" for i in range(3)}}), encoding="utf-8")
+    store = ThreadSessions(path, max_threads=3)
+    store.set("C1", "9.0", "session-0009", persona="update")
+    assert list(store.threads()) == ["mungchi:C1:1.0", "mungchi:C1:2.0", "update:C1:9.0"]
 
 
 def test_thread_sessions_ignore_corrupt_or_unsafe_values(tmp_path):
     path = tmp_path / "threads.json"
     path.write_text("{not json", encoding="utf-8")
     store = ThreadSessions(path)
-    assert store.get("C1", "1.0") is None
-    store.set("C1", "1.0", "--bad value; rm -rf /")  # never stored or passed to --resume
-    assert store.get("C1", "1.0") is None
+    assert store.get("C1", "1.0", persona="mungchi") is None
+    store.set("C1", "1.0", "--bad value; rm -rf /", persona="mungchi")  # never stored or passed to --resume
+    assert store.get("C1", "1.0", persona="mungchi") is None
     path.write_text(json.dumps({"threads": {"C1:1.0": "--flag", "C1:2.0": SID_A}}), encoding="utf-8")
-    assert store.threads() == {"C1:2.0": SID_A}
+    assert store.threads() == {"mungchi:C1:2.0": SID_A}
 
 
 def test_slack_threads_file_sits_next_to_state_file(tmp_path):

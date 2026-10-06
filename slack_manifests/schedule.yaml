@@ -1,21 +1,22 @@
-# 비서실 고뭉치 Slack 앱 매니페스트
+# 일정 Slack 앱 매니페스트 (@schedule)
 # api.slack.com/apps → Create New App → From an app manifest → 워크스페이스 선택 → 이 내용을 붙여 넣기.
 # Socket Mode를 쓰므로 공개 URL(Request URL)이 필요 없습니다.
+# 토큰은 SLACK_SCHEDULE_BOT_TOKEN(xoxb-)과 SLACK_SCHEDULE_APP_TOKEN(xapp-)에 넣습니다.
 display_information:
-  name: 비서실 고뭉치
-  description: 공저자 업데이트와 일정을 챙겨 주는 연구 비서 (고뭉치·업뎃·빠릿)
-  background_color: "#3b4a5a"
+  name: 일정
+  description: 캘린더에서 오늘·내일 일정과 지금·바로 다음 일정, 빈 시간을 바로 알려 주는 비서실 일정 담당
+  background_color: "#5a3b4a"
 features:
   app_home:
     home_tab_enabled: false
     messages_tab_enabled: true
     messages_tab_read_only_enabled: false
   bot_user:
-    # display_name은 ASCII여야 합니다. Slack이 여기서 @멘션 핸들(@moongchi)을 만들기 때문입니다.
-    # 그래도 `@고뭉치`라고 입력하면 Slack 자동완성에서 봇을 찾을 수 있습니다(Slack은 앱 이름도 함께 검색합니다).
-    # 나중에 App Home → "Your App's Presence in Slack" → Edit에서 표시 이름을 "고뭉치"로 바꿀 수 있습니다
+    # display_name은 ASCII여야 합니다. Slack이 여기서 @멘션 핸들(@schedule)을 만들기 때문입니다.
+    # 그래도 `@일정`이라고 입력하면 Slack 자동완성에서 봇을 찾을 수 있습니다(Slack은 앱 이름도 함께 검색합니다).
+    # 나중에 App Home → "Your App's Presence in Slack" → Edit에서 표시 이름을 "일정"으로 바꿀 수 있습니다
     # (Slack이 받아 주는 경우).
-    display_name: moongchi
+    display_name: schedule
     always_online: true
 oauth_config:
   scopes:

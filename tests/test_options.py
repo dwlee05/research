@@ -21,11 +21,13 @@ from mungchi import main as main_module
 from mungchi.agents import (
     AGENT_LABELS,
     MUNGCHI_SYSTEM_PROMPT,
-    PPALIT,
-    UPDEOT,
+    TOOL_GATES,
+    build_schedule_prompt,
+    build_update_prompt,
     gate_decision,
     tool_gate,
 )
+from mungchi.personas import SCHEDULE, UPDATE
 from mungchi.main import BLOCKED_BUILTINS, Renderer, TurnResult, build_options, build_parser, main, run_turn
 from mungchi.tools import CALENDAR_TOOL, DATA_TOOLS, DROPBOX_TOOL, OVERLEAF_TOOL, SERVER_NAME
 
@@ -38,13 +40,13 @@ def options() -> ClaudeAgentOptions:
 
 def test_agents_have_ascii_keys_and_own_tools_only():
     opts = options()
-    assert set(opts.agents) == {"updeot", "ppalit"}
+    assert set(opts.agents) == {"update", "schedule"}
     assert all(key.isascii() for key in opts.agents)
-    updeot, ppalit = opts.agents["updeot"], opts.agents["ppalit"]
-    assert isinstance(updeot, AgentDefinition) and isinstance(ppalit, AgentDefinition)
-    assert sorted(updeot.tools) == sorted([DROPBOX_TOOL, OVERLEAF_TOOL])
-    assert ppalit.tools == [CALENDAR_TOOL]
-    for agent in (updeot, ppalit):
+    update, schedule = opts.agents["update"], opts.agents["schedule"]
+    assert isinstance(update, AgentDefinition) and isinstance(schedule, AgentDefinition)
+    assert sorted(update.tools) == sorted([DROPBOX_TOOL, OVERLEAF_TOOL])
+    assert schedule.tools == [CALENDAR_TOOL]
+    for agent in (update, schedule):
         assert agent.model == "inherit"
         assert all(t.startswith(f"mcp__{SERVER_NAME}__") for t in agent.tools)
     assert DROPBOX_TOOL == "mcp__mungchi__check_dropbox_updates"
@@ -73,14 +75,14 @@ def test_data_tools_are_gated_per_subagent():
     for tool in DATA_TOOLS:
         assert decision(tool) == "deny"
     # Each subagent may call only its own tools.
-    assert decision(DROPBOX_TOOL, UPDEOT, "a1") == "allow"
-    assert decision(OVERLEAF_TOOL, UPDEOT, "a1") == "allow"
-    assert decision(CALENDAR_TOOL, UPDEOT, "a1") == "deny"
-    assert decision(CALENDAR_TOOL, PPALIT, "a2") == "allow"
-    assert decision(DROPBOX_TOOL, PPALIT, "a2") == "deny"
+    assert decision(DROPBOX_TOOL, UPDATE, "a1") == "allow"
+    assert decision(OVERLEAF_TOOL, UPDATE, "a1") == "allow"
+    assert decision(CALENDAR_TOOL, UPDATE, "a1") == "deny"
+    assert decision(CALENDAR_TOOL, SCHEDULE, "a2") == "allow"
+    assert decision(DROPBOX_TOOL, SCHEDULE, "a2") == "deny"
     assert decision(DROPBOX_TOOL, "general-purpose", "a3") == "deny"
-    # Only 업뎃 and 빠릿 can be spawned.
-    assert decision("Agent", tool_input={"subagent_type": "updeot"}) is None
+    # Only 업뎃 and 일정 can be spawned.
+    assert decision("Agent", tool_input={"subagent_type": "update"}) is None
     assert decision("Agent", tool_input={"subagent_type": "general-purpose"}) == "deny"
 
 
@@ -121,8 +123,8 @@ def test_renderer_streams_text_once_and_announces_subagents():
         AssistantMessage(
             content=[
                 TextBlock(text="확인할게요."),
-                ToolUseBlock(id="t1", name="Agent", input={"subagent_type": "updeot", "prompt": "..."}),
-                ToolUseBlock(id="t2", name="Task", input={"subagent_type": "ppalit", "prompt": "..."}),
+                ToolUseBlock(id="t1", name="Agent", input={"subagent_type": "update", "prompt": "..."}),
+                ToolUseBlock(id="t2", name="Task", input={"subagent_type": "schedule", "prompt": "..."}),
             ],
             model="m",
         )
@@ -134,7 +136,7 @@ def test_renderer_streams_text_once_and_announces_subagents():
         ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1, is_error=False, num_turns=2, session_id="s")
     )
     assert out.getvalue() == "확인할게요.\n\n브리핑 끝\n"
-    assert status.getvalue().splitlines() == ["→ 업뎃에게 맡기는 중...", "→ 빠릿에게 맡기는 중..."]
+    assert status.getvalue().splitlines() == ["→ 업뎃에게 맡기는 중...", "→ 일정에게 맡기는 중..."]
     assert not renderer.failed
 
 
@@ -155,7 +157,7 @@ def test_cli_parser():
     assert parser.parse_args(["--brief"]).brief is True
     assert parser.parse_args(["오늘 일정?"]).question == "오늘 일정?"
     assert "사용법" in parser.format_help()
-    assert set(AGENT_LABELS.values()) == {"업뎃", "빠릿"}
+    assert set(AGENT_LABELS.values()) == {"업뎃", "일정"}
 
 
 # ---------------------------------------------------------------- shared runner
@@ -166,7 +168,7 @@ SCRIPT = [
     AssistantMessage(
         content=[
             TextBlock(text="업뎃에게 맡길게요."),
-            ToolUseBlock(id="t1", name="Agent", input={"subagent_type": "updeot", "prompt": "..."}),
+            ToolUseBlock(id="t1", name="Agent", input={"subagent_type": "update", "prompt": "..."}),
         ],
         model="m",
     ),
@@ -233,7 +235,7 @@ def test_run_turn_resumes_reports_status_and_returns_answer(fake_sdk, capsys):
     for field in SAFETY_FIELDS:
         assert getattr(opts, field) == getattr(baseline, field), field
     assert opts.hooks["PreToolUse"][0].hooks == [tool_gate]
-    assert set(opts.agents) == {"updeot", "ppalit"}
+    assert set(opts.agents) == {"update", "schedule"}
     assert set(opts.mcp_servers) == {SERVER_NAME}
     # Quiet by default: nothing printed.
     assert capsys.readouterr() == ("", "")
@@ -312,13 +314,189 @@ def test_api_error_text_is_not_part_of_the_answer():
 
 
 def test_prompts_never_promise_overleaf_content_summaries():
-    from mungchi.agents import UPDEOT_DESCRIPTION, UPDEOT_PROMPT
+    from mungchi.agents import UPDATE_DESCRIPTION, UPDATE_PROMPT
 
-    for text in (MUNGCHI_SYSTEM_PROMPT, UPDEOT_PROMPT, UPDEOT_DESCRIPTION):
+    for text in (MUNGCHI_SYSTEM_PROMPT, UPDATE_PROMPT, UPDATE_DESCRIPTION):
         assert "diff" not in text.replace("diff는 없다", "")
         assert "요약한다" not in text
-    assert "프로젝트 열기" in MUNGCHI_SYSTEM_PROMPT and "프로젝트 열기" in UPDEOT_PROMPT
+    assert "프로젝트 열기" in MUNGCHI_SYSTEM_PROMPT and "프로젝트 열기" in UPDATE_PROMPT
     assert "내용은 직접 확인해 주세요." in MUNGCHI_SYSTEM_PROMPT
-    assert "내용은 직접 확인해 주세요." in UPDEOT_PROMPT
+    assert "내용은 직접 확인해 주세요." in UPDATE_PROMPT
     for key in ("edited_by", "last_edit", "edits", "unchanged", "errors"):
-        assert key in UPDEOT_PROMPT
+        assert key in UPDATE_PROMPT
+
+
+# ---------------------------------------------------------------- personas (direct 업뎃 / 일정)
+
+
+@pytest.fixture
+def server_spy(monkeypatch):
+    """Records which tools each built MCP server gets (None = all three)."""
+    built: list[list[str] | None] = []
+    real = main_module.build_server
+
+    def spy(tools=None):
+        tools = None if tools is None else list(tools)
+        built.append(None if tools is None else [t.name for t in tools])
+        return real(tools)
+
+    monkeypatch.setattr(main_module, "build_server", spy)
+    return built
+
+
+def test_direct_update_gets_only_its_two_data_tools(server_spy):
+    opts = build_options(env={}, now=NOW, persona="update")
+    assert opts.tools == []  # no built-in tools at all, not even Agent
+    assert opts.allowed_tools == [DROPBOX_TOOL, OVERLEAF_TOOL]
+    assert "Agent" not in opts.allowed_tools and "Agent" in opts.disallowed_tools
+    assert not opts.agents
+    assert set(BLOCKED_BUILTINS) <= set(opts.disallowed_tools)
+    assert opts.permission_mode == "dontAsk"
+    assert opts.setting_sources == []
+    assert opts.env == options().env
+    assert server_spy[0] == ["check_dropbox_updates", "check_overleaf_updates"]
+    assert opts.hooks["PreToolUse"][0].hooks == [TOOL_GATES["update"]]
+    assert set(opts.mcp_servers) == {SERVER_NAME}
+
+
+def test_direct_schedule_gets_only_get_schedule(server_spy):
+    opts = build_options(env={}, now=NOW, persona="schedule")
+    assert opts.tools == []
+    assert opts.allowed_tools == [CALENDAR_TOOL]
+    assert "Agent" in opts.disallowed_tools
+    assert not opts.agents
+    assert set(BLOCKED_BUILTINS) <= set(opts.disallowed_tools)
+    assert server_spy[-1] == ["get_schedule"]
+    assert opts.hooks["PreToolUse"][0].hooks == [TOOL_GATES["schedule"]]
+
+
+def test_mungchi_options_are_unchanged_by_personas(server_spy):
+    default, explicit = options(), build_options(env={}, now=NOW, persona="mungchi")
+    for field in (*SAFETY_FIELDS, "system_prompt"):
+        assert getattr(default, field) == getattr(explicit, field), field
+    assert explicit.tools == ["Agent"] and explicit.allowed_tools == ["Agent"]
+    assert explicit.disallowed_tools == BLOCKED_BUILTINS
+    assert set(explicit.agents) == {"update", "schedule"}
+    assert explicit.hooks["PreToolUse"][0].hooks == [tool_gate]
+    assert TOOL_GATES["mungchi"] is tool_gate
+    assert server_spy == [None, None]  # 고뭉치's server keeps all three tools for its subagents
+
+
+def test_unknown_persona_is_rejected():
+    with pytest.raises(ValueError):
+        build_options(env={}, now=NOW, persona="nobody")
+
+
+def test_direct_gates_allow_only_the_personas_own_tools():
+    def decision(persona, tool, agent_id=None, tool_input=None):
+        out = gate_decision(tool, tool_input or {}, None, agent_id, persona=persona)
+        return out["hookSpecificOutput"]["permissionDecision"]
+
+    assert decision("update", DROPBOX_TOOL) == "allow"
+    assert decision("update", OVERLEAF_TOOL) == "allow"
+    assert decision("update", CALENDAR_TOOL) == "deny"
+    assert decision("schedule", CALENDAR_TOOL) == "allow"
+    assert decision("schedule", DROPBOX_TOOL) == "deny"
+    assert decision("schedule", OVERLEAF_TOOL) == "deny"
+    for persona in ("update", "schedule"):
+        for tool in ("Agent", "Task"):
+            for subagent in ("update", "schedule", "general-purpose"):
+                assert decision(persona, tool, tool_input={"subagent_type": subagent}) == "deny"
+        for tool in ("Bash", "Read", "Write", "WebFetch", "mcp__other__tool", ""):
+            assert decision(persona, tool) == "deny"
+        # Never from inside a subagent, even for the persona's own tools.
+        for tool in DATA_TOOLS:
+            assert decision(persona, tool, agent_id="a1") == "deny"
+    # Unknown personas own nothing.
+    for tool in DATA_TOOLS:
+        assert decision("nobody", tool) == "deny"
+
+
+def test_direct_gate_hooks_are_async_and_persona_bound():
+    async def ask(persona, tool):
+        out = await TOOL_GATES[persona]({"tool_name": tool, "tool_input": {}}, "t1", None)
+        return out["hookSpecificOutput"]["permissionDecision"]
+
+    assert asyncio.run(ask("update", DROPBOX_TOOL)) == "allow"
+    assert asyncio.run(ask("update", CALENDAR_TOOL)) == "deny"
+    assert asyncio.run(ask("schedule", CALENDAR_TOOL)) == "allow"
+    assert asyncio.run(ask("schedule", "Agent")) == "deny"
+
+
+def test_direct_and_subagent_prompts_share_the_same_rules():
+    sub, direct = build_update_prompt(), build_update_prompt(direct=True)
+    assert "고뭉치에게 한국어로 보고" in sub and "고뭉치" not in direct.split("## 대화")[0]
+    assert "사용자에게 직접" in direct and "사용자에게 직접" not in sub
+    rules = sub[sub.index("## 공통 규칙") : sub.index("## 보고 형식")]
+    assert rules.replace("고뭉치에게", "사용자에게") in direct
+    assert sub.split("## 보고 형식")[1] == direct.split("## 답 형식")[1]
+
+    sub, direct = build_schedule_prompt(), build_schedule_prompt(direct=True)
+    assert "고뭉치에게 한국어로 짧게 보고" in sub and "사용자에게 직접 한국어로 짧게 답한다" in direct
+    assert sub.split("## 보고 형식 (짧게)")[1] == direct.split("## 답 형식 (짧게)")[1]
+    assert "'일정' 에이전트" in sub and "'일정' 에이전트" in direct
+
+
+def test_direct_prompts_carry_date_and_point_elsewhere_for_other_requests():
+    update = build_options(env={}, now=NOW, persona="update").system_prompt
+    schedule = build_options(env={}, now=NOW, persona="schedule").system_prompt
+    for prompt in (update, schedule):
+        assert "2026-10-05 (월요일)" in prompt and "Asia/Seoul" in prompt
+        assert "Agent" not in prompt
+    assert "'일정' 에이전트" in update and "고뭉치 담당" in update
+    assert "업뎃" in schedule and "고뭉치 담당" in schedule
+    # 고뭉치 names its schedule subagent unambiguously.
+    assert "'일정' 에이전트 (subagent_type: \"schedule\")" in MUNGCHI_SYSTEM_PROMPT
+
+
+def test_run_turn_runs_the_requested_persona(fake_sdk):
+    result = asyncio.run(run_turn("질문", persona="update", resume="sess-0", extra_system_prompt="## Slack 규칙"))
+    assert result.session_id == "sess-final"
+    [client] = fake_sdk.instances
+    opts = client.options
+    assert opts.resume == "sess-0"
+    assert opts.tools == [] and not opts.agents
+    assert opts.allowed_tools == [DROPBOX_TOOL, OVERLEAF_TOOL]
+    assert opts.hooks["PreToolUse"][0].hooks == [TOOL_GATES["update"]]
+    assert opts.system_prompt.rstrip().endswith("## Slack 규칙")
+
+
+def test_renderer_answer_starts_after_last_data_tool_call():
+    renderer = Renderer(echo=False)
+    renderer.handle(
+        AssistantMessage(
+            content=[TextBlock(text="확인해 볼게요."), ToolUseBlock(id="t1", name=DROPBOX_TOOL, input={})], model="m"
+        )
+    )
+    renderer.handle(AssistantMessage(content=[TextBlock(text="Dropbox 변경 없음")], model="m"))
+    assert renderer.result().text == "Dropbox 변경 없음"
+    assert renderer.status_lines == []
+
+
+def test_cli_agent_one_shot_and_chat(fake_sdk, capsys, monkeypatch):
+    assert main(["--agent", "update", "누가 Overleaf 고쳤어?"]) == 0
+    [client] = fake_sdk.instances
+    assert client.prompts == ["누가 Overleaf 고쳤어?"]
+    assert client.options.allowed_tools == [DROPBOX_TOOL, OVERLEAF_TOOL] and not client.options.agents
+
+    fake_sdk.instances = []
+    lines = iter(["내일 일정은?", "종료"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(lines))
+    assert main(["--agent", "schedule"]) == 0
+    [client] = fake_sdk.instances
+    assert client.prompts == ["내일 일정은?"]
+    assert client.options.allowed_tools == [CALENDAR_TOOL]
+    out = capsys.readouterr().out
+    assert "\n'일정'입니다. 캘린더 일정을 확인해 드릴게요." in out and "일정: 수고하셨습니다!" in out
+
+
+def test_cli_agent_argument_rules(capsys):
+    for argv in (["--agent", "update", "--brief"], ["slack", "--agent", "update"], ["--agent", "mungchi"], ["--agent", "nobody"]):
+        with pytest.raises(SystemExit) as exc:
+            main(argv)
+        assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "--brief는 고뭉치 전용" in err
+    assert "slack 명령은 --agent와 함께 쓸 수 없습니다" in err
+    help_text = build_parser().format_help()
+    assert "--agent" in help_text and "update" in help_text and "schedule" in help_text
