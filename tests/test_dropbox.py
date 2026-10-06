@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import unicodedata
 from datetime import datetime, timedelta, timezone
@@ -8,15 +9,23 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
-from dropbox.files import FileMetadata, FileSharingInfo, FolderMetadata
+from dropbox.exceptions import ApiError
+from dropbox.files import FileMetadata, FileSharingInfo, FolderMetadata, ListFolderError, LookupError
 
-from mungchi import config
+from mungchi import config, dropbox_check
+from mungchi.dropbox_check import run_dropbox_check
+from mungchi.main import build_parser, main
 from mungchi.state import StateStore
 from mungchi.tools import dropbox_tool
 from mungchi.tools.dropbox_tool import (
+    EXCLUDED_BEFORE_WINDOW,
+    EXCLUDED_MINE,
+    EXCLUDED_UNKNOWN_MODIFIER,
+    INCLUDED,
     MAX_LISTED_FILES,
     UNKNOWN_MODIFIER,
     check_dropbox_updates,
+    classify_entry,
     classify_modifier,
     collect_updates,
     folder_link,
@@ -24,11 +33,13 @@ from mungchi.tools.dropbox_tool import (
     relative_path,
     run_check,
     split_group,
+    tally,
 )
 
 ME = "dbid:" + "A" * 35
 KIM = "dbid:" + "B" * 35
 PARK = "dbid:" + "C" * 35
+MY_NAME = "나연구"
 ROOT = "/20_연구-진행"
 # "/20_연구-진행" percent-encoded from its UTF-8 bytes.
 ROOT_LINK = "https://www.dropbox.com/home/20_%EC%97%B0%EA%B5%AC-%EC%A7%84%ED%96%89"
@@ -40,8 +51,9 @@ _rev_counter = iter(range(0x100000000, 0x1FFFFFFFF))
 
 # Every key the compact result may contain; sizes, ids, revs and diffs are gone.
 ALLOWED_KEYS = {
-    "configured", "folder", "since", "total_files", "groups", "omitted",
+    "configured", "folder", "since", "since_basis", "total_files", "stats", "groups", "omitted",
     "subfolder", "link", "by", "name", "files", "path", "modified",
+    "scanned", "changed_in_window", "excluded_mine", "excluded_unknown_modifier",
 }
 
 
@@ -95,7 +107,7 @@ class FakeDropbox:
         raise AssertionError("files_list_revisions must never be called")
 
     def users_get_current_account(self):
-        return SimpleNamespace(account_id=ME)
+        return SimpleNamespace(account_id=ME, name=SimpleNamespace(display_name=MY_NAME))
 
     def _page(self, start):
         chunk = self.entries[start : start + self.page_size]
@@ -141,6 +153,26 @@ def test_classify_modifier_excludes_me_and_unshared_files():
     assert classify_modifier(fm("/r/a.tex", at(2), modified_by=ME), ME) is None
     assert classify_modifier(fm("/r/a.tex", at(2), modified_by=None), ME) == UNKNOWN_MODIFIER
     assert classify_modifier(fm("/r/a.tex", at(2), shared=False), ME) is None
+
+
+def test_classify_entry_gives_exactly_one_decision():
+    # In the window (after SINCE = 10-01 00:00 UTC), in a shared folder:
+    assert classify_entry(fm("/r/a.tex", at(2), modified_by=KIM), ME, SINCE) == INCLUDED
+    assert classify_entry(fm("/r/a.tex", at(2), modified_by=ME), ME, SINCE) == EXCLUDED_MINE
+    # Shared but Dropbox does not say who: still reported, as "확인 불가" (the existing rule).
+    assert classify_entry(fm("/r/a.tex", at(2), modified_by=None), ME, SINCE) == INCLUDED
+    # Not in a shared folder (no sharing_info): nobody can tell who modified it.
+    assert classify_entry(fm("/r/a.tex", at(2), shared=False), ME, SINCE) == EXCLUDED_UNKNOWN_MODIFIER
+    # At or before the start of the window, whoever modified it.
+    for kwargs in ({"modified_by": KIM}, {"modified_by": ME}, {"modified_by": None}, {"shared": False}):
+        assert classify_entry(fm("/r/a.tex", datetime(2026, 9, 30), **kwargs), ME, SINCE) == EXCLUDED_BEFORE_WINDOW
+        assert classify_entry(fm("/r/a.tex", at(1, 0), **kwargs), ME, SINCE) == EXCLUDED_BEFORE_WINDOW
+
+
+def test_tally_counts_decisions():
+    decisions = [INCLUDED, INCLUDED, EXCLUDED_MINE, EXCLUDED_UNKNOWN_MODIFIER, EXCLUDED_BEFORE_WINDOW]
+    assert tally(decisions) == {"scanned": 5, "changed_in_window": 4, "excluded_mine": 1, "excluded_unknown_modifier": 1}
+    assert tally([]) == {"scanned": 0, "changed_in_window": 0, "excluded_mine": 0, "excluded_unknown_modifier": 0}
 
 
 def test_normalize_root_handles_korean_hyphen_and_slashes():
@@ -196,6 +228,8 @@ def test_collect_updates_output_shape_order_and_time_format():
         "folder": ROOT,
         "since": "2026-10-01T09:00+09:00",
         "total_files": 5,
+        # 8 files (the folder is not counted); old.tex is before the window.
+        "stats": {"scanned": 8, "changed_in_window": 7, "excluded_mine": 1, "excluded_unknown_modifier": 1},
         "groups": [
             {
                 "subfolder": "Paper-B",
@@ -335,7 +369,7 @@ def test_tool_handler_returns_compact_list_only_json(monkeypatch):
     result = asyncio.run(check_dropbox_updates.handler({}))
     text = result["content"][0]["text"]
     data = json.loads(text)
-    assert set(data) == {"configured", "folder", "since", "total_files", "groups", "omitted"}
+    assert set(data) == {"configured", "folder", "since", "since_basis", "total_files", "stats", "groups", "omitted"}
     assert set(all_keys(data)) <= ALLOWED_KEYS
     assert data["groups"][0]["by"] == [{"name": "김공저", "files": [{"path": "a.tex", "modified": "2026-10-03 18:00"}]}]
     assert "논문A" in text and "123456" not in text
@@ -355,6 +389,32 @@ def test_run_check_uses_and_updates_state(tmp_path):
     assert payload["total_files"] == 1
     assert payload["since"] == "2026-10-03T09:00+09:00"
     assert store.last_checked("dropbox") == NOW
+
+
+def test_run_check_reports_since_basis_and_stats(tmp_path):
+    entries = [
+        fm(f"{ROOT}/논문A/mine.tex", at(4), modified_by=ME),
+        fm(f"{ROOT}/개인/notes.txt", at(4), shared=False),
+        fm(f"{ROOT}/논문A/old.tex", datetime(2026, 9, 1), modified_by=KIM),
+    ]
+    store = StateStore(tmp_path / "state.json")
+
+    def check(**kwargs):
+        dbx = FakeDropbox(entries, names={KIM: "김공저"})
+        return run_check(env=env_with(), now=NOW, client_factory=lambda cfg: dbx, store=store, **kwargs)
+
+    first = check()  # no record yet: LOOKBACK_DAYS (7 days)
+    assert first["since_basis"] == "lookback_default" and first["since"] == "2026-09-28T09:00+09:00"
+    assert first["total_files"] == 0 and first["groups"] == []
+    assert first["stats"] == {"scanned": 3, "changed_in_window": 2, "excluded_mine": 1, "excluded_unknown_modifier": 1}
+
+    second = check()  # the first check moved the checkpoint to NOW
+    assert second["since_basis"] == "last_check" and second["since"] == "2026-10-05T09:00+09:00"
+    assert second["stats"] == {"scanned": 3, "changed_in_window": 0, "excluded_mine": 0, "excluded_unknown_modifier": 0}
+
+    asked = check(since_hours=24 * 90)
+    assert asked["since_basis"] == "since_hours" and asked["since"] == "2026-07-07T09:00+09:00"
+    assert asked["stats"]["changed_in_window"] == 3 and asked["total_files"] == 1
 
 
 def test_run_check_error_is_scrubbed_and_state_untouched(tmp_path):
@@ -385,3 +445,172 @@ def test_make_client_prefers_refresh_token_trio():
     )
     client = dropbox_tool.make_client(cfg)
     assert client._oauth2_refresh_token == "r" * 20  # no network call is made here
+
+
+# ---------------------------------------------------------------- --dropbox-check
+
+LAST_CHECK = datetime(2026, 10, 3, 0, 0, tzinfo=timezone.utc)  # 10-03 09:00 in Seoul
+
+
+def diagnosis_entries():
+    return [
+        FolderMetadata(name="논문A", path_lower=f"{ROOT}/논문a", path_display=f"{ROOT}/논문A", id="id:folder00"),
+        fm(f"{ROOT}/논문A/intro.tex", at(4, 1), modified_by=KIM),  # 10-04 10:00 Seoul
+        fm(f"{ROOT}/논문A/mine.tex", at(4, 2), modified_by=ME),  # 10-04 11:00
+        fm(f"{ROOT}/개인/notes.txt", at(4, 3), shared=False),  # 10-04 12:00
+        fm(f"{ROOT}/Paper-B/refs.bib", at(3, 5), modified_by=None),  # 10-03 14:00, shared, modifier unknown
+        fm(f"{ROOT}/논문A/old.tex", at(2, 9), modified_by=PARK),  # 10-02 18:00, before the last check
+        *[fm(f"{ROOT}/Archive/a{i}.txt", at(1, i), modified_by=KIM) for i in range(1, 9)],  # 10-01 10:00..17:00
+    ]
+
+
+def run_diagnosis(entries, tmp_path, *, hours=None, last_check=LAST_CHECK, env=None, dbx=None):
+    store = StateStore(tmp_path / "state.json")
+    if last_check is not None:
+        store.mark_checked("dropbox", last_check)
+    dbx = dbx or FakeDropbox(entries, names={KIM: "김공저", PARK: "박공저"})
+    out = io.StringIO()
+    code = run_dropbox_check(
+        env or env_with(), hours=hours, now=NOW, client_factory=lambda cfg: dbx, store=store, out=out
+    )
+    return code, out.getvalue(), store
+
+
+def table_after(text, title):
+    """Cells of the table printed under the line starting with ``title`` (header row first)."""
+    lines = text.split(title, 1)[1].split("\n\n", 1)[0].splitlines()[1:]
+    return [tuple(cell.strip() for cell in line.split(" | ")) for line in lines]
+
+
+def test_dropbox_check_explains_every_file_without_moving_the_checkpoint(tmp_path):
+    state_file = tmp_path / "state.json"
+    code, out, store = run_diagnosis(diagnosis_entries(), tmp_path)
+    assert code == 0
+    assert out.startswith("Dropbox 변경 확인 진단 (읽기 전용")
+    for line in (
+        "확인할 폴더: /20_연구-진행 (기본값)",
+        "폴더: 있음",
+        "계정: 나연구",
+        "기간: 2026-10-03 09:00 (Asia/Seoul) 이후 — 기준: 마지막 확인 시각 (고뭉치·업뎃이 Dropbox를 마지막으로 확인한 때)",
+        "훑어본 파일: 13개 (하위 폴더 포함)",
+        "기간 안에 바뀐 파일: 4개",
+        "  - 포함: 2개 (업뎃이 알려 주는 파일)",
+        "  - 제외: 내가 수정: 1개",
+        "  - 제외: 수정자 정보 없음(공유 폴더 아님): 1개",
+    ):
+        assert line + "\n" in out
+
+    header = ("경로", "수정 시각", "수정한 사람", "공유 폴더", "판정")
+    changed = [
+        ("개인/notes.txt", "10-04 12:00", "(정보 없음)", "아니오", "제외: 수정자 정보 없음(공유 폴더 아님)"),
+        ("논문A/mine.tex", "10-04 11:00", "나연구", "예", "제외: 내가 수정"),
+        ("논문A/intro.tex", "10-04 10:00", "김공저", "예", "포함"),
+        ("Paper-B/refs.bib", "10-03 14:00", "(정보 없음)", "예", "포함"),
+    ]
+    assert table_after(out, "기간 안에 바뀐 파일 (최근 수정 순") == [header, *changed]
+
+    recent = table_after(out, "기간과 상관없이 가장 최근에 바뀐 파일 10개")
+    assert recent[0] == header and len(recent) == 11
+    assert recent[1:5] == changed
+    assert recent[5] == ("논문A/old.tex", "10-02 18:00", "박공저", "예", "제외: 기간 이전 (기준 시각 이전)")
+    assert [row[0] for row in recent[6:]] == [f"Archive/a{i}.txt" for i in (8, 7, 6, 5, 4)]
+
+    assert out.rstrip().splitlines()[-1].startswith("참고: 삭제·이동·이름 바꾸기는 감지하지 않습니다.")
+    # Read-only: the checkpoint is where it was, and no token is printed.
+    assert store.last_checked("dropbox") == LAST_CHECK
+    assert json.loads(state_file.read_text(encoding="utf-8")) == {"last_checked": {"dropbox": LAST_CHECK.isoformat()}}
+    assert TOKEN not in out
+
+
+def test_dropbox_check_matches_what_the_tool_reports(tmp_path):
+    entries = diagnosis_entries()
+    _code, out, _store = run_diagnosis(entries, tmp_path)
+
+    tool_store = StateStore(tmp_path / "tool-state.json")
+    tool_store.mark_checked("dropbox", LAST_CHECK)
+    dbx = FakeDropbox(entries, names={KIM: "김공저", PARK: "박공저"})
+    payload = run_check(env=env_with(), now=NOW, client_factory=lambda cfg: dbx, store=tool_store)
+
+    reported = {f"{g['subfolder']}/{f['path']}" for g in payload["groups"] for p in g["by"] for f in p["files"]}
+    included = {row[0] for row in table_after(out, "기간 안에 바뀐 파일 (최근 수정 순")[1:] if row[4] == "포함"}
+    assert reported == included == {"논문A/intro.tex", "Paper-B/refs.bib"}
+    stats = payload["stats"]
+    assert f"훑어본 파일: {stats['scanned']}개" in out
+    assert f"기간 안에 바뀐 파일: {stats['changed_in_window']}개" in out
+    assert f"제외: 내가 수정: {stats['excluded_mine']}개" in out
+
+
+def test_dropbox_check_window_from_hours_or_lookback(tmp_path):
+    code, out, store = run_diagnosis(diagnosis_entries(), tmp_path, hours=72)
+    assert code == 0
+    assert "기간: 2026-10-02 09:00 (Asia/Seoul) 이후 — 기준: --hours 72 (최근 72시간)" in out
+    assert "기간 안에 바뀐 파일: 5개" in out  # old.tex (10-02 18:00) is now inside
+    assert store.last_checked("dropbox") == LAST_CHECK
+
+    no_record = tmp_path / "fresh"
+    code, out, store = run_diagnosis(diagnosis_entries(), no_record, last_check=None, env=env_with(LOOKBACK_DAYS="3"))
+    assert code == 0
+    assert "기간: 2026-10-02 09:00 (Asia/Seoul) 이후 — 기준: 확인 기록이 없어 최근 3일 (LOOKBACK_DAYS)" in out
+    assert not (no_record / "state.json").exists()  # nothing written
+
+
+class MissingFolderDropbox(FakeDropbox):
+    def files_list_folder(self, path, recursive=False):
+        raise ApiError("req-1", ListFolderError.path(LookupError.not_found), None, None)
+
+
+def test_dropbox_check_folder_not_found_hint(tmp_path):
+    env = env_with(DROPBOX_ROOT_FOLDER="20_연구-진행/")
+    code, out, store = run_diagnosis([], tmp_path, env=env, dbx=MissingFolderDropbox([]))
+    assert code == 1
+    assert "확인할 폴더: /20_연구-진행 (DROPBOX_ROOT_FOLDER)" in out
+    assert "폴더: 찾을 수 없음" in out
+    assert "전체 경로" in out and "팀 스페이스" in out
+    assert "계정: 나연구" in out
+    assert "훑어본 파일" not in out
+    assert store.last_checked("dropbox") == LAST_CHECK
+    assert TOKEN not in out
+
+
+def test_dropbox_check_unconfigured_or_failing_never_prints_tokens(tmp_path):
+    out = io.StringIO()
+    assert run_dropbox_check({}, now=NOW, out=out) == 1
+    assert "[오류] Dropbox 설정 누락: DROPBOX_ACCESS_TOKEN" in out.getvalue()
+
+    def boom(cfg):
+        raise RuntimeError(f"401 Unauthorized: invalid token {cfg.access_token}")
+
+    out = io.StringIO()
+    store = StateStore(tmp_path / "state.json")
+    assert run_dropbox_check(env_with(), now=NOW, client_factory=boom, store=store, out=out) == 1
+    assert "[오류] Dropbox 확인 실패" in out.getvalue()
+    assert TOKEN not in out.getvalue()
+    assert store.last_checked("dropbox") is None
+
+
+def test_cli_dropbox_check_dispatch_help_and_conflicts(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(dropbox_check, "run_dropbox_check", lambda hours=None: calls.append(hours) or 0)
+    assert main(["--dropbox-check"]) == 0
+    assert main(["--dropbox-check", "--hours", "72"]) == 0
+    assert calls == [None, 72]
+
+    help_text = build_parser().format_help()
+    assert "--dropbox-check" in help_text and "--hours N" in help_text
+    assert "python -m mungchi --dropbox-check --hours 72" in help_text
+
+    for argv in (
+        ["--dropbox-check", "질문"],
+        ["--dropbox-check", "--brief"],
+        ["--dropbox-check", "--agent", "update"],
+        ["--dropbox-check", "--calendar-setup"],
+        ["--hours", "72"],
+        ["--dropbox-check", "--hours", "0"],
+    ):
+        with pytest.raises(SystemExit) as exc:
+            main(argv)
+        assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "--dropbox-check는 질문이나 다른 옵션" in err
+    assert "--hours는 --dropbox-check와 함께 써야 합니다" in err
+    assert "--hours에는 1 이상의 정수" in err

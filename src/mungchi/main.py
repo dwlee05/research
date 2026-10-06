@@ -501,6 +501,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  python -m mungchi --agent schedule      # '일정'과 바로 대화\n"
             "  python -m mungchi --list-models         # 쓸 수 있는 모델 ID 확인 (MUNGCHI_MODEL 고르기)\n"
             "  python -m mungchi --calendar-setup      # Mac 캘린더 앱 연결 (처음 한 번, 터미널에서)\n"
+            "  python -m mungchi --dropbox-check --hours 72   # 업뎃이 Dropbox 변경을 못 찾을 때 원인 확인 (최근 72시간)\n"
             "  python -m mungchi service install       # (macOS) Slack 봇을 백그라운드 서비스로 설치 (로그인하면 자동 시작)\n"
             "  python -m mungchi service status        # (macOS) 서비스 상태와 최근 로그\n"
             "\n"
@@ -555,6 +556,21 @@ def build_parser() -> argparse.ArgumentParser:
             "(macOS 터미널에서 한 번 실행, Claude API는 쓰지 않음)"
         ),
     )
+    opts.add_argument(
+        "--dropbox-check",
+        action="store_true",
+        help=(
+            "업뎃이 Dropbox 변경을 못 찾을 때 원인을 확인합니다: 폴더·계정, 기간 안에 바뀐 파일마다 "
+            "포함/제외 이유, 기간과 상관없이 최근에 바뀐 파일 (읽기 전용, Claude API는 쓰지 않고 "
+            "마지막 확인 시각도 바꾸지 않음)"
+        ),
+    )
+    opts.add_argument(
+        "--hours",
+        type=int,
+        metavar="N",
+        help="--dropbox-check와 함께: 최근 N시간을 봅니다 (없으면 마지막 확인 이후, 기록이 없으면 LOOKBACK_DAYS일)",
+    )
     opts.add_argument("-h", "--help", action="help", help="이 도움말을 보여 주고 끝냅니다")
     return parser
 
@@ -605,6 +621,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(
             "--calendar-setup은 질문이나 다른 옵션(--brief, --slack, --agent, --list-models, slack)과 함께 쓸 수 없습니다."
         )
+    if args.dropbox_check and (
+        args.question or args.brief or args.slack or args.agent or args.list_models or args.calendar_setup
+    ):
+        parser.error(
+            "--dropbox-check는 질문이나 다른 옵션(--brief, --slack, --agent, --list-models, --calendar-setup, slack)과 "
+            "함께 쓸 수 없습니다."
+        )
+    if args.hours is not None and not args.dropbox_check:
+        parser.error("--hours는 --dropbox-check와 함께 써야 합니다. 예: python -m mungchi --dropbox-check --hours 72")
+    if args.hours is not None and args.hours <= 0:
+        parser.error("--hours에는 1 이상의 정수(시간 수)를 적으세요. 예: --hours 72")
     start_slack_bot = args.question == SLACK_COMMAND
     if start_slack_bot and (args.brief or args.slack):
         parser.error("slack 명령은 --brief, --slack과 함께 쓸 수 없습니다.")
@@ -630,6 +657,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             from .calendar_setup import run_calendar_setup
 
             return run_calendar_setup()
+        if args.dropbox_check:
+            from .dropbox_check import run_dropbox_check
+
+            return run_dropbox_check(hours=args.hours)
         if start_slack_bot:
             from .slack_bot import run_bot_cli
 

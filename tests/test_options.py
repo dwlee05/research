@@ -335,6 +335,29 @@ def test_prompts_never_promise_content_summaries():
         assert key in UPDATE_PROMPT
 
 
+def test_update_prompts_turn_periods_into_since_hours_and_explain_empty_results():
+    from mungchi.tools.common import SINCE_HOURS_SCHEMA
+
+    for prompt in (build_update_prompt(), build_update_prompt(direct=True)):
+        # Period -> since_hours.
+        assert '"최근 3일"' in prompt and "→ 72" in prompt
+        assert '"오늘" → 오늘 0시' in prompt and '"이번 주" → 이번 주 월요일 0시' in prompt
+        # Why nothing was found, from stats and since_basis.
+        for key in ("stats", "since_basis", "changed_in_window", "excluded_mine", "excluded_unknown_modifier", "last_check"):
+            assert key in prompt
+        assert "마지막 확인(10/06 14:20) 이후 바뀐 파일이 없어요" in prompt
+        assert "기간 안에 바뀐 파일 5개는 모두 내가 수정했어요" in prompt
+        assert "수정한 사람을 알 수 없어 뺐어요 (공유 폴더가 아닌 곳에 있을 수 있어요)" in prompt
+
+    # 고뭉치 converts periods for 업뎃; it and direct 업뎃 know the current time.
+    mungchi = build_options(env={}, now=NOW).system_prompt
+    assert "## 기간 전하기" in mungchi and "since_hours" in mungchi and "지금 시각: 08:00" in mungchi
+    assert "지금 시각: 08:00" in build_options(env={}, now=NOW, persona="update").system_prompt
+
+    description = SINCE_HOURS_SCHEMA["properties"]["since_hours"]["description"]
+    assert "'최근 3일' → 72" in description and "'오늘'" in description and "'이번 주'" in description
+
+
 # ---------------------------------------------------------------- personas (direct 업뎃 / 일정)
 
 
