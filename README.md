@@ -10,7 +10,7 @@
 사용자 (터미널 · Slack 멘션/DM · cron 브리핑)
  └─ 비서실장 고뭉치 ─ main 에이전트. 데이터에 직접 손대지 않고 Agent 도구로 일을 맡김
      ├─ 업뎃 (updeot) ─ 공저자 업데이트 담당
-     │    ├─ check_dropbox_updates  → Dropbox 폴더의 하위 폴더별 변경 + diff
+     │    ├─ check_dropbox_updates  → Dropbox 폴더(20_연구-진행)의 공저자 변경 파일 목록 (내용은 안 읽음)
      │    └─ check_overleaf_updates → Overleaf 프로젝트의 공저자 커밋 + diff (git)
      └─ 빠릿 (ppalit) ─ 일정 담당
           └─ get_schedule           → ICS 캘린더 (Google·Outlook·iCloud)
@@ -19,8 +19,10 @@
 - **고뭉치**는 브리핑을 부탁받으면 업뎃과 빠릿에게 **동시에** 일을 맡기고, 두 보고를 합쳐
   ① 공저자 업데이트 ② 일정 ③ 오늘 챙길 것 세 부분으로 된 브리핑을 씁니다.
   고뭉치가 쓸 수 있는 도구는 Agent(하위 에이전트 호출) 하나뿐입니다.
-- **업뎃**은 Dropbox·Overleaf 도구만 씁니다. 사용자 본인의 작업은 빼고 **공저자의 작업만**,
-  파일 이름이 아니라 diff를 읽고 "서론 2문단 재작성", "참고문헌 3개 추가"처럼 실제로 한 일을 요약합니다.
+- **업뎃**은 Dropbox·Overleaf 도구만 씁니다. 사용자 본인의 작업은 빼고 **공저자의 작업만** 보고합니다.
+  - Dropbox: `20_연구-진행` 폴더에서 공저자가 바꾼 **파일 목록만** 하위 폴더·사람별로 수정 시각과 폴더 링크를 붙여 알려 줍니다.
+    토큰을 아끼려고 파일 내용은 읽지도 요약하지도 않으니, 내용은 직접 열어 확인하세요.
+  - Overleaf: diff를 읽고 "서론 2문단 재작성", "참고문헌 3개 추가"처럼 실제로 한 일을 요약합니다.
 - **빠릿**은 캘린더 도구만 씁니다. 그날과 다음 날 일정, "지금 / 바로 다음 일정", 겹침과 빈 시간을 짧게 보고합니다.
 - 세 도구는 모두 **읽기 전용**이고, 프로그램 안에서 도는 SDK MCP 서버(`mungchi`)로 묶여 있습니다.
 - 모델은 `MUNGCHI_MODEL`(기본 `claude-opus-5-5`)이며, 업뎃·빠릿은 같은 모델을 이어받습니다(`inherit`).
@@ -53,14 +55,17 @@ Claude 인증은 둘 중 하나면 됩니다.
 
 ### 1. Dropbox
 
+고뭉치는 Dropbox에서 **파일 목록(경로, 수정 시각, 마지막 수정자)만** 읽습니다.
+토큰을 아끼려고 파일 내용은 내려받지 않습니다.
+
 1. <https://www.dropbox.com/developers/apps> → **Create app** → **Scoped access** →
    **Full Dropbox**(공저자와 공유한 폴더를 보려면 필요) → 앱 이름을 정하고 만듭니다.
-2. **Permissions** 탭에서 아래 네 가지를 체크하고 **Submit** 합니다.
-   - `files.metadata.read`
-   - `files.content.read`
-   - `sharing.read`
-   - `account_info.read`
+2. **Permissions** 탭에서 아래 세 가지를 체크하고 **Submit** 합니다.
+   - `files.metadata.read`: 폴더의 파일 목록 읽기
+   - `sharing.read`: 수정한 공저자의 이름 확인
+   - `account_info.read`: 내 계정 확인(내가 고친 파일 빼기)
    > 권한을 바꾼 뒤에는 토큰을 새로 받아야 반영됩니다.
+   > 예전 안내대로 `files.content.read`도 켜 두었다면 이제 필요 없으니 꺼도 됩니다.
 3. 토큰 받기 (둘 중 하나)
    - **간단히 시험해 보기**: **Settings** 탭 → *Generated access token* → **Generate** →
      `DROPBOX_ACCESS_TOKEN`에 넣습니다. 이 토큰은 몇 시간 뒤 만료됩니다.
@@ -76,7 +81,8 @@ Claude 인증은 둘 중 하나면 됩니다.
           -d code=<복사한_코드> -d grant_type=authorization_code \
           -u <APP_KEY>:<APP_SECRET>
         ```
-4. `DROPBOX_ROOT_FOLDER`에 확인할 폴더를 적습니다(예: `/Research/Papers`).
+4. 확인할 폴더는 기본으로 Dropbox 맨 위의 **`/20_연구-진행`** 입니다. 이 폴더가 다른 폴더 안에 있으면
+   `DROPBOX_ROOT_FOLDER`에 전체 경로를 적습니다(예: `/Research/20_연구-진행`). 앞의 `/`는 빠져도 되고 끝의 `/`는 무시합니다.
    이 폴더 바로 아래 하위 폴더(논문별 폴더 등)를 단위로 묶어서 보고합니다.
 
 ### 2. Overleaf
@@ -139,7 +145,9 @@ python -m mungchi --help
   확인 시각은 소스(Dropbox, Overleaf 프로젝트별)마다 `.mungchi_state.json`에 저장됩니다(`MUNGCHI_STATE_FILE`로 경로 변경).
 - 기록이 없으면 최근 `LOOKBACK_DAYS`일(기본 7일)을 봅니다.
 - "지난 48시간"처럼 기간을 말하면 그 범위로 봅니다.
-- diff는 텍스트 파일(`.tex .bib .md .txt .py .r .m .sty .cls .csv`)만, 200KB 이하 파일만 만듭니다.
+- Dropbox는 파일 목록만 봅니다. 한 번에 최근 60개 파일까지 이름과 수정 시각을 적고,
+  그보다 많으면 나머지는 하위 폴더·사람별 개수만 알려 줍니다.
+- Overleaf diff는 텍스트 파일(`.tex .bib .md .txt .py .r .m .sty .cls .csv`)만, 200KB 이하 파일만 만듭니다.
   파일마다 약 80줄, 한 번에 약 30,000자까지만 보내고, 잘린 부분은 보고에 "일부만 확인함"으로 표시됩니다.
 
 ## 매일 자동으로 받기 (cron)
@@ -312,9 +320,9 @@ python -m mungchi --brief --slack
 
 - **Dropbox의 `modified_by`(마지막 수정자)는 공유 폴더 안의 파일에만 있습니다.**
   공유되지 않은 폴더의 파일은 누가 고쳤는지 알 수 없어 보고에서 빠집니다.
-  공유 폴더인데도 수정자 정보가 없으면 "수정자 미상"으로 표시합니다.
-- Dropbox diff는 **직전 리비전과의 차이(마지막 수정분)** 입니다. 확인 기간 동안 여러 번 저장했다면
-  앞선 수정은 diff에 보이지 않을 수 있습니다. 또 공저자가 고친 뒤 내가 다시 저장하면 마지막 수정자가 나라서 빠집니다.
+  공유 폴더인데도 수정자 정보가 없으면 "확인 불가"로 표시합니다.
+- Dropbox는 **어떤 파일이 바뀌었는지만** 알려 주고, 무엇을 고쳤는지는 알려 주지 않습니다(토큰 절약).
+  또 마지막 수정자 기준이라, 공저자가 고친 뒤 내가 다시 저장하면 마지막 수정자가 나라서 빠집니다.
 - **Overleaf Git 연동은 유료 플랜 기능**이고, **커밋 작성자 정보는 Overleaf 히스토리에서 옵니다.**
   Overleaf가 여러 사람의 편집을 한 커밋으로 묶거나 계정 이름으로 표시할 수 있어서,
   `MY_NAMES`/`MY_EMAILS`를 Overleaf에 보이는 값과 맞춰야 내 커밋이 정확히 빠집니다.

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import difflib
 import json
 import re
 from datetime import datetime, tzinfo
@@ -49,15 +48,6 @@ def is_text_path(path: str) -> bool:
     return PurePosixPath(path).suffix.lower() in TEXT_EXTENSIONS
 
 
-def decode_text(data: bytes) -> str:
-    for encoding in ("utf-8", "cp949"):
-        try:
-            return data.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    return data.decode("utf-8", errors="replace")
-
-
 def truncate_diff(
     text: str, max_lines: int = MAX_DIFF_LINES, max_chars: int = MAX_DIFF_CHARS
 ) -> tuple[str, int, bool]:
@@ -86,28 +76,6 @@ def truncate_diff(
     elif cut_long_line:
         kept.append("… (긴 줄 일부 생략)")
     return "\n".join(kept), omitted, bool(omitted or cut_long_line)
-
-
-def unified_diff(old: str, new: str, path: str, context: int = 2) -> str:
-    return "\n".join(
-        difflib.unified_diff(
-            old.splitlines(),
-            new.splitlines(),
-            fromfile=f"a/{path}",
-            tofile=f"b/{path}",
-            lineterm="",
-            n=context,
-        )
-    )
-
-
-def new_file_preview(text: str) -> str:
-    """A newly added file formatted like an added hunk.
-
-    Callers pass it through ``OutputBudget.fit`` which keeps only the first
-    lines and reports how many were omitted.
-    """
-    return "\n".join("+" + line for line in text.splitlines())
 
 
 class OutputBudget:

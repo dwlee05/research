@@ -20,6 +20,8 @@ DEFAULT_STATE_FILE = ".mungchi_state.json"
 SLACK_THREADS_FILE = ".mungchi_slack_threads.json"
 DEFAULT_OVERLEAF_CACHE = Path("~/.cache/mungchi/overleaf")
 DEFAULT_SLACK_MAX_CONCURRENT = 2
+# Dropbox folder checked when DROPBOX_ROOT_FOLDER is unset or empty.
+DEFAULT_DROPBOX_ROOT_FOLDER = "/20_연구-진행"
 
 # Overleaf project ids are hex strings; be a little lenient but never allow
 # characters that could escape the URL path or the cache directory.
@@ -93,11 +95,12 @@ class DropboxConfig:
     refresh_token: str = ""
     app_key: str = ""
     app_secret: str = ""
-    root_folder: str = ""
+    root_folder: str = DEFAULT_DROPBOX_ROOT_FOLDER
     missing: list[str] = field(default_factory=list)
 
     @property
     def configured(self) -> bool:
+        """Only auth is required; the folder falls back to the default."""
         return not self.missing
 
 
@@ -107,7 +110,7 @@ def load_dropbox_config(env: Mapping[str, str] | None = None) -> DropboxConfig:
         refresh_token=_get(env, "DROPBOX_REFRESH_TOKEN"),
         app_key=_get(env, "DROPBOX_APP_KEY"),
         app_secret=_get(env, "DROPBOX_APP_SECRET"),
-        root_folder=_get(env, "DROPBOX_ROOT_FOLDER"),
+        root_folder=_get(env, "DROPBOX_ROOT_FOLDER") or DEFAULT_DROPBOX_ROOT_FOLDER,
     )
     if not cfg.access_token:
         trio = {
@@ -120,8 +123,6 @@ def load_dropbox_config(env: Mapping[str, str] | None = None) -> DropboxConfig:
             cfg.missing.append("DROPBOX_ACCESS_TOKEN")
         else:
             cfg.missing.extend(name for name, value in trio.items() if not value)
-    if not cfg.root_folder:
-        cfg.missing.append("DROPBOX_ROOT_FOLDER")
     return cfg
 
 
@@ -129,9 +130,10 @@ def dropbox_hint(missing: list[str]) -> str:
     names = ", ".join(missing)
     return (
         f"Dropbox 설정 누락: {names} — dropbox.com/developers/apps에서 앱을 만들고 "
-        "(권한: files.metadata.read, files.content.read, sharing.read, account_info.read) "
+        "(권한: files.metadata.read, sharing.read, account_info.read) "
         "토큰을 발급해 .env에 넣으세요 (DROPBOX_ACCESS_TOKEN 하나 또는 "
-        "DROPBOX_REFRESH_TOKEN+DROPBOX_APP_KEY+DROPBOX_APP_SECRET, 그리고 DROPBOX_ROOT_FOLDER)."
+        "DROPBOX_REFRESH_TOKEN+DROPBOX_APP_KEY+DROPBOX_APP_SECRET). "
+        f"확인할 폴더는 DROPBOX_ROOT_FOLDER(기본 {DEFAULT_DROPBOX_ROOT_FOLDER})입니다."
     )
 
 
