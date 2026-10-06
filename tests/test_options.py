@@ -4,7 +4,8 @@ import asyncio
 import io
 import json
 import os
-from datetime import datetime
+import re
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -25,25 +26,47 @@ from mungchi import main as main_module
 from mungchi.agents import (
     AGENT_LABELS,
     MUNGCHI_SYSTEM_PROMPT,
+    NOW_GUIDANCE,
     PERSONA_TOOLS,
     TOOL_GATES,
     build_schedule_prompt,
     build_update_prompt,
     gate_decision,
+    now_line,
     tool_gate,
 )
 from mungchi.personas import SCHEDULE, UPDATE
-from mungchi.main import BLOCKED_BUILTINS, Renderer, TurnResult, build_options, build_parser, main, run_turn
+from mungchi.main import (
+    BLOCKED_BUILTINS,
+    Renderer,
+    TurnResult,
+    build_options,
+    build_parser,
+    main,
+    run_chat,
+    run_turn,
+    stamp_prompt,
+)
+from mungchi.slack_format import SLACK_FORMAT_PROMPT
 from mungchi.tools import ALL_TOOLS, CALENDAR_TOOL, DATA_TOOLS, DROPBOX_TOOL, SERVER_NAME, UPDATE_TOOLS
 from mungchi.tools.dropbox_tool import check_dropbox_updates
 
 NOW = datetime(2026, 10, 5, 8, 0, tzinfo=ZoneInfo("Asia/Seoul"))
 # The Overleaf check was removed; its old tool name must stay unusable.
 REMOVED_TOOL_NAMES = ("check_overleaf_updates", "mcp__mungchi__check_overleaf_updates")
+# The line run_turn / the chat loop put in front of every prompt (default TIMEZONE: Asia/Seoul).
+NOW_LINE_RE = re.compile(r"\[지금: \d{4}-\d{2}-\d{2}\([월화수목금토일]\) \d{2}:\d{2} KST\]\n")
+
+
+def without_now_line(prompt: str) -> str:
+    """``prompt`` as typed: asserts the per-turn time line is in front and strips it."""
+    match = NOW_LINE_RE.match(prompt)
+    assert match, prompt
+    return prompt[match.end() :]
 
 
 def options() -> ClaudeAgentOptions:
-    return build_options(env={}, now=NOW)
+    return build_options(env={})
 
 
 def test_agents_have_ascii_keys_and_own_tools_only():
@@ -104,15 +127,15 @@ def test_tool_gate_hook_is_registered_and_async():
 
 def test_model_defaults_and_env_override():
     assert options().model == "claude-opus-5-5"
-    assert build_options(env={"MUNGCHI_MODEL": "custom-model"}, now=NOW).model == "custom-model"
+    assert build_options(env={"MUNGCHI_MODEL": "custom-model"}).model == "custom-model"
 
 
-def test_system_prompt_mentions_date_and_three_sections():
+def test_system_prompt_has_three_sections_and_points_to_the_per_turn_time_line():
     prompt = options().system_prompt
-    assert "2026-10-05 (월요일)" in prompt
     for heading in ("① 공저자 업데이트", "② 일정", "③ 오늘 챙길 것"):
         assert heading in prompt
-    assert "{today}" in MUNGCHI_SYSTEM_PROMPT
+    assert NOW_GUIDANCE in prompt and "[지금: YYYY-MM-DD(요일) HH:MM 시간대]" in prompt
+    assert "{" not in MUNGCHI_SYSTEM_PROMPT  # no unfilled placeholders, nothing filled per call
 
 
 def test_mcp_server_is_in_process_sdk_server():
@@ -233,7 +256,7 @@ def test_run_turn_resumes_reports_status_and_returns_answer(fake_sdk, capsys):
     assert not result.failed and result.error is None
     assert seen == ["→ 업뎃에게 맡기는 중..."]
     [client] = fake_sdk.instances
-    assert client.prompts == ["질문"]
+    assert [without_now_line(p) for p in client.prompts] == ["질문"]
     opts = client.options
     assert opts.resume == "sess-0"
     assert opts.system_prompt.rstrip().endswith("## Slack 규칙")
@@ -265,7 +288,7 @@ def test_build_options_defaults_have_no_resume_and_no_extra_prompt():
     opts = options()
     assert opts.resume is None
     assert "Slack" not in opts.system_prompt
-    assert build_options(env={}, now=NOW, resume="abc-123").resume == "abc-123"
+    assert build_options(env={}, resume="abc-123").resume == "abc-123"
 
 
 def test_cli_one_shot_output_is_unchanged(fake_sdk, capsys):
@@ -274,21 +297,21 @@ def test_cli_one_shot_output_is_unchanged(fake_sdk, capsys):
     assert out == "업뎃에게 맡길게요.\n*① 공저자 업데이트*\n• 변경 없음\n"
     assert err == "→ 업뎃에게 맡기는 중...\n"
     [client] = fake_sdk.instances
-    assert client.prompts == ["어제 공저자들이 뭐 고쳤어?"]
+    assert [without_now_line(p) for p in client.prompts] == ["어제 공저자들이 뭐 고쳤어?"]
     assert client.options.resume is None
     assert "Slack 출력" not in client.options.system_prompt
 
 
 def test_cli_brief_and_chat_modes_still_work(fake_sdk, capsys, monkeypatch):
     assert main(["--brief"]) == 0
-    assert "브리핑" in fake_sdk.instances[-1].prompts[0]
+    assert "브리핑" in without_now_line(fake_sdk.instances[-1].prompts[0])
 
     lines = iter(["안녕", "", "내일 일정은?", "종료"])
     monkeypatch.setattr("builtins.input", lambda prompt="": next(lines))
     fake_sdk.instances = []
     assert main([]) == 0
     [client] = fake_sdk.instances  # one client for the whole conversation
-    assert client.prompts == ["안녕", "내일 일정은?"]
+    assert [without_now_line(p) for p in client.prompts] == ["안녕", "내일 일정은?"]
     assert "수고하셨습니다" in capsys.readouterr().out
 
 
@@ -349,10 +372,18 @@ def test_update_prompts_turn_periods_into_since_hours_and_explain_empty_results(
         assert "기간 안에 바뀐 파일 5개는 모두 내가 수정했어요" in prompt
         assert "수정한 사람을 알 수 없어 뺐어요 (공유 폴더가 아닌 곳에 있을 수 있어요)" in prompt
 
-    # 고뭉치 converts periods for 업뎃; it and direct 업뎃 know the current time.
-    mungchi = build_options(env={}, now=NOW).system_prompt
-    assert "## 기간 전하기" in mungchi and "since_hours" in mungchi and "지금 시각: 08:00" in mungchi
-    assert "지금 시각: 08:00" in build_options(env={}, now=NOW, persona="update").system_prompt
+    # 고뭉치 converts periods for 업뎃 from the per-turn time line, and passes
+    # that line on, since its subagents never see the user's message.
+    mungchi = build_options(env={}).system_prompt
+    assert "## 기간 전하기" in mungchi and "since_hours" in mungchi
+    assert "사용자 메시지 맨 앞의 [지금: ...] 줄(현지 시간)을 기준으로 시간 수로 바꿔" in mungchi
+    assert "Agent 도구의 prompt 맨 앞에 그 [지금: ...] 줄을 그대로 옮겨 적는다" in mungchi
+    assert "팀원은 이 대화를 볼 수 없고 지금 날짜·시각도 모른다" in mungchi
+    # The subagent falls back to the line 고뭉치 copied; direct 업뎃 reads the user's.
+    assert "고뭉치가 맡긴 글 맨 앞의 [지금: ...] 줄을 기준으로 바꾼다" in build_update_prompt()
+    direct = build_options(env={}, persona="update").system_prompt
+    assert "사용자 메시지 맨 앞의 [지금: ...] 줄에 있다" in direct and NOW_GUIDANCE in direct
+    assert "지금 시각:" not in mungchi and "지금 시각:" not in direct
 
     description = SINCE_HOURS_SCHEMA["properties"]["since_hours"]["description"]
     assert "'최근 3일' → 72" in description and "'오늘'" in description and "'이번 주'" in description
@@ -377,7 +408,7 @@ def server_spy(monkeypatch):
 
 
 def test_direct_update_gets_only_the_dropbox_tool(server_spy):
-    opts = build_options(env={}, now=NOW, persona="update")
+    opts = build_options(env={}, persona="update")
     assert opts.tools == []  # no built-in tools at all, not even Agent
     assert opts.allowed_tools == [DROPBOX_TOOL]
     assert "Agent" not in opts.allowed_tools and "Agent" in opts.disallowed_tools
@@ -392,7 +423,7 @@ def test_direct_update_gets_only_the_dropbox_tool(server_spy):
 
 
 def test_direct_schedule_gets_only_get_schedule(server_spy):
-    opts = build_options(env={}, now=NOW, persona="schedule")
+    opts = build_options(env={}, persona="schedule")
     assert opts.tools == []
     assert opts.allowed_tools == [CALENDAR_TOOL]
     assert "Agent" in opts.disallowed_tools
@@ -403,7 +434,7 @@ def test_direct_schedule_gets_only_get_schedule(server_spy):
 
 
 def test_mungchi_options_are_unchanged_by_personas(server_spy):
-    default, explicit = options(), build_options(env={}, now=NOW, persona="mungchi")
+    default, explicit = options(), build_options(env={}, persona="mungchi")
     for field in (*SAFETY_FIELDS, "system_prompt"):
         assert getattr(default, field) == getattr(explicit, field), field
     assert explicit.tools == ["Agent"] and explicit.allowed_tools == ["Agent"]
@@ -416,7 +447,7 @@ def test_mungchi_options_are_unchanged_by_personas(server_spy):
 
 def test_unknown_persona_is_rejected():
     with pytest.raises(ValueError):
-        build_options(env={}, now=NOW, persona="nobody")
+        build_options(env={}, persona="nobody")
 
 
 def test_direct_gates_allow_only_the_personas_own_tools():
@@ -467,12 +498,13 @@ def test_direct_and_subagent_prompts_share_the_same_rules():
     assert "'일정' 에이전트" in sub and "'일정' 에이전트" in direct
 
 
-def test_direct_prompts_carry_date_and_point_elsewhere_for_other_requests():
-    update = build_options(env={}, now=NOW, persona="update").system_prompt
-    schedule = build_options(env={}, now=NOW, persona="schedule").system_prompt
+def test_direct_prompts_explain_the_time_line_and_point_elsewhere_for_other_requests():
+    update = build_options(env={}, persona="update").system_prompt
+    schedule = build_options(env={}, persona="schedule").system_prompt
     for prompt in (update, schedule):
-        assert "2026-10-05 (월요일)" in prompt and "Asia/Seoul" in prompt
+        assert NOW_GUIDANCE in prompt and "## 출력" in prompt
         assert "Agent" not in prompt
+    assert "사용자 메시지 맨 앞의 [지금: ...] 줄의 날짜를 기준으로 YYYY-MM-DD로" in schedule
     assert "'일정' 에이전트" in update and "고뭉치 담당" in update
     assert "업뎃" in schedule and "고뭉치 담당" in schedule
     # 고뭉치 names its schedule subagent unambiguously.
@@ -506,7 +538,7 @@ def test_renderer_answer_starts_after_last_data_tool_call():
 def test_cli_agent_one_shot_and_chat(fake_sdk, capsys, monkeypatch):
     assert main(["--agent", "update", "누가 무슨 파일 고쳤어?"]) == 0
     [client] = fake_sdk.instances
-    assert client.prompts == ["누가 무슨 파일 고쳤어?"]
+    assert [without_now_line(p) for p in client.prompts] == ["누가 무슨 파일 고쳤어?"]
     assert client.options.allowed_tools == [DROPBOX_TOOL] and not client.options.agents
 
     fake_sdk.instances = []
@@ -514,7 +546,7 @@ def test_cli_agent_one_shot_and_chat(fake_sdk, capsys, monkeypatch):
     monkeypatch.setattr("builtins.input", lambda prompt="": next(lines))
     assert main(["--agent", "schedule"]) == 0
     [client] = fake_sdk.instances
-    assert client.prompts == ["내일 일정은?"]
+    assert [without_now_line(p) for p in client.prompts] == ["내일 일정은?"]
     assert client.options.allowed_tools == [CALENDAR_TOOL]
     out = capsys.readouterr().out
     assert "\n'일정'입니다. 캘린더 일정을 확인해 드릴게요." in out and "일정: 수고하셨습니다!" in out
@@ -560,7 +592,7 @@ def test_removed_tool_names_are_unknown_or_denied():
             assert decision(name, agent_type=agent_type, agent_id="a1") != "allow"
         # 업뎃 / 일정 answering directly: explicitly denied.
         for persona in (UPDATE, SCHEDULE):
-            assert name not in build_options(env={}, now=NOW, persona=persona).allowed_tools
+            assert name not in build_options(env={}, persona=persona).allowed_tools
             assert decision(name, persona=persona) == "deny"
 
 
@@ -573,7 +605,7 @@ def test_user_facing_texts_never_mention_overleaf():
         build_update_prompt(),
         build_update_prompt(direct=True),
         UPDATE_DESCRIPTION,
-        build_options(env={}, now=NOW, persona="update").system_prompt,
+        build_options(env={}, persona="update").system_prompt,
         SLACK_FORMAT_PROMPT,
         build_parser().format_help(),
         *main_module.CHAT_GREETINGS.values(),
@@ -618,3 +650,97 @@ def test_old_env_with_overleaf_and_my_lines_still_works(tmp_path, monkeypatch, f
         assert name not in text
     err = capsys.readouterr().err
     assert "[오류]" not in err and "OVERLEAF" not in err
+
+
+# ---------------------------------------------------------------- cache-stable system prompts, time per turn
+
+
+class _PinnedDatetime(datetime):
+    """``datetime`` whose ``now()`` is pinned; patched over a module's ``datetime``."""
+
+    pinned: datetime = NOW
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls.pinned.astimezone(tz) if tz is not None else cls.pinned
+
+
+def _every_system_prompt() -> dict[str, str]:
+    """System prompts of every persona (CLI and Slack) and every subagent definition."""
+    texts: dict[str, str] = {}
+    for persona in ("mungchi", "update", "schedule"):
+        for extra in ("", SLACK_FORMAT_PROMPT):
+            opts = build_options(persona=persona, extra_system_prompt=extra)
+            key = persona + ("+slack" if extra else "")
+            texts[key] = opts.system_prompt
+            for name, agent in (opts.agents or {}).items():
+                texts[f"{key}/{name}.prompt"] = agent.prompt
+                texts[f"{key}/{name}.description"] = agent.description
+    return texts
+
+
+def test_system_prompts_carry_no_time_and_are_byte_identical_at_different_times(monkeypatch):
+    morning = datetime(2026, 10, 5, 8, 7, tzinfo=ZoneInfo("Asia/Seoul"))
+    months_later = datetime(2027, 3, 14, 21, 37, tzinfo=ZoneInfo("Asia/Seoul"))
+    snapshots = []
+    for pinned in (morning, months_later):
+        monkeypatch.setattr(main_module, "datetime", type("Pinned", (_PinnedDatetime,), {"pinned": pinned}))
+        snapshots.append(_every_system_prompt())
+    first, second = snapshots
+    assert first.keys() == second.keys() and len(first) == 3 * 2 + 2 * 2 * 2
+    for key, text in first.items():
+        assert text.encode("utf-8") == second[key].encode("utf-8"), key
+        assert not re.search(r"\d{4}-\d{2}-\d{2}", text), key
+        for stamp in ("10-05", "03-14", "08:07", "21:37", "Asia/Seoul", "KST", "지금 시각:", "오늘 날짜:"):
+            assert stamp not in text, (key, stamp)
+
+
+def test_now_line_is_short_and_uses_the_zone_abbreviation_when_there_is_one():
+    utc = datetime(2026, 10, 6, 5, 20, tzinfo=timezone.utc)
+    assert now_line(utc.astimezone(ZoneInfo("Asia/Seoul"))) == "[지금: 2026-10-06(화) 14:20 KST]"
+    assert now_line(utc) == "[지금: 2026-10-06(화) 05:20 UTC]"
+    assert now_line(utc.astimezone(ZoneInfo("America/New_York"))) == "[지금: 2026-10-06(화) 01:20 EDT]"
+    # No real abbreviation (tzdata says "+04"): the IANA name instead.
+    assert now_line(utc.astimezone(ZoneInfo("Asia/Dubai"))) == "[지금: 2026-10-06(화) 09:20 Asia/Dubai]"
+    # A bare offset has neither: the zone is left out.
+    assert now_line(utc.astimezone(timezone(timedelta(hours=9)))) == "[지금: 2026-10-06(화) 14:20]"
+    # stamp_prompt converts the clock's time to TIMEZONE.
+    clock = lambda: utc  # noqa: E731
+    assert stamp_prompt("질문", clock) == "[지금: 2026-10-06(화) 14:20 KST]\n질문"
+    assert stamp_prompt("q", clock, env={"TIMEZONE": "Europe/Berlin"}) == "[지금: 2026-10-06(화) 07:20 CEST]\nq"
+
+
+def test_run_turn_puts_the_current_time_in_the_user_message(fake_sdk, monkeypatch):
+    first_turn = lambda: datetime(2026, 10, 6, 5, 20, tzinfo=timezone.utc)  # noqa: E731 - 14:20 in Seoul
+    next_day = lambda: datetime(2026, 10, 7, 0, 5, tzinfo=timezone.utc)  # noqa: E731 - 09:05 in Seoul
+    asyncio.run(run_turn("최근 3일 업데이트 알려줘", clock=first_turn, extra_system_prompt=SLACK_FORMAT_PROMPT))
+    # A resumed Slack thread, the next day.
+    asyncio.run(run_turn("이어서", resume="sess-final", clock=next_day, extra_system_prompt=SLACK_FORMAT_PROMPT))
+    first, second = fake_sdk.instances
+    assert first.prompts == ["[지금: 2026-10-06(화) 14:20 KST]\n최근 3일 업데이트 알려줘"]
+    assert second.prompts == ["[지금: 2026-10-07(수) 09:05 KST]\n이어서"]
+    # Same system prompt on both turns, so the cached prefix is reused.
+    assert first.options.system_prompt == second.options.system_prompt
+    assert "2026-10-0" not in first.options.system_prompt
+
+    # Direct personas too, in the configured TIMEZONE.
+    monkeypatch.setenv("TIMEZONE", "Asia/Tokyo")
+    fake_sdk.instances = []
+    for persona in ("update", "schedule"):
+        asyncio.run(run_turn("내일 일정은?", persona=persona, clock=first_turn))
+    assert [c.prompts for c in fake_sdk.instances] == [["[지금: 2026-10-06(화) 14:20 JST]\n내일 일정은?"]] * 2
+
+
+def test_chat_loop_puts_the_current_time_in_every_message(fake_sdk, monkeypatch, capsys):
+    seoul = ZoneInfo("Asia/Seoul")
+    times = iter([datetime(2026, 10, 6, 23, 59, tzinfo=seoul), datetime(2026, 10, 7, 0, 1, tzinfo=seoul)])
+    lines = iter(["안녕", "", "내일 일정은?", "종료"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(lines))
+    options = build_options(persona="schedule")
+    assert asyncio.run(run_chat(options, "schedule", clock=lambda: next(times))) == 0
+    [client] = fake_sdk.instances  # one session; the time is read again for every message
+    assert client.prompts == [
+        "[지금: 2026-10-06(화) 23:59 KST]\n안녕",
+        "[지금: 2026-10-07(수) 00:01 KST]\n내일 일정은?",
+    ]
+    assert client.options.system_prompt == build_options(persona="schedule").system_prompt

@@ -39,6 +39,45 @@ def korean_date(now: datetime) -> str:
     return f"{now.date().isoformat()} ({WEEKDAYS_KO[now.weekday()]}요일)"
 
 
+# ---------------------------------------------------------------- current time
+#
+# System prompts never contain the date or time: they must stay byte-identical
+# from call to call so prompt caching keeps working across the turns of a
+# resumed conversation. The current local time travels in each user message
+# instead, as one short line in front of it (see ``now_line``).
+
+NOW_LINE_FORMAT = "[지금: YYYY-MM-DD(요일) HH:MM 시간대]"
+
+NOW_GUIDANCE = (
+    f"지금 날짜와 시각(현지 시간)은 사용자 메시지마다 맨 앞에 {NOW_LINE_FORMAT} 한 줄로 주어진다. "
+    "'오늘'·'내일'·'이번 주'처럼 지금을 기준으로 한 말은 가장 최근 메시지의 이 줄을 기준으로 풀고, "
+    "이 줄 자체는 답에 옮기지 않는다."
+)
+
+
+def _zone_label(now: datetime) -> str:
+    """``KST``-style abbreviation when the zone has a real one, else the IANA name, else ``""``."""
+    abbreviation = now.tzname() or ""
+    if abbreviation.isascii() and abbreviation.isalpha():
+        return abbreviation  # e.g. KST, JST, UTC, CEST (not "+04")
+    return str(getattr(now.tzinfo, "key", "") or "")
+
+
+def now_line(now: datetime) -> str:
+    """The line put in front of every user message, e.g. ``[지금: 2026-10-06(화) 14:20 KST]``.
+
+    ``now`` should already be in the configured ``TIMEZONE``.
+    """
+    zone = _zone_label(now)
+    stamp = f"{now.date().isoformat()}({WEEKDAYS_KO[now.weekday()]}) {now:%H:%M}"
+    return f"[지금: {stamp}{' ' + zone if zone else ''}]"
+
+
+def with_now_line(prompt: str, now: datetime) -> str:
+    """``prompt`` with ``now_line(now)`` in front of it on its own line."""
+    return f"{now_line(now)}\n{prompt}"
+
+
 MUNGCHI_SYSTEM_PROMPT = """\
 너는 한 연구자의 비서실장 '고뭉치'다. 전체 이름은 '비서실 고뭉치'이고, 자신을 소개하거나 가리킬 때는 '고뭉치'라고 한다. 사용자는 한국어로 말하고, 너도 항상 한국어로 답한다.
 
@@ -49,7 +88,7 @@ MUNGCHI_SYSTEM_PROMPT = """\
 ## 원칙
 1. 너는 Dropbox, 캘린더 같은 데이터 소스를 직접 다루지 않는다. 네가 쓰는 도구는 Agent 도구 하나뿐이고, 데이터가 필요하면 반드시 업뎃이나 '일정' 에이전트에게 맡긴다.
 2. 데이터를 절대 지어내지 않는다. 팀원 보고에 없는 공저자, 파일, 변경 내용, 일정, 시간을 추측해서 채우지 않는다. 모르면 모른다고 말한다.
-3. 팀원은 이 대화를 볼 수 없다. 일을 맡길 때 필요한 정보(날짜, 확인 기간, 사용자의 구체적인 요청)를 Agent 도구의 prompt에 모두 적는다.
+3. 팀원은 이 대화를 볼 수 없고 지금 날짜·시각도 모른다. 일을 맡길 때 필요한 정보(날짜, 확인 기간, 사용자의 구체적인 요청)를 Agent 도구의 prompt에 모두 적는다. '오늘'·'내일'·'이번 주'처럼 지금을 기준으로 한 말은 그대로 넘기지 말고 아래 '기간 전하기'대로 날짜(YYYY-MM-DD)나 시간 수(since_hours)로 바꿔 적는다.
 4. 팀원이 어떤 소스가 설정되지 않았다(configured: false)고 보고하면 다시 시키지 말고, 그 사실과 빠진 환경변수 이름(missing), 설정 방법(hint)을 사용자에게 그대로 전한다.
 5. 팀원이 오류를 보고하면 무엇이 실패했는지 짧게 전하고, 나머지 결과는 그대로 활용한다.
 
@@ -74,16 +113,20 @@ MUNGCHI_SYSTEM_PROMPT = """\
 - 공저자 작업에 관한 질문은 업뎃에게, 일정에 관한 질문은 '일정' 에이전트에게만 맡긴다. 둘 다 필요하면 동시에 맡긴다.
 - 데이터가 필요 없는 질문(사용법, 일반 대화)은 팀원에게 맡기지 말고 직접 짧게 답한다.
 
+## 지금 시각
+{now_guidance}
+
 ## 기간 전하기
-업뎃은 지금 시각을 모른다. 사용자가 기간을 말하면 아래 지금 시각(현지 시간)을 기준으로 시간 수로 바꿔 "since_hours=72"처럼 업뎃에게 전한다(소수점은 올림).
+업뎃과 '일정' 에이전트는 지금 시각을 모른다. 사용자가 기간을 말하면 사용자 메시지 맨 앞의 [지금: ...] 줄(현지 시간)을 기준으로 시간 수로 바꿔 "since_hours=72"처럼 업뎃에게 전한다(소수점은 올림).
 - "최근 3일"·"지난 3일" → 72, "지난 48시간" → 48
 - "오늘" → 오늘 0시부터 지금까지의 시간, "어제부터" → 어제 0시부터 지금까지의 시간
 - "이번 주" → 이번 주 월요일 0시부터 지금까지의 시간
+- 날짜("내일", "금요일")는 같은 줄을 기준으로 YYYY-MM-DD로 바꿔 '일정' 에이전트에게 전한다.
+- 일을 맡길 때마다 Agent 도구의 prompt 맨 앞에 그 [지금: ...] 줄을 그대로 옮겨 적는다. 그래야 팀원도 지금 날짜·시각을 안다.
 
 ## 출력
 - 터미널에서 읽기 좋게 간결하게 쓴다. 표 대신 짧은 목록을 쓴다.
-- 오늘 날짜: {today}, 지금 시각: {time}, 시간대: {timezone}.
-"""
+""".format(now_guidance=NOW_GUIDANCE)
 
 
 # ---------------------------------------------------------------- shared prompt pieces
@@ -99,10 +142,14 @@ _FRAMING = {
         "schedule_role": "너는 비서실의 '일정' 에이전트다(이름이 '일정'이다). 사용자의 캘린더 일정을 확인해 비서실장 고뭉치에게 한국어로 짧게 보고한다.",
         "period": (
             "고뭉치가 since_hours(시간 수)를 주면 그대로 넘기고, 기간을 말로만 줬으면 아래 규칙대로 시간 수로 바꿔 넘긴다"
-            "('오늘'·'이번 주'처럼 지금 시각이 필요한 기간은 고뭉치가 시간 수로 바꿔 준다). "
+            "('오늘'·'이번 주'처럼 지금 시각이 필요한 기간은 고뭉치가 시간 수로 바꿔 준다. 그래도 말로만 왔으면 "
+            "고뭉치가 맡긴 글 맨 앞의 [지금: ...] 줄을 기준으로 바꾼다). "
             "기간이 없으면 since_hours를 0으로 둔다(마지막 확인 이후)."
         ),
-        "date_rule": "고뭉치가 날짜를 주면 그 날짜로, 아니면 date를 비우고 한 번만 호출한다.",
+        "date_rule": (
+            "고뭉치가 날짜를 주면 그 날짜로, 아니면 date를 비우고 한 번만 호출한다. "
+            "날짜가 '내일'처럼 말로만 왔으면 고뭉치가 맡긴 글 맨 앞의 [지금: ...] 줄을 기준으로 YYYY-MM-DD로 바꾼다."
+        ),
     },
     "direct": {
         "to": "사용자에게",
@@ -111,9 +158,9 @@ _FRAMING = {
         "schedule_role": "너는 비서실의 '일정' 에이전트다(이름이 '일정'이다). 사용자가 너를 직접 불렀다. 사용자의 캘린더 일정을 확인해 사용자에게 직접 한국어로 짧게 답한다.",
         "period": (
             "사용자가 기간을 말했으면(예: \"최근 3일\", \"오늘\", \"이번 주\") 아래 규칙대로 시간 수로 바꿔 since_hours로 넘기고"
-            "(지금 시각은 맨 아래 '출력'에 있다), 아니면 since_hours를 0으로 둔다(마지막 확인 이후)."
+            "(지금 시각은 사용자 메시지 맨 앞의 [지금: ...] 줄에 있다), 아니면 since_hours를 0으로 둔다(마지막 확인 이후)."
         ),
-        "date_rule": "사용자가 날짜를 말하면(예: \"내일\", \"금요일\") 아래 오늘 날짜를 기준으로 YYYY-MM-DD로 바꿔 넘기고, 아니면 date를 비우고 한 번만 호출한다. 며칠치를 물으면 days를 맞춘다(최대 14).",
+        "date_rule": "사용자가 날짜를 말하면(예: \"내일\", \"금요일\") 사용자 메시지 맨 앞의 [지금: ...] 줄의 날짜를 기준으로 YYYY-MM-DD로 바꿔 넘기고, 아니면 date를 비우고 한 번만 호출한다. 며칠치를 물으면 days를 맞춘다(최대 14).",
     },
 }
 
@@ -197,10 +244,12 @@ _DIRECT_TAIL = {
 """,
 }
 
-_DIRECT_OUTPUT = """
+_DIRECT_OUTPUT = f"""
+## 지금 시각
+{NOW_GUIDANCE}
+
 ## 출력
 - 터미널에서 읽기 좋게 간결하게 쓴다. 표 대신 짧은 목록을 쓴다.
-- 오늘 날짜: {today}, 지금 시각: {time}, 시간대: {timezone}.
 """
 
 
@@ -229,21 +278,20 @@ SCHEDULE_DESCRIPTION = (
 )
 
 
-def build_system_prompt(now: datetime, timezone_name: str) -> str:
-    return MUNGCHI_SYSTEM_PROMPT.format(today=korean_date(now), time=f"{now:%H:%M}", timezone=timezone_name)
+def build_system_prompt() -> str:
+    """고뭉치's system prompt: a constant, so it is cached across turns (no date or time in it)."""
+    return MUNGCHI_SYSTEM_PROMPT
 
 
-def build_direct_prompt(persona: str, now: datetime, timezone_name: str) -> str:
-    """System prompt for 업뎃 or 일정 answering the user directly (no 고뭉치)."""
+def build_direct_prompt(persona: str) -> str:
+    """System prompt for 업뎃 or 일정 answering the user directly (no 고뭉치); also time-free."""
     if persona == UPDATE:
         body = build_update_prompt(direct=True)
     elif persona == SCHEDULE:
         body = build_schedule_prompt(direct=True)
     else:
         raise ValueError(f"no direct prompt for persona {persona!r}")
-    return body + _DIRECT_TAIL[persona] + _DIRECT_OUTPUT.format(
-        today=korean_date(now), time=f"{now:%H:%M}", timezone=timezone_name
-    )
+    return body + _DIRECT_TAIL[persona] + _DIRECT_OUTPUT
 
 
 def build_agents() -> dict[str, AgentDefinition]:

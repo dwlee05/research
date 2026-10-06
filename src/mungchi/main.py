@@ -35,6 +35,7 @@ from .agents import (
     build_direct_prompt,
     build_system_prompt,
     korean_date,
+    with_now_line,
 )
 from .personas import DIRECT_PERSONAS, MUNGCHI, PERSONA_LABELS, PERSONAS, SCHEDULE, UPDATE, josa
 from .tools import DATA_TOOLS, SERVER_NAME, build_server, tools_named
@@ -119,6 +120,8 @@ MAX_ERROR_DETAIL_CHARS = 200
 
 
 StatusCallback = Callable[[str], "Awaitable[None] | None"]
+# Returns the current time; injectable so tests can pin the per-turn time line.
+Clock = Callable[[], datetime]
 
 
 @dataclass
@@ -204,9 +207,20 @@ def briefing_prompt(now: datetime | None = None, env: Mapping[str, str] | None =
     return BRIEFING_PROMPT.format(today=korean_date(now))
 
 
+def stamp_prompt(prompt: str, clock: Clock | None = None, env: Mapping[str, str] | None = None) -> str:
+    """``prompt`` with the current local time in front, e.g. ``[지금: 2026-10-06(화) 14:20 KST]``.
+
+    The time goes in the user message, never the system prompt, so the system
+    prompt stays byte-identical and cached across the turns of a conversation.
+    ``clock`` defaults to the wall clock; the result is shown in ``TIMEZONE``.
+    """
+    tz = config.get_timezone(env)
+    now = clock() if clock is not None else datetime.now(tz)
+    return with_now_line(prompt, now.astimezone(tz))
+
+
 def build_options(
     env: Mapping[str, str] | None = None,
-    now: datetime | None = None,
     *,
     resume: str | None = None,
     extra_system_prompt: str = "",
@@ -221,14 +235,14 @@ def build_options(
 
     ``resume`` continues an earlier session by id; ``extra_system_prompt`` is
     appended to the system prompt (e.g. Slack formatting rules).
+
+    Nothing here depends on the clock: the system prompts carry no date or
+    time, so they can be cached. The time is added per turn (``stamp_prompt``).
     """
     if persona not in PERSONAS:
         raise ValueError(f"unknown persona: {persona!r}")
-    tz = config.get_timezone(env)
-    now = (now or datetime.now(tz)).astimezone(tz)
-    timezone_name = config.get_timezone_name(env)
     if persona == MUNGCHI:
-        system_prompt = build_system_prompt(now, timezone_name)
+        system_prompt = build_system_prompt()
         # Built-in tool availability: only the subagent-invocation tool.
         builtin_tools = [SUBAGENT_TOOL]
         # 고뭉치's only pre-approved tool. Data tools are approved per subagent
@@ -238,7 +252,7 @@ def build_options(
         server = build_server()
         agents = build_agents()
     else:
-        system_prompt = build_direct_prompt(persona, now, timezone_name)
+        system_prompt = build_direct_prompt(persona)
         # No built-in tools at all, not even the Agent tool.
         builtin_tools = []
         # Only this persona's data tools exist (server) and are pre-approved;
@@ -435,17 +449,19 @@ async def run_turn(
     extra_system_prompt: str = "",
     renderer: Renderer | None = None,
     persona: str = MUNGCHI,
+    clock: Clock | None = None,
 ) -> TurnResult:
     """Run one turn of ``persona`` in a fresh session (or ``resume`` an earlier one).
 
     Shared by the CLI (one-shot, ``--brief``, ``--agent``) and the Slack bots.
     ``on_status`` receives the same status lines the CLI prints, e.g.
     "→ 업뎃에게 맡기는 중...". Without ``renderer`` nothing is printed.
+    The prompt is sent with the current time in front (``stamp_prompt``).
     """
     options = build_options(resume=resume, extra_system_prompt=extra_system_prompt, persona=persona)
     renderer = renderer or Renderer(echo=False)
     async with ClaudeSDKClient(options=options) as client:
-        return await stream_turn(client, prompt, renderer, on_status)
+        return await stream_turn(client, stamp_prompt(prompt, clock), renderer, on_status)
 
 
 async def run_once(prompt: str, persona: str = MUNGCHI) -> int:
@@ -453,8 +469,9 @@ async def run_once(prompt: str, persona: str = MUNGCHI) -> int:
     return 1 if result.failed else 0
 
 
-async def run_chat(options: ClaudeAgentOptions, persona: str = MUNGCHI) -> int:
-    # One long-lived client keeps the whole conversation in a single session.
+async def run_chat(options: ClaudeAgentOptions, persona: str = MUNGCHI, *, clock: Clock | None = None) -> int:
+    # One long-lived client keeps the whole conversation in a single session;
+    # every line the user types is sent with the current time in front.
     print(CHAT_GREETINGS[persona])
     async with ClaudeSDKClient(options=options) as client:
         while True:
@@ -469,7 +486,7 @@ async def run_chat(options: ClaudeAgentOptions, persona: str = MUNGCHI) -> int:
             if prompt.lower() in EXIT_WORDS:
                 break
             print()
-            await stream_turn(client, prompt, Renderer())
+            await stream_turn(client, stamp_prompt(prompt, clock), Renderer())
     print(f"{PERSONA_LABELS[persona]}: 수고하셨습니다!")
     return 0
 
