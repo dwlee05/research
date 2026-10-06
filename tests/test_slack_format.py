@@ -161,3 +161,8 @@ def test_default_limit_is_3500():
     chunks = chunk_text(text)
     assert len(chunks) >= 3
     assert all(len(c) <= 3_500 for c in chunks)
+
+
+def test_slack_prompt_formats_dropbox_and_overleaf_links():
+    assert "<주소|폴더 열기>" in SLACK_FORMAT_PROMPT
+    assert "<주소|프로젝트 열기>" in SLACK_FORMAT_PROMPT

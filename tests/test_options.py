@@ -309,3 +309,16 @@ def test_api_error_text_is_not_part_of_the_answer():
     assert result.text == ""
     assert result.failed and result.error.startswith("요청 한도")
     assert "API Error: 429" in out.getvalue()  # the terminal still shows it, as before
+
+
+def test_prompts_never_promise_overleaf_content_summaries():
+    from mungchi.agents import UPDEOT_DESCRIPTION, UPDEOT_PROMPT
+
+    for text in (MUNGCHI_SYSTEM_PROMPT, UPDEOT_PROMPT, UPDEOT_DESCRIPTION):
+        assert "diff" not in text.replace("diff는 없다", "")
+        assert "요약한다" not in text
+    assert "프로젝트 열기" in MUNGCHI_SYSTEM_PROMPT and "프로젝트 열기" in UPDEOT_PROMPT
+    assert "내용은 직접 확인해 주세요." in MUNGCHI_SYSTEM_PROMPT
+    assert "내용은 직접 확인해 주세요." in UPDEOT_PROMPT
+    for key in ("edited_by", "last_edit", "edits", "unchanged", "errors"):
+        assert key in UPDEOT_PROMPT

@@ -1,12 +1,17 @@
-"""``check_overleaf_updates``: co-author commits in Overleaf projects via git."""
+"""``check_overleaf_updates``: which Overleaf projects co-authors edited, via git.
+
+List-only by design: only ``git log`` metadata (author name, email, date) is
+read. Commit contents, diffstats and diffs are never fetched, which keeps each
+check to a few tokens per project. The user opens the projects themselves.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import base64
 import os
+import re
 import subprocess
-from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, tzinfo
 from pathlib import Path
@@ -15,18 +20,14 @@ from typing import Any, Callable, Mapping, Sequence
 from claude_agent_sdk import ToolAnnotations, tool
 
 from .. import config
-from ..state import StateStore, describe_basis, ensure_aware, resolve_since, utcnow
+from ..state import StateStore, ensure_aware, resolve_since, utcnow
 from .common import (
     MAX_RESULT_SIZE_CHARS,
     MAX_SINCE_HOURS,
-    MAX_TEXT_FILE_BYTES,
     SINCE_HOURS_SCHEMA,
-    OutputBudget,
     int_arg,
-    is_text_path,
     safe_error,
     scrub,
-    shrink_to_limit,
     to_local_iso,
     tool_result,
     unconfigured,
@@ -34,11 +35,17 @@ from .common import (
 
 SOURCE_PREFIX = "overleaf:"
 OVERLEAF_GIT_BASE = "https://git.overleaf.com"
+OVERLEAF_PROJECT_URL = "https://www.overleaf.com/project"
 GIT_TIMEOUT_SECONDS = 180
-MAX_COMMITS_WITH_DIFF = 30
-MAX_DIFFSTAT_CHARS = 2_000
-# Unit/record separators keep the log machine-parseable even with odd subjects.
-LOG_FORMAT = "%H%x1f%an%x1f%ae%x1f%aI%x1f%s%x1e"
+TIME_FORMAT = "%Y-%m-%d %H:%M"
+NO_NAME = "(이름 없음)"
+# Author name, email and ISO date only. Unit/record separators keep the log
+# machine-parseable even with odd names.
+LOG_FORMAT = "%an%x1f%ae%x1f%aI%x1e"
+# The git remote URL carries the project id; error messages show a label instead.
+_GIT_URL_RE = re.compile(r"(?i)https?://(?:[^/\s@]+@)?git\.overleaf\.com/\S*")
+GIT_URL_LABEL = "<Overleaf git 주소>"
+INVALID_ENTRY_ERROR = "OVERLEAF_PROJECTS 항목 형식이 잘못됨 ('이름=프로젝트ID' 형식으로 적어 주세요)"
 
 Runner = Callable[[Sequence[str], "Path | None"], subprocess.CompletedProcess]
 
@@ -49,11 +56,9 @@ class GitError(Exception):
 
 @dataclass
 class Commit:
-    sha: str
     author_name: str
     author_email: str
     date: datetime
-    subject: str
 
 
 def _default_runner(cmd: Sequence[str], cwd: Path | None) -> subprocess.CompletedProcess:
@@ -124,15 +129,15 @@ def git_subcommand(args: Sequence[str]) -> str:
     return "git"
 
 
+def _norm(value: str) -> str:
+    return " ".join(value.split()).casefold()
+
+
 def is_mine(name: str, email: str, my_names: Sequence[str], my_emails: Sequence[str]) -> bool:
     """Case-insensitive match of a commit author against MY_NAMES / MY_EMAILS."""
-
-    def norm(value: str) -> str:
-        return " ".join(value.split()).casefold()
-
-    names = {norm(n) for n in my_names if n.strip()}
-    emails = {norm(e) for e in my_emails if e.strip()}
-    return (bool(name) and norm(name) in names) or (bool(email) and norm(email) in emails)
+    names = {_norm(n) for n in my_names if n.strip()}
+    emails = {_norm(e) for e in my_emails if e.strip()}
+    return (bool(name) and _norm(name) in names) or (bool(email) and _norm(email) in emails)
 
 
 def parse_log(output: str) -> list[Commit]:
@@ -142,61 +147,28 @@ def parse_log(output: str) -> list[Commit]:
         if not record.strip():
             continue
         parts = record.split("\x1f")
-        if len(parts) < 5:
+        if len(parts) < 3:
             continue
-        sha, name, email, date_raw, subject = parts[0], parts[1], parts[2], parts[3], "\x1f".join(parts[4:])
+        name, email, date_raw = parts[0], parts[1], parts[2]
         try:
             date = ensure_aware(datetime.fromisoformat(date_raw.strip().replace("Z", "+00:00")))
         except ValueError:
             continue
-        commits.append(Commit(sha.strip(), name.strip(), email.strip(), date, subject.strip()))
+        commits.append(Commit(name.strip(), email.strip(), date))
     return commits
 
 
-def parse_numstat(output: str) -> list[str]:
-    """Paths from ``git show --numstat`` output."""
-    paths: list[str] = []
-    for line in output.splitlines():
-        parts = line.split("\t", 2)
-        if len(parts) == 3 and parts[2]:
-            paths.append(parts[2])
-    return paths
+def project_link(project_id: str) -> str:
+    """Overleaf web page of the project (not the git URL)."""
+    return f"{OVERLEAF_PROJECT_URL}/{project_id}"
 
 
-def parse_ls_tree_sizes(output: str) -> dict[str, int]:
-    """``git ls-tree -r -l`` lines: ``<mode> <type> <sha> <size>\t<path>``."""
-    sizes: dict[str, int] = {}
-    for line in output.splitlines():
-        meta, _, path = line.partition("\t")
-        fields = meta.split()
-        if len(fields) == 4 and fields[3].isdigit():
-            sizes[path] = int(fields[3])
-    return sizes
+def format_time(dt: datetime, tz: tzinfo) -> str:
+    return ensure_aware(dt).astimezone(tz).strftime(TIME_FORMAT)
 
 
-def split_patch(patch: str) -> list[tuple[str, str]]:
-    """Split a multi-file patch into ``(path, section)`` pairs."""
-    sections: list[list[str]] = []
-    for line in patch.splitlines():
-        if line.startswith("diff --git ") or not sections:
-            sections.append([])
-        if line.startswith("index "):
-            continue  # blob hashes are noise for the reader
-        sections[-1].append(line)
-    result: list[tuple[str, str]] = []
-    for section in sections:
-        path = ""
-        for line in section:
-            if line.startswith("+++ b/"):
-                path = line[len("+++ b/") :]
-                break
-            if line.startswith("--- a/"):
-                path = line[len("--- a/") :]
-        if not path and section and section[0].startswith("diff --git "):
-            path = section[0].rsplit(" b/", 1)[-1]
-        if any(line.strip() for line in section):
-            result.append((path, "\n".join(section)))
-    return result
+def hide_git_url(text: str) -> str:
+    return _GIT_URL_RE.sub(GIT_URL_LABEL, text)
 
 
 def sync_repo(git: GitClient, project_id: str, cache_dir: Path) -> Path:
@@ -224,81 +196,40 @@ def remote_ref(git: GitClient, repo: Path) -> str:
     return "FETCH_HEAD"
 
 
-def commit_details(
-    git: GitClient, repo: Path, commit: Commit, label: str, budget: OutputBudget
-) -> dict[str, Any]:
-    base = ["-C", str(repo)]
-    stat = git.run(base + ["show", "--stat=120", "--format=", "--no-renames", commit.sha]).strip()
-    if len(stat) > MAX_DIFFSTAT_CHARS:
-        stat = stat[:MAX_DIFFSTAT_CHARS] + "\n… (diffstat 일부 생략)"
-    details: dict[str, Any] = {"diffstat": stat}
+def summarize_editors(commits: Sequence[Commit], tz: tzinfo) -> list[dict[str, Any]]:
+    """One entry per co-author: name, last edit time and commit count, newest first.
 
-    paths = parse_numstat(git.run(base + ["show", "--numstat", "--format=", "--no-renames", commit.sha]))
-    text_paths = [p for p in paths if is_text_path(p)]
-    if not text_paths:
-        details["files"] = []
-        return details
-    sizes = parse_ls_tree_sizes(git.run(base + ["ls-tree", "-r", "-l", commit.sha, "--", *text_paths]))
-    small = [p for p in text_paths if sizes.get(p, 0) <= MAX_TEXT_FILE_BYTES]
-    skipped = [p for p in text_paths if p not in small]
-    files: list[dict[str, Any]] = []
-    if small:
-        patch = git.run(
-            base
-            + ["show", "--format=", "--patch", "--no-color", "--no-renames", "--unified=2", commit.sha, "--", *small]
-        )
-        for path, section in split_patch(patch):
-            files.append({"path": path, **budget.fit(f"{label}:{path}@{commit.sha[:8]}", section)})
-    files.extend({"path": p, "diff": None, "diff_note": "200KB를 넘는 파일이라 diff 생략"} for p in skipped)
-    details["files"] = files
-    return details
+    Commits are grouped by author name (case- and space-insensitive); the
+    name is shown as written in the most recent commit.
+    """
+    people: dict[str, dict[str, Any]] = {}
+    for commit in sorted(commits, key=lambda c: c.date, reverse=True):
+        shown = commit.author_name or commit.author_email or NO_NAME
+        person = people.get(_norm(shown))
+        if person is None:
+            people[_norm(shown)] = {"name": shown, "last": commit.date, "edits": 1}
+        else:
+            person["edits"] += 1
+    ordered = sorted(people.values(), key=lambda p: (-p["last"].timestamp(), p["name"]))
+    return [{"name": p["name"], "last_edit": format_time(p["last"], tz), "edits": p["edits"]} for p in ordered]
 
 
-def check_project(
+def coauthor_commits(
     git: GitClient,
     project: config.OverleafProject,
     cache_dir: Path,
     since: datetime,
     my_names: Sequence[str],
     my_emails: Sequence[str],
-    tz: tzinfo,
-    budget: OutputBudget,
-) -> dict[str, Any]:
+) -> list[Commit]:
+    """Co-author commits after ``since``, from ``git log`` metadata only."""
     repo = sync_repo(git, project.project_id, cache_dir)
     ref = remote_ref(git, repo)
     log = git.run(
         ["-C", str(repo), "log", ref, "--no-merges", f"--since={since.isoformat()}", f"--format={LOG_FORMAT}"]
     )
     commits = [c for c in parse_log(log) if ensure_aware(c.date) > since]
-    coauthor_commits = [c for c in commits if not is_mine(c.author_name, c.author_email, my_names, my_emails)]
-
-    grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
-    for index, commit in enumerate(coauthor_commits):
-        item: dict[str, Any] = {
-            "commit": commit.sha[:8],
-            "date": to_local_iso(commit.date, tz),
-            "subject": commit.subject,
-        }
-        if index < MAX_COMMITS_WITH_DIFF:
-            try:
-                item.update(commit_details(git, repo, commit, project.name, budget))
-            except GitError as exc:
-                item["diff_note"] = f"diff 가져오기 실패: {exc}"
-        else:
-            item["diff_note"] = f"diff는 최근 {MAX_COMMITS_WITH_DIFF}개 커밋까지만"
-        grouped[(commit.author_name, commit.author_email)].append(item)
-
-    return {
-        "name": project.name,
-        "project_id": project.project_id,
-        "ok": True,
-        "coauthor_commit_count": len(coauthor_commits),
-        "my_commits_excluded": len(commits) - len(coauthor_commits),
-        "coauthors": [
-            {"name": name or "(이름 없음)", "email": email, "commits": items}
-            for (name, email), items in sorted(grouped.items())
-        ],
-    }
+    return [c for c in commits if not is_mine(c.author_name, c.author_email, my_names, my_emails)]
 
 
 def run_check(
@@ -317,58 +248,56 @@ def run_check(
     lookback_days = config.get_lookback_days(env)
     tz = config.get_timezone(env)
     git = GitClient(cfg.token, runner)
-    budget = OutputBudget()
     secrets = config.secret_values(env)
 
-    projects: list[dict[str, Any]] = []
+    edited: list[tuple[datetime, dict[str, Any]]] = []
+    unchanged: list[str] = []
+    errors: list[dict[str, str]] = [{"name": entry, "error": INVALID_ENTRY_ERROR} for entry in cfg.invalid_entries]
+    window_starts: list[datetime] = []
     for project in cfg.projects:
         key = SOURCE_PREFIX + project.project_id
-        since, basis = resolve_since(since_hours, store.last_checked(key), now, lookback_days)
-        window = {
-            "since": to_local_iso(since, tz),
-            "until": to_local_iso(now, tz),
-            "basis": describe_basis(basis, lookback_days),
-        }
+        since, _basis = resolve_since(since_hours, store.last_checked(key), now, lookback_days)
+        window_starts.append(since)
         try:
-            result = check_project(
-                git, project, cfg.cache_dir, since, cfg.my_names, cfg.my_emails, tz, budget
-            )
+            commits = coauthor_commits(git, project, cfg.cache_dir, since, cfg.my_names, cfg.my_emails)
         except Exception as exc:  # noqa: BLE001 - one project failing must not hide the others
             message = str(exc) if isinstance(exc, GitError) else safe_error(exc, secrets)
-            projects.append(
-                {
-                    "name": project.name,
-                    "project_id": project.project_id,
-                    "ok": False,
-                    "window": window,
-                    "error": scrub(message, secrets),
-                }
-            )
+            errors.append({"name": project.name, "error": hide_git_url(scrub(message, secrets))})
             continue
         store.mark_checked(key, now)
-        result["window"] = window
-        projects.append(result)
+        if not commits:
+            unchanged.append(project.name)
+            continue
+        latest = max(c.date for c in commits)
+        edited.append(
+            (
+                latest,
+                {
+                    "name": project.name,
+                    "link": project_link(project.project_id),
+                    "edited_by": summarize_editors(commits, tz),
+                },
+            )
+        )
 
-    payload: dict[str, Any] = {
+    edited.sort(key=lambda item: (-item[0].timestamp(), item[1]["name"]))
+    return {
         "configured": True,
-        "ok": any(p.get("ok") for p in projects),
-        "source": "overleaf",
-        "projects": projects,
+        # Projects keep their own "last checked" time; report the widest window.
+        "since": to_local_iso(min(window_starts) if window_starts else now, tz),
+        "projects": [project for _latest, project in edited],
+        "unchanged": unchanged,
+        "errors": errors,
     }
-    if cfg.invalid_entries:
-        payload["invalid_project_entries"] = cfg.invalid_entries
-    truncation = budget.report()
-    if truncation:
-        payload["truncation"] = truncation
-    return shrink_to_limit(payload)
 
 
 @tool(
     "check_overleaf_updates",
     (
-        "OVERLEAF_PROJECTS의 각 Overleaf 프로젝트를 git으로 가져와, 기간 내 공저자 커밋(내 커밋 제외)을 "
-        "공저자별로 묶어 커밋 시각·메시지·diffstat·텍스트 파일 diff(잘림 표시 포함)를 JSON으로 돌려준다. "
-        "읽기 전용. configured=false면 설정이 없는 것이니 재시도하지 말 것."
+        "OVERLEAF_PROJECTS의 각 Overleaf 프로젝트에서 기간 내 공저자(나 제외)가 편집했는지 목록만 확인한다. "
+        "프로젝트(최근 편집 순, 프로젝트 링크 포함)마다 편집한 사람, 마지막 편집 시각, 편집(커밋) 수를 "
+        "짧은 JSON으로 돌려준다. 변경 없는 프로젝트는 unchanged, 확인에 실패한 프로젝트는 errors에 있다. "
+        "원고 내용·diff는 읽지 않는다. 읽기 전용. configured=false면 설정이 없는 것이니 재시도하지 말 것."
     ),
     SINCE_HOURS_SCHEMA,
     annotations=ToolAnnotations(readOnlyHint=True, maxResultSizeChars=MAX_RESULT_SIZE_CHARS),
@@ -378,5 +307,5 @@ async def check_overleaf_updates(args: dict[str, Any]) -> dict[str, Any]:
     try:
         payload = await asyncio.to_thread(run_check, since_hours)
     except Exception as exc:  # noqa: BLE001 - last line of defence
-        payload = {"configured": True, "ok": False, "source": "overleaf", "error": safe_error(exc)}
+        payload = {"configured": True, "ok": False, "error": hide_git_url(safe_error(exc))}
     return tool_result(payload)

@@ -144,12 +144,3 @@ def resolve_since(
         if last_checked <= now:
             return last_checked, "last_checked"
     return now - timedelta(days=lookback_days), "lookback_days"
-
-
-def describe_basis(basis: str, lookback_days: int) -> str:
-    """Korean explanation of the window basis for the model to relay."""
-    return {
-        "since_hours": "요청한 시간 범위 기준",
-        "last_checked": "마지막 확인 시각 이후",
-        "lookback_days": f"저장된 확인 기록이 없어 최근 {lookback_days}일 기준",
-    }.get(basis, basis)

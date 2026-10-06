@@ -1,6 +1,6 @@
 # 고뭉치 비서실
 
-공저자들이 Dropbox와 Overleaf에서 무엇을 했는지, 오늘·내일 일정이 어떤지를 한 번에 챙겨 주는
+공저자들이 Dropbox와 Overleaf에서 어떤 파일과 프로젝트를 고쳤는지, 오늘·내일 일정이 어떤지를 한 번에 챙겨 주는
 연구자용 비서입니다. [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview)
 (`claude-agent-sdk`)로 만든 멀티 에이전트 프로그램입니다.
 
@@ -11,7 +11,7 @@
  └─ 비서실장 고뭉치 ─ main 에이전트. 데이터에 직접 손대지 않고 Agent 도구로 일을 맡김
      ├─ 업뎃 (updeot) ─ 공저자 업데이트 담당
      │    ├─ check_dropbox_updates  → Dropbox 폴더(20_연구-진행)의 공저자 변경 파일 목록 (내용은 안 읽음)
-     │    └─ check_overleaf_updates → Overleaf 프로젝트의 공저자 커밋 + diff (git)
+     │    └─ check_overleaf_updates → Overleaf 프로젝트별로 누가 언제 몇 번 편집했는지 (내용은 안 읽음, git log)
      └─ 빠릿 (ppalit) ─ 일정 담당
           └─ get_schedule           → ICS 캘린더 (Google·Outlook·iCloud)
 ```
@@ -22,7 +22,8 @@
 - **업뎃**은 Dropbox·Overleaf 도구만 씁니다. 사용자 본인의 작업은 빼고 **공저자의 작업만** 보고합니다.
   - Dropbox: `20_연구-진행` 폴더에서 공저자가 바꾼 **파일 목록만** 하위 폴더·사람별로 수정 시각과 폴더 링크를 붙여 알려 줍니다.
     토큰을 아끼려고 파일 내용은 읽지도 요약하지도 않으니, 내용은 직접 열어 확인하세요.
-  - Overleaf: diff를 읽고 "서론 2문단 재작성", "참고문헌 3개 추가"처럼 실제로 한 일을 요약합니다.
+  - Overleaf: 공저자가 편집한 **프로젝트 목록만** 알려 줍니다. 프로젝트마다 링크를 붙이고, 누가 마지막으로 언제
+    편집했는지와 편집 횟수를 적습니다. 역시 토큰을 아끼려고 원고 내용(diff)은 읽지도 요약하지도 않습니다.
 - **빠릿**은 캘린더 도구만 씁니다. 그날과 다음 날 일정, "지금 / 바로 다음 일정", 겹침과 빈 시간을 짧게 보고합니다.
 - 세 도구는 모두 **읽기 전용**이고, 프로그램 안에서 도는 SDK MCP 서버(`mungchi`)로 묶여 있습니다.
 - 모델은 `MUNGCHI_MODEL`(기본 `claude-opus-5-5`)이며, 업뎃·빠릿은 같은 모델을 이어받습니다(`inherit`).
@@ -96,6 +97,9 @@ Claude 인증은 둘 중 하나면 됩니다.
 4. `MY_NAMES`와 `MY_EMAILS`에 Overleaf에 표시되는 내 이름과 이메일을 적습니다(쉼표 구분, 대소문자 무시).
    이 값으로 내 커밋을 걸러 내므로 **둘 중 하나 이상은 꼭** 채워야 합니다.
 
+고뭉치는 Overleaf에서 **편집 기록(누가, 언제, 몇 번)만** 읽습니다(`git log`의 작성자 이름·이메일·시각).
+토큰을 아끼려고 원고 내용과 diff는 읽지 않습니다.
+
 고뭉치는 토큰을 `git -c http.extraHeader=...`로 명령마다 넘기므로 `.git/config`에 토큰이 저장되지 않습니다.
 받은 프로젝트는 `~/.cache/mungchi/overleaf/<프로젝트ID>`에 보관됩니다(`OVERLEAF_CACHE_DIR`로 변경 가능).
 
@@ -124,7 +128,7 @@ python -m mungchi
 python -m mungchi --brief
 
 # 질문 한 번
-python -m mungchi "지난 48시간 동안 공저자들이 Overleaf에서 뭐 고쳤어?"
+python -m mungchi "지난 48시간 동안 Overleaf에서 누가 어느 프로젝트를 고쳤어?"
 python -m mungchi "내일 오후에 비는 시간 있어?"
 
 # Slack 봇 실행 / 오늘 브리핑을 Slack에 올리기 (아래 "Slack에서 고뭉치 부르기" 참고)
@@ -147,8 +151,8 @@ python -m mungchi --help
 - "지난 48시간"처럼 기간을 말하면 그 범위로 봅니다.
 - Dropbox는 파일 목록만 봅니다. 한 번에 최근 60개 파일까지 이름과 수정 시각을 적고,
   그보다 많으면 나머지는 하위 폴더·사람별 개수만 알려 줍니다.
-- Overleaf diff는 텍스트 파일(`.tex .bib .md .txt .py .r .m .sty .cls .csv`)만, 200KB 이하 파일만 만듭니다.
-  파일마다 약 80줄, 한 번에 약 30,000자까지만 보내고, 잘린 부분은 보고에 "일부만 확인함"으로 표시됩니다.
+- Overleaf도 목록만 봅니다. 공저자가 편집한 프로젝트를 최근 편집 순으로, 사람마다 마지막 편집 시각과
+  편집 횟수(커밋 수)만 알려 주고, 변경 없는 프로젝트는 한 줄로 묶습니다. 원고 내용은 직접 열어 확인하세요.
 
 ## 매일 자동으로 받기 (cron)
 
@@ -323,6 +327,8 @@ python -m mungchi --brief --slack
   공유 폴더인데도 수정자 정보가 없으면 "확인 불가"로 표시합니다.
 - Dropbox는 **어떤 파일이 바뀌었는지만** 알려 주고, 무엇을 고쳤는지는 알려 주지 않습니다(토큰 절약).
   또 마지막 수정자 기준이라, 공저자가 고친 뒤 내가 다시 저장하면 마지막 수정자가 나라서 빠집니다.
+- Overleaf도 **누가 어느 프로젝트를 언제 몇 번 편집했는지만** 알려 주고, 무엇을 고쳤는지는 알려 주지 않습니다(토큰 절약).
+  편집 횟수는 Overleaf가 만든 git 커밋 수라서, 실제로 고친 횟수와 다를 수 있습니다.
 - **Overleaf Git 연동은 유료 플랜 기능**이고, **커밋 작성자 정보는 Overleaf 히스토리에서 옵니다.**
   Overleaf가 여러 사람의 편집을 한 커밋으로 묶거나 계정 이름으로 표시할 수 있어서,
   `MY_NAMES`/`MY_EMAILS`를 Overleaf에 보이는 값과 맞춰야 내 커밋이 정확히 빠집니다.
@@ -355,7 +361,7 @@ src/mungchi/
 ├── state.py           # 마지막 확인 시각(.mungchi_state.json), Slack 스레드↔대화(.mungchi_slack_threads.json)
 └── tools/
     ├── __init__.py    # SDK MCP 서버(mungchi)와 도구 이름
-    ├── common.py      # diff 자르기, 출력 한도, 비밀값 지우기
+    ├── common.py      # 비밀값 지우기, 인자 정리, 결과 JSON
     ├── dropbox_tool.py
     ├── overleaf_tool.py
     └── calendar_tool.py
