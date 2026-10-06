@@ -19,6 +19,8 @@ dependencies = [
     "slack_bolt>=1.30",
     "slack_sdk>=3.45",
     "aiohttp>=3.9",
+    # Reads the macOS Calendar app (EventKit). Imported lazily, only on a Mac.
+    "pyobjc-framework-EventKit>=10.0; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]

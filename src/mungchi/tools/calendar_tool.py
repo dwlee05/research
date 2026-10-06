@@ -1,5 +1,10 @@
-"""``get_schedule``: events from ICS feeds (Google private address, iCloud public
-calendar ``webcal://`` link, Outlook published calendar)."""
+"""``get_schedule``: events from the macOS Calendar app (EventKit) or from ICS
+feeds (Google private address, iCloud public calendar ``webcal://`` link,
+Outlook published calendar).
+
+Both sources produce the same ``Event`` list, so the output (events, now,
+next_event, overlaps, gaps) is built by the same code; only ``source`` differs.
+"""
 
 from __future__ import annotations
 
@@ -15,13 +20,16 @@ from claude_agent_sdk import ToolAnnotations, tool
 
 from .. import config
 from ..state import utcnow
+from . import macos_calendar
 from .common import MAX_RESULT_SIZE_CHARS, int_arg, safe_error, tool_result, unconfigured
 
 MAX_DAYS = 14
 MIN_GAP_MINUTES = 30
 FETCH_TIMEOUT_SECONDS = 20
+NO_TITLE = "(제목 없음)"
 
 Fetcher = Callable[[str], bytes]
+AdapterFactory = Callable[[tzinfo], macos_calendar.CalendarAdapter]
 
 
 @dataclass
@@ -81,7 +89,7 @@ def _component_event(component: Any, calendar_name: str, tz: tzinfo) -> Event | 
         start=start,
         end=end,
         all_day=all_day,
-        title=str(component.get("SUMMARY", "")).strip() or "(제목 없음)",
+        title=str(component.get("SUMMARY", "")).strip() or NO_TITLE,
         location=str(component.get("LOCATION", "")).strip(),
         calendar=calendar_name,
     )
@@ -106,11 +114,25 @@ def parse_events(
     return events
 
 
+def adapter_event(record: Mapping[str, Any], tz: tzinfo) -> Event:
+    """An ``Event`` from a Calendar app record (``macos_calendar.event_record`` shape)."""
+    start = record["start"].astimezone(tz)
+    end = max(record["end"].astimezone(tz), start)
+    return Event(
+        start=start,
+        end=end,
+        all_day=bool(record.get("all_day")),
+        title=str(record.get("title") or "").strip() or NO_TITLE,
+        location=str(record.get("location") or "").strip(),
+        calendar=str(record.get("calendar") or ""),
+    )
+
+
 def _sort_key(event: Event) -> tuple[datetime, int, str]:
     return (event.start, 0 if event.all_day else 1, event.title)
 
 
-def _overlaps_window(event: Event, start: datetime, end: datetime) -> bool:
+def overlaps_window(event: Event, start: datetime, end: datetime) -> bool:
     if event.end == event.start:  # zero-length event
         return start <= event.start < end
     return event.start < end and event.end > start
@@ -171,7 +193,7 @@ def build_schedule(
         unique.setdefault((event.title, event.start, event.end), event)
     ordered = sorted(unique.values(), key=_sort_key)
 
-    in_window = [e for e in ordered if _overlaps_window(e, window_start, window_end)]
+    in_window = [e for e in ordered if overlaps_window(e, window_start, window_end)]
     happening = [e for e in ordered if e.start <= now < e.end]
     upcoming_timed = [e for e in ordered if not e.all_day and e.start > now]
     upcoming_all_day = [e for e in ordered if e.all_day and e.start > now]
@@ -216,34 +238,20 @@ def parse_date_arg(value: str, tz: tzinfo, now: datetime) -> date:
     return date.fromisoformat(value)
 
 
-def run_schedule(
-    date_str: str = "",
-    days: int = 2,
-    env: Mapping[str, str] | None = None,
-    now: datetime | None = None,
-    fetcher: Fetcher | None = None,
-) -> dict[str, Any]:
-    cfg = config.load_calendar_config(env)
-    if not cfg.configured:
-        return unconfigured(cfg.missing, config.calendar_hint(cfg.missing))
-
-    tz = config.get_timezone(env)
-    now = (now or utcnow()).astimezone(tz)
-    try:
-        start_day = parse_date_arg(date_str, tz, now)
-    except ValueError:
-        return {"configured": True, "ok": False, "error": "date는 YYYY-MM-DD 형식이어야 합니다."}
-    days = int_arg(days, 2, 1, MAX_DAYS)
-
-    # Expand enough to answer both the requested window and "now / next".
+def expand_window(start_day: date, days: int, now: datetime) -> tuple[date, date]:
+    """Days to read so both the requested window and "now / next" can be answered."""
     today = now.date()
-    expand_start = min(start_day, today)
-    expand_end = max(start_day + timedelta(days=days), today + timedelta(days=2))
+    return min(start_day, today), max(start_day + timedelta(days=days), today + timedelta(days=2))
 
+
+def ics_events(
+    urls: list[str], tz: tzinfo, expand_start: date, expand_end: date, fetcher: Fetcher | None = None
+) -> tuple[list[Event], list[dict[str, str]]]:
+    """Events from every ICS feed, and one error entry per feed that failed."""
     events: list[Event] = []
     errors: list[dict[str, str]] = []
     fetch = fetcher or fetch_ics
-    for index, url in enumerate(cfg.urls, start=1):
+    for index, url in enumerate(urls, start=1):
         label = f"캘린더 {index}"
         try:
             ics = fetch(url)
@@ -254,26 +262,129 @@ def run_schedule(
             events.extend(parse_events(ics, label, tz, expand_start, expand_end))
         except Exception as exc:  # noqa: BLE001
             errors.append({"calendar": label, "error": f"ICS 해석 실패: {safe_error(exc, redact_urls=True)}"})
+    return events, errors
 
-    payload: dict[str, Any] = {
+
+def macos_unconfigured(reason: str, hint: str) -> dict[str, Any]:
+    return {**unconfigured([], hint), "source": config.CALENDAR_SOURCE_MACOS, "reason": reason}
+
+
+def missing_calendar_warnings(not_found: list[str]) -> list[str]:
+    return [
+        f"MACOS_CALENDARS의 '{name}' 캘린더를 Mac 캘린더 앱에서 찾지 못했습니다(이름을 캘린더 앱과 같게 적으세요)."
+        for name in not_found
+    ]
+
+
+def macos_events(
+    adapter: macos_calendar.CalendarAdapter,
+    wanted: list[str],
+    tz: tzinfo,
+    start: datetime,
+    end: datetime,
+) -> tuple[list[Event], list[str]]:
+    """Events from the Calendar app in ``[start, end)``, limited to ``wanted`` calendars (empty = all).
+
+    Returns ``(events, warnings)``. Wanted names that match no calendar are
+    reported, never fatal; if none match, nothing is read (rather than all).
+    """
+    available = [calendar["name"] for calendar in adapter.list_calendars()]
+    selected, not_found = macos_calendar.select_calendars(wanted, available)
+    warnings = missing_calendar_warnings(not_found)
+    if selected == []:
+        return [], warnings
+    keys = None if selected is None else {macos_calendar.normalize_name(name) for name in selected}
+    events = [
+        adapter_event(record, tz)
+        for record in adapter.fetch_events(start, end, names=selected)
+        if keys is None or macos_calendar.normalize_name(record.get("calendar")) in keys
+    ]
+    return events, warnings
+
+
+def _read_macos(
+    cfg: config.CalendarConfig,
+    tz: tzinfo,
+    expand_start: date,
+    expand_end: date,
+    adapter_factory: AdapterFactory | None,
+) -> tuple[list[Event], dict[str, Any], dict[str, Any] | None]:
+    """``(events, extra payload fields, early result)``; the early result replaces the schedule."""
+    try:
+        adapter = (adapter_factory or macos_calendar.default_adapter)(tz)
+    except macos_calendar.EventKitUnavailable:
+        return [], {}, macos_unconfigured("eventkit_missing", macos_calendar.EVENTKIT_MISSING_HINT)
+    status = adapter.authorization_status()
+    if status == macos_calendar.NOT_DETERMINED:
+        # Never ask from here: the bot may run while nobody is at the Mac.
+        return [], {}, macos_unconfigured("permission_not_determined", macos_calendar.NOT_DETERMINED_HINT)
+    if status != macos_calendar.GRANTED:
+        return [], {}, macos_unconfigured(f"permission_{status}", macos_calendar.permission_hint(status))
+    start = datetime.combine(expand_start, time.min, tzinfo=tz)
+    end = datetime.combine(expand_end, time.min, tzinfo=tz)
+    events, warnings = macos_events(adapter, cfg.macos_calendars, tz, start, end)
+    return events, ({"warnings": warnings} if warnings else {}), None
+
+
+def run_schedule(
+    date_str: str = "",
+    days: int = 2,
+    env: Mapping[str, str] | None = None,
+    now: datetime | None = None,
+    fetcher: Fetcher | None = None,
+    adapter_factory: AdapterFactory | None = None,
+    platform: str | None = None,
+) -> dict[str, Any]:
+    cfg = config.load_calendar_config(env, platform=platform)
+    if not cfg.configured:
+        return unconfigured(cfg.missing, cfg.hint)
+
+    tz = config.get_timezone(env)
+    now = (now or utcnow()).astimezone(tz)
+    try:
+        start_day = parse_date_arg(date_str, tz, now)
+    except ValueError:
+        return {"configured": True, "ok": False, "source": cfg.source, "error": "date는 YYYY-MM-DD 형식이어야 합니다."}
+    days = int_arg(days, 2, 1, MAX_DAYS)
+    expand_start, expand_end = expand_window(start_day, days, now)
+
+    if cfg.source == config.CALENDAR_SOURCE_MACOS:
+        try:
+            events, extra, early = _read_macos(cfg, tz, expand_start, expand_end, adapter_factory)
+        except Exception as exc:  # noqa: BLE001 - reported to the model, never raised
+            return {
+                "configured": True,
+                "ok": False,
+                "source": cfg.source,
+                "error": f"Mac 캘린더를 읽지 못했습니다: {safe_error(exc)}",
+            }
+        if early is not None:
+            return early
+        ok = True
+    else:
+        events, errors = ics_events(cfg.urls, tz, expand_start, expand_end, fetcher)
+        ok = len(errors) < len(cfg.urls)
+        extra = {"errors": errors} if errors else {}
+
+    return {
         "configured": True,
-        "ok": len(errors) < len(cfg.urls),
+        "ok": ok,
+        "source": cfg.source,
         "timezone": config.get_timezone_name(env),
         **build_schedule(events, tz, start_day, days, now),
+        **extra,
     }
-    if errors:
-        payload["errors"] = errors
-    return payload
 
 
 @tool(
     "get_schedule",
     (
-        "ICS 캘린더(CALENDAR_ICS_URLS)에서 date(YYYY-MM-DD, 비우면 오늘)부터 days일(기본 2: 오늘·내일)의 "
-        "일정을 시작 시각 순으로 돌려준다. 각 일정: start, end, all_day, title, location, calendar "
+        "캘린더에서 date(YYYY-MM-DD, 비우면 오늘)부터 days일(기본 2: 오늘·내일)의 "
+        "일정을 시작 시각 순으로 돌려준다. 캘린더는 Mac 캘린더 앱(source: macos) 또는 "
+        "ICS 주소(source: ics)다. 각 일정: start, end, all_day, title, location, calendar "
         "(종일 일정의 end는 마지막 날 포함). 현재 진행 중인 일정(now), 바로 다음 일정(next_event), "
-        "겹침(overlaps), 30분 이상 빈 시간(gaps)도 포함. 읽기 전용. "
-        "configured=false면 설정이 없는 것이니 재시도하지 말 것."
+        "겹침(overlaps), 30분 이상 빈 시간(gaps)도 포함. warnings가 있으면 함께 전할 것. 읽기 전용. "
+        "configured=false면 설정이나 권한이 없는 것이니 재시도하지 말 것."
     ),
     {
         "type": "object",

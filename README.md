@@ -13,7 +13,7 @@
  │       ├─ 업뎃 (update) ─ 공저자 업데이트 담당
  │       │    └─ check_dropbox_updates  → Dropbox 폴더(20_연구-진행)의 공저자 변경 파일 목록 (내용은 안 읽음)
  │       └─ 일정 (schedule) ─ 캘린더 일정 담당
- │            └─ get_schedule           → ICS 캘린더 (Google·Outlook·iCloud)
+ │            └─ get_schedule           → Mac 캘린더 앱(EventKit) 또는 ICS 캘린더 (Google·Outlook·iCloud)
  ├─ Slack @update (업뎃 봇) · 터미널 --agent update     → 업뎃이 바로 답함 (Dropbox 도구만)
  └─ Slack @schedule (일정 봇) · 터미널 --agent schedule → '일정'이 바로 답함 (캘린더 도구만)
 ```
@@ -173,7 +173,48 @@ HTTP 200: 모델 2개
    `DROPBOX_ROOT_FOLDER`에 전체 경로를 적습니다(예: `/Research/20_연구-진행`). 앞의 `/`는 빠져도 되고 끝의 `/`는 무시합니다.
    이 폴더 바로 아래 하위 폴더(논문별 폴더 등)를 단위로 묶어서 보고합니다.
 
-### 2. 캘린더 (macOS 캘린더 앱 · Google 캘린더 · Outlook)
+### 2. 캘린더 (Mac 캘린더 앱 · Google 캘린더 · Outlook)
+
+'일정' 에이전트가 일정을 읽는 방법은 두 가지입니다. `.env`의 `CALENDAR_SOURCE`(기본 `auto`)로 고릅니다.
+
+- **방법 A. Mac 캘린더 앱에서 바로 읽기** (`CALENDAR_SOURCE=macos`): 봇을 Mac에서 돌린다면 이 방법을 권장합니다.
+  캘린더를 공개하거나 ICS 주소를 만들 필요가 없습니다.
+- **방법 B. ICS 주소로 읽기** (`CALENDAR_SOURCE=ics`): Mac이 아닌 컴퓨터이거나 Google·Outlook 주소를 쓰고 싶을 때.
+- `auto`는 `CALENDAR_ICS_URLS`가 있으면 B, 비어 있으면 Mac에서는 A를 씁니다.
+
+#### 방법 A. Mac 캘린더 앱에서 바로 읽기 (Mac 권장)
+
+캘린더 앱에 보이는 캘린더(iCloud, Google, Exchange, "나의 Mac에" 모두)를 macOS의 EventKit으로 바로 읽습니다.
+
+1. 저장소를 새로 받았다면(`git pull`) 가상환경을 켠 상태에서 **다시 설치**합니다.
+   Mac에서만 필요한 `pyobjc`(EventKit)가 이때 함께 설치됩니다.
+   ```bash
+   cd research
+   source .venv/bin/activate
+   git pull
+   pip install -e .
+   ```
+2. **macOS의 터미널 앱에서** 한 번 실행합니다(Claude API는 쓰지 않습니다).
+   ```bash
+   python -m mungchi --calendar-setup
+   ```
+   처음이면 macOS 확인 창이 뜹니다. **허용**을 누르세요. 창에는 고뭉치 대신 **터미널**(또는 그 명령을 실행한 앱) 이름이
+   나올 수 있습니다. macOS는 권한을 Python을 실행한 앱에 주기 때문입니다.
+   허용하면 계정별 캘린더 목록과, 오늘·내일 읽힐 일정 수와 처음 몇 개가 나옵니다. 맞는지 확인하세요.
+3. (선택) 일부 캘린더만 읽으려면 `.env`의 `MACOS_CALENDARS`에 캘린더 이름을 쉼표로 구분해 적습니다
+   (예: `MACOS_CALENDARS=연구,수업`, 대소문자 무시). 비우면 모든 캘린더를 읽습니다. 적은 뒤 `--calendar-setup`을 다시 실행하면
+   그 필터로 몇 개가 읽히는지, 찾지 못한 이름이 있는지 알려 줍니다.
+4. `.env`의 `CALENDAR_ICS_URLS`는 **비워 두세요**(값이 있으면 `auto`는 ICS 주소를 읽습니다). 또는 `CALENDAR_SOURCE=macos`로 정합니다.
+   예전에 이 용도로 iCloud 캘린더를 공개해 두었다면 이제 **공개 캘린더**를 꺼도 됩니다.
+5. 켜 둔 봇이 있으면 **다시 시작**합니다(`Ctrl+C`로 멈춘 뒤 `python -m mungchi slack`).
+
+- 권한을 거부했거나 "쓰기 전용"으로 정했다면 **시스템 설정 → 개인정보 보호 및 보안 → 캘린더**에서 그 터미널 앱을
+  **전체 접근**으로 바꾼 뒤 봇을 다시 시작하세요. 고뭉치는 일정을 읽기만 하지만, macOS에서 일정을 읽으려면 '전체 접근'이 필요합니다.
+- 봇은 권한을 직접 묻지 않습니다(Mac 앞에 아무도 없을 수 있으니까요). 아직 허용하지 않았으면 '일정' 에이전트가
+  `--calendar-setup`을 실행하라고 알려 줍니다.
+- 캘린더 앱에 동기화된 내용을 읽으므로, 다른 기기에서 바꾼 일정은 Mac에 동기화된 뒤에 보입니다.
+
+#### 방법 B. ICS 주소로 읽기
 
 OAuth 없이 캘린더의 구독 주소(ICS, `webcal://…` 또는 `https://…`)만으로 읽습니다.
 **캘린더가 여러 개면** 주소를 쉼표로 구분해 `CALENDAR_ICS_URLS`에 모두 넣습니다.
@@ -182,12 +223,12 @@ OAuth 없이 캘린더의 구독 주소(ICS, `webcal://…` 또는 `https://…`
 CALENDAR_ICS_URLS=webcal://p01-caldav.icloud.com/published/2/...,https://calendar.google.com/calendar/ical/.../basic.ics
 ```
 
-#### 먼저: 캘린더가 어느 계정에 있는지 확인 (macOS 캘린더 앱)
+##### 먼저: 캘린더가 어느 계정에 있는지 확인 (macOS 캘린더 앱)
 
 캘린더 앱 왼쪽 사이드바를 보면 캘린더가 **iCloud**, **Google**, **Exchange**, **나의 Mac에** 같은 계정별로 묶여 있습니다.
 쓰려는 캘린더가 어느 묶음 아래에 있는지에 따라 주소를 얻는 방법이 다릅니다.
 
-#### iCloud 캘린더
+##### iCloud 캘린더
 
 1. 캘린더 앱 사이드바에서 캘린더를 Control-클릭(또는 오른쪽 클릭)하고 **캘린더 공유…** 를 고릅니다.
 2. **공개 캘린더**를 켭니다.
@@ -197,7 +238,7 @@ CALENDAR_ICS_URLS=webcal://p01-caldav.icloud.com/published/2/...,https://calenda
 > ⚠️ 공개 캘린더는 **주소를 아는 사람이면 누구나** 일정을 볼 수 있습니다. 이 주소를 다른 사람과 공유하거나
 > 커밋하지 마세요. 유출됐다면 같은 화면에서 **공개 캘린더**를 꺼서 공유를 멈추세요.
 
-#### Google 캘린더 (비공개 iCal 주소)
+##### Google 캘린더 (비공개 iCal 주소)
 
 1. 컴퓨터에서 [Google 캘린더](https://calendar.google.com) → 오른쪽 위 톱니바퀴 → **설정**.
 2. 왼쪽 **내 캘린더의 설정**에서 캘린더를 고릅니다.
@@ -206,14 +247,13 @@ CALENDAR_ICS_URLS=webcal://p01-caldav.icloud.com/published/2/...,https://calenda
 
 > 비공개 주소는 **비밀번호와 같습니다**. 유출됐다면 같은 화면에서 재설정하세요.
 
-#### Exchange·Outlook 캘린더
+##### Exchange·Outlook 캘린더
 
 Outlook 웹의 설정 → 캘린더 → 공유 캘린더 → **캘린더 게시**에서 ICS 링크를 받습니다(기관에서 막아 두었을 수 있습니다).
 
-#### "나의 Mac에" 캘린더
+##### "나의 Mac에" 캘린더
 
-이 컴퓨터에만 저장된 로컬 캘린더라 구독 주소가 없습니다. **아직 지원하지 않습니다.** 고뭉치에게 보여 주려면
-그 일정을 iCloud나 Google 캘린더로 옮긴 뒤 위 방법으로 주소를 넣어야 합니다.
+이 컴퓨터에만 저장된 로컬 캘린더라 구독 주소가 없어 **ICS로는 읽을 수 없습니다.** Mac에서는 방법 A로 읽을 수 있습니다.
 
 > 고뭉치는 캘린더 주소를 출력이나 오류 메시지, 로그에 내보내지 않습니다(`webcal://` 형식과 바꾼 `https://` 형식 모두).
 
@@ -240,6 +280,9 @@ python -m mungchi --brief --slack
 
 # 쓸 수 있는 모델 ID 확인 (에이전트 실행 없음, 위 "모델 확인" 참고)
 python -m mungchi --list-models
+
+# Mac 캘린더 앱 연결 (처음 한 번, macOS 터미널에서. 위 "캘린더"의 방법 A 참고)
+python -m mungchi --calendar-setup
 
 # 도움말
 python -m mungchi --help
@@ -276,6 +319,7 @@ Slack 없이 파일에 쌓으려면 `--slack`을 빼면 됩니다(브리핑은 �
 - Claude 인증은 `.env`의 설정(API 키 또는 게이트웨이 설정)을 그대로 씁니다. 셸에서만 `export`한 값은 cron이 읽지 못하니
   `.env`에 넣어 두세요.
 - Dropbox는 몇 시간 뒤 만료되는 액세스 토큰 대신 리프레시 토큰 방식을 쓰세요.
+- Mac 캘린더 앱(방법 A)을 읽는다면 cron에서는 캘린더 권한이 없을 수 있습니다. 아래 [알려진 한계](#알려진-한계)를 보세요.
 
 ## Slack에서 부르기
 
@@ -434,6 +478,7 @@ loginctl enable-linger "$USER"             # 로그아웃한 뒤에도 계속 �
 ```
 
 macOS에서는 tmux를 쓰거나, 같은 명령을 launchd(`~/Library/LaunchAgents`)에 등록하면 됩니다.
+Mac 캘린더 앱(방법 A)을 읽는다면 터미널에서 띄우는 tmux가 가장 확실합니다(launchd는 [알려진 한계](#알려진-한계) 참고).
 
 ### 8. 브리핑을 Slack으로 받기
 
@@ -510,6 +555,7 @@ export SSL_CERT_FILE="$(python -m certifi)"
 ## 보안
 
 - 모든 도구는 읽기 전용입니다. Dropbox·캘린더의 내용을 바꾸지 않습니다.
+  Mac 캘린더 앱은 macOS가 읽기에 '전체 접근'을 요구해서 그 권한을 받지만, 고뭉치는 일정을 읽기만 합니다.
 - 토큰·키와 캘린더 주소(Google 비공개 주소, iCloud 공개 캘린더 주소)는 도구 출력·오류 메시지·로그에 나오지 않도록 지웁니다(`***`).
 - 고뭉치는 Bash·파일 쓰기 같은 내장 도구를 쓸 수 없고, 데이터 도구도 직접 부를 수 없습니다.
   업뎃은 Dropbox 도구만, 일정은 캘린더 도구만 쓸 수 있습니다(PreToolUse 훅으로 강제).
@@ -537,6 +583,10 @@ export SSL_CERT_FILE="$(python -m certifi)"
   스레드의 다른 메시지(다른 봇의 답 포함)는 읽지 않습니다. 대화도 봇마다 따로라서, 업뎃 봇에게 들은 내용을 고뭉치는 모릅니다.
 - Dropbox의 "마지막 확인 시각"은 고뭉치, 업뎃 봇, `--agent update`가 함께 씁니다. 업뎃 봇으로 먼저 확인하면
   다음 고뭉치 브리핑에는 그 뒤의 변경만 나옵니다.
+- **Mac 캘린더 앱 권한은 Python을 실행한 앱(보통 터미널)에 주어집니다.** 그래서 터미널에서 띄운 봇(tmux 포함)은 그 권한을 쓰지만,
+  봇이나 브리핑을 나중에 launchd 같은 백그라운드 서비스나 cron으로 돌리면 권한이 없다고 나올 수 있습니다.
+  그때는 권한을 다시 받거나 다른 방법이 필요할 수 있는데, 이 경우는 아직 실제로 확인하지 못했습니다.
+  확실한 대안은 ICS 주소(방법 B)입니다. iTerm 같은 다른 터미널 앱에서 실행하면 그 앱에 따로 허용해야 합니다.
 - 고뭉치에게 물으면 고뭉치·업뎃·일정이 모두 모델을 호출하므로 API 비용이 듭니다. 업뎃·일정을 직접 부르면 한 에이전트만
   호출합니다. Slack 멘션·DM도 한 번마다 비용이 듭니다.
 
@@ -548,7 +598,8 @@ pytest -q
 ```
 
 테스트는 네트워크를 쓰지 않습니다. Dropbox 클라이언트는 가짜 객체로 대신하고,
-캘린더는 테스트 안의 ICS 문자열과 고정된 시계로 확인합니다. Slack은 가짜 웹 클라이언트와 가짜 `run_turn`으로
+캘린더는 테스트 안의 ICS 문자열과 고정된 시계로 확인합니다. Mac 캘린더 앱(EventKit)은 가짜 어댑터와 가짜 EventKit 객체로
+확인하므로 macOS가 아니어도 테스트가 돌고, 실제 캘린더 앱에는 접근하지 않습니다. Slack은 가짜 웹 클라이언트와 가짜 `run_turn`으로
 확인하므로 실제 Slack이나 Claude에 연결하지 않습니다. `--list-models`는 가짜 httpx 전송(`MockTransport`)으로 확인합니다.
 
 ```
@@ -557,6 +608,7 @@ src/mungchi/
 ├── __main__.py        # python -m mungchi
 ├── main.py            # 페르소나별 ClaudeAgentOptions 구성, 한 턴 실행(run_turn), CLI(--agent 포함), 출력 스트리밍, 오류 문구
 ├── model_list.py      # --list-models: 모델 목록 확인 (GET /v1/models)
+├── calendar_setup.py  # --calendar-setup: Mac 캘린더 앱 접근 허용, 캘린더·오늘 일정 확인
 ├── personas.py        # 페르소나 키(mungchi·update·schedule), 한글 이름, Slack 핸들
 ├── slack_bot.py       # Slack 봇 세 개(한 프로세스, Socket Mode), 권한 확인, 진행 표시, --brief --slack
 ├── slack_format.py    # Slack용 프롬프트, 봇별 첫 답, 멘션 제거, mrkdwn 변환, 메시지 나누기
@@ -567,5 +619,6 @@ src/mungchi/
     ├── __init__.py    # SDK MCP 서버(mungchi)와 도구 이름
     ├── common.py      # 비밀값 지우기, 인자 정리, 결과 JSON
     ├── dropbox_tool.py
-    └── calendar_tool.py
+    ├── calendar_tool.py   # get_schedule: Mac 캘린더 앱 또는 ICS 주소에서 일정 읽기
+    └── macos_calendar.py  # EventKit 어댑터 (pyobjc는 Mac에서 필요할 때만 불러옴)
 ```

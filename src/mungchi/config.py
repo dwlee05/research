@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
@@ -164,16 +165,37 @@ def dropbox_hint(missing: list[str]) -> str:
 
 # ---------------------------------------------------------------- Calendar
 
+# CALENDAR_SOURCE values. "auto": the ICS addresses if CALENDAR_ICS_URLS is
+# set, otherwise the macOS Calendar app when running on a Mac.
+CALENDAR_SOURCE_AUTO = "auto"
+CALENDAR_SOURCE_MACOS = "macos"
+CALENDAR_SOURCE_ICS = "ics"
+CALENDAR_SOURCES = (CALENDAR_SOURCE_AUTO, CALENDAR_SOURCE_MACOS, CALENDAR_SOURCE_ICS)
+CALENDAR_SETUP_COMMAND = "python -m mungchi --calendar-setup"
+
+
+def current_platform() -> str:
+    """``sys.platform`` ("darwin" on a Mac); tests replace this function."""
+    return sys.platform
+
 
 @dataclass
 class CalendarConfig:
     urls: list[str] = field(default_factory=list)
     timezone_name: str = DEFAULT_TIMEZONE
+    # CALENDAR_SOURCE as written (lower-cased) and the source it resolves to
+    # here: "ics", "macos", or "" when no calendar can be read.
+    requested_source: str = CALENDAR_SOURCE_AUTO
+    source: str = ""
+    # MACOS_CALENDARS: calendar names to read from the Calendar app (empty = all).
+    macos_calendars: list[str] = field(default_factory=list)
     missing: list[str] = field(default_factory=list)
+    # Korean explanation when not configured.
+    hint: str = ""
 
     @property
     def configured(self) -> bool:
-        return not self.missing
+        return bool(self.source)
 
 
 _WEBCAL_RE = re.compile(r"^webcals?://", re.IGNORECASE)
@@ -190,22 +212,67 @@ def ics_fetch_url(url: str) -> str:
     return _WEBCAL_RE.sub("https://", url, count=1)
 
 
-def load_calendar_config(env: Mapping[str, str] | None = None) -> CalendarConfig:
+def load_calendar_config(env: Mapping[str, str] | None = None, platform: str | None = None) -> CalendarConfig:
+    """Calendar settings and the source to read.
+
+    ``CALENDAR_SOURCE`` (default ``auto``): ``ics`` reads CALENDAR_ICS_URLS,
+    ``macos`` reads the Calendar app (Mac only), ``auto`` picks ICS when
+    CALENDAR_ICS_URLS is set and otherwise the Calendar app on a Mac.
+    """
+    platform = current_platform() if platform is None else platform
+    raw_source = _get(env, "CALENDAR_SOURCE")
+    requested = raw_source.lower() or CALENDAR_SOURCE_AUTO
     cfg = CalendarConfig(
         urls=[ics_fetch_url(url) for url in split_csv(_get(env, "CALENDAR_ICS_URLS"))],
         timezone_name=get_timezone_name(env),
+        requested_source=requested,
+        macos_calendars=split_csv(_get(env, "MACOS_CALENDARS")),
     )
-    if not cfg.urls:
+    on_mac = platform == "darwin"
+    if requested not in CALENDAR_SOURCES:
+        cfg.hint = (
+            f"CALENDAR_SOURCE 값 '{raw_source}'은(는) 쓸 수 없습니다. "
+            "auto(기본), macos, ics 가운데 하나를 쓰거나 비워 두세요."
+        )
+    elif requested == CALENDAR_SOURCE_ICS or (requested == CALENDAR_SOURCE_AUTO and cfg.urls):
+        if cfg.urls:
+            cfg.source = CALENDAR_SOURCE_ICS
+        else:
+            cfg.missing.append("CALENDAR_ICS_URLS")
+            cfg.hint = calendar_hint(cfg.missing)
+    elif on_mac:
+        cfg.source = CALENDAR_SOURCE_MACOS
+    else:
         cfg.missing.append("CALENDAR_ICS_URLS")
+        cfg.hint = (
+            not_mac_hint(cfg.missing) if requested == CALENDAR_SOURCE_MACOS else calendar_hint(cfg.missing, mac_note=True)
+        )
     return cfg
 
 
-def calendar_hint(missing: list[str]) -> str:
+_ICS_HOW = (
+    "Google 캘린더 설정 > 내 캘린더의 설정 > 캘린더 통합의 'iCal 형식의 비공개 주소', "
+    "macOS 캘린더 앱 iCloud 캘린더의 '캘린더 공유… > 공개 캘린더' 주소(webcal://), "
+    "Outlook의 ICS 주소 가운데 쓰는 것을 복사해 쉼표로 구분해 .env의 CALENDAR_ICS_URLS에 넣으세요."
+)
+
+
+def calendar_hint(missing: list[str], mac_note: bool = False) -> str:
+    names = ", ".join(missing)
+    note = (
+        f"Mac에서 실행하면 캘린더 앱을 바로 읽을 수 있습니다(터미널에서 {CALENDAR_SETUP_COMMAND} 한 번 실행). "
+        "이 컴퓨터는 macOS가 아니므로 "
+        if mac_note
+        else ""
+    )
+    return f"캘린더 설정 누락: {names} — {note}{_ICS_HOW}"
+
+
+def not_mac_hint(missing: list[str]) -> str:
     names = ", ".join(missing)
     return (
-        f"캘린더 설정 누락: {names} — Google 캘린더 설정 > 내 캘린더의 설정 > 캘린더 통합의 "
-        "'iCal 형식의 비공개 주소', macOS 캘린더 앱 iCloud 캘린더의 '캘린더 공유… > 공개 캘린더' 주소(webcal://), "
-        "Outlook의 ICS 주소 가운데 쓰는 것을 복사해 쉼표로 구분해 .env에 넣으세요."
+        f"캘린더 설정 누락: {names} — CALENDAR_SOURCE=macos(Mac 캘린더 앱 읽기)는 macOS에서만 쓸 수 있습니다. "
+        f"이 컴퓨터에서는 CALENDAR_SOURCE를 비우고 {_ICS_HOW}"
     )
 
 

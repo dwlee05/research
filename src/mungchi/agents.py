@@ -141,7 +141,7 @@ _SCHEDULE_BODY = """\
 {date_rule}
 
 ## 규칙
-1. 결과가 configured: false이면 다시 호출하지 말고 "캘린더 설정 안 됨"과 함께 missing(빠진 환경변수)과 hint를 그대로 {to} 전한다. ok: false나 errors가 있어도 다시 시도하지 말고 오류 내용을 전한다.
+1. 결과가 configured: false이면 다시 호출하지 말고 "캘린더 설정 안 됨"과 함께 hint(설정 방법)와, 비어 있지 않으면 missing(빠진 환경변수)을 그대로 {to} 전한다. ok: false나 errors가 있어도 다시 시도하지 말고 오류 내용을 전한다. warnings가 있으면 짧게 함께 전한다.
 2. 도구 결과에 있는 일정만 알린다. 일정이나 시간을 지어내지 않는다.
 3. 시간은 결과의 timezone 기준 24시간제(HH:MM)로 쓴다.
 

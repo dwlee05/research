@@ -496,6 +496,7 @@ def build_parser() -> argparse.ArgumentParser:
             '  python -m mungchi --agent update "누가 무슨 파일 고쳤어?"   # 업뎃에게 바로 묻기\n'
             "  python -m mungchi --agent schedule      # '일정'과 바로 대화\n"
             "  python -m mungchi --list-models         # 쓸 수 있는 모델 ID 확인 (MUNGCHI_MODEL 고르기)\n"
+            "  python -m mungchi --calendar-setup      # Mac 캘린더 앱 연결 (처음 한 번, 터미널에서)\n"
             "\n"
             "질문 자리에 slack 한 단어만 쓰면 질문이 아니라 Slack 봇 실행 명령으로 처리합니다.\n"
             "Slack 봇은 고뭉치·업뎃·일정 가운데 토큰을 넣은 봇이 한 프로세스에서 함께 켜집니다.\n"
@@ -532,6 +533,14 @@ def build_parser() -> argparse.ArgumentParser:
             "(에이전트는 실행하지 않음)"
         ),
     )
+    opts.add_argument(
+        "--calendar-setup",
+        action="store_true",
+        help=(
+            "Mac 캘린더 앱 접근을 허용하고, 읽을 캘린더와 오늘·내일 일정을 확인합니다 "
+            "(macOS 터미널에서 한 번 실행, Claude API는 쓰지 않음)"
+        ),
+    )
     opts.add_argument("-h", "--help", action="help", help="이 도움말을 보여 주고 끝냅니다")
     return parser
 
@@ -556,6 +565,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.list_models and (args.question or args.brief or args.slack or args.agent):
         parser.error("--list-models는 질문이나 다른 옵션(--brief, --slack, --agent, slack)과 함께 쓸 수 없습니다.")
+    if args.calendar_setup and (args.question or args.brief or args.slack or args.agent or args.list_models):
+        parser.error(
+            "--calendar-setup은 질문이나 다른 옵션(--brief, --slack, --agent, --list-models, slack)과 함께 쓸 수 없습니다."
+        )
     start_slack_bot = args.question == SLACK_COMMAND
     if start_slack_bot and (args.brief or args.slack):
         parser.error("slack 명령은 --brief, --slack과 함께 쓸 수 없습니다.")
@@ -582,6 +595,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             from .model_list import list_models
 
             return list_models()
+        if args.calendar_setup:
+            from .calendar_setup import run_calendar_setup
+
+            return run_calendar_setup()
         if start_slack_bot:
             from .slack_bot import run_bot_cli
 
