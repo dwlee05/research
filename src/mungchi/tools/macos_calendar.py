@@ -38,7 +38,8 @@ STATUS_LABELS = {
 SETTINGS_PATH = "시스템 설정 → 개인정보 보호 및 보안 → 캘린더"
 NOT_DETERMINED_HINT = (
     "터미널에서 `python -m mungchi --calendar-setup`을 한 번 실행해 캘린더 접근을 허용하세요. "
-    "그다음 봇을 다시 시작하세요."
+    "그다음 봇을 다시 시작하세요. 봇을 백그라운드 서비스로 돌린다면 대신 `python -m mungchi service restart`를 "
+    "실행하고 '비서실 고뭉치' 확인 창에서 허용을 누르세요."
 )
 EVENTKIT_MISSING_HINT = (
     "Mac 캘린더 앱을 읽는 데 필요한 pyobjc(EventKit)가 설치되어 있지 않습니다. "
@@ -51,7 +52,8 @@ def permission_hint(status: str) -> str:
     """Korean fix for a permission state that does not allow reading events."""
     hint = (
         f"Mac 캘린더 접근이 허용되지 않았습니다(상태: {STATUS_LABELS.get(status, status)}). "
-        f"{SETTINGS_PATH}에서 봇을 실행하는 터미널 앱(예: 터미널)을 '전체 접근'으로 바꾼 뒤 봇을 다시 시작하세요."
+        f"{SETTINGS_PATH}에서 봇을 실행하는 앱(백그라운드 서비스면 '비서실 고뭉치', 터미널에서 띄웠으면 그 터미널 앱)을 "
+        "'전체 접근'으로 바꾼 뒤 봇을 다시 시작하세요."
     )
     if status == RESTRICTED:
         hint += " 기기 관리 정책으로 막혀 있으면 바꿀 수 없으니 CALENDAR_ICS_URLS(ICS 주소)를 쓰세요."

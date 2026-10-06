@@ -72,6 +72,9 @@ BRIEFING_PROMPT = "업뎃과 '일정' 에이전트에게 일을 맡겨서 오늘
 EXIT_WORDS = {"exit", "quit", "종료"}
 # A positional prompt that is exactly this word starts the Slack bot.
 SLACK_COMMAND = "slack"
+# A first argument that is exactly this word is a background-service command
+# (``python -m mungchi service install`` etc., see ``service.py``), not a question.
+SERVICE_COMMAND = "service"
 
 CHAT_GREETINGS = {
     MUNGCHI: "고뭉치 비서실입니다. 무엇을 도와드릴까요? (끝내려면 exit 또는 종료)",
@@ -473,7 +476,8 @@ async def run_chat(options: ClaudeAgentOptions, persona: str = MUNGCHI) -> int:
 
 class KoreanHelpFormatter(argparse.RawDescriptionHelpFormatter):
     def add_usage(self, usage, actions, groups, prefix=None):  # type: ignore[override]
-        return super().add_usage(usage, actions, groups, prefix="사용법: ")
+        # argparse passes prefix="" when it builds a subcommand's prog; keep that.
+        return super().add_usage(usage, actions, groups, prefix="사용법: " if prefix is None else prefix)
 
 
 class KoreanArgumentParser(argparse.ArgumentParser):
@@ -497,10 +501,17 @@ def build_parser() -> argparse.ArgumentParser:
             "  python -m mungchi --agent schedule      # '일정'과 바로 대화\n"
             "  python -m mungchi --list-models         # 쓸 수 있는 모델 ID 확인 (MUNGCHI_MODEL 고르기)\n"
             "  python -m mungchi --calendar-setup      # Mac 캘린더 앱 연결 (처음 한 번, 터미널에서)\n"
+            "  python -m mungchi service install       # (macOS) Slack 봇을 백그라운드 서비스로 설치 (로그인하면 자동 시작)\n"
+            "  python -m mungchi service status        # (macOS) 서비스 상태와 최근 로그\n"
             "\n"
             "질문 자리에 slack 한 단어만 쓰면 질문이 아니라 Slack 봇 실행 명령으로 처리합니다.\n"
             "Slack 봇은 고뭉치·업뎃·일정 가운데 토큰을 넣은 봇이 한 프로세스에서 함께 켜집니다.\n"
-            "Slack 설정(SLACK_BOT_TOKEN 등)은 README의 'Slack에서 부르기'를 보세요."
+            "Slack 설정(SLACK_BOT_TOKEN 등)은 README의 'Slack에서 부르기'를 보세요.\n"
+            "\n"
+            "마찬가지로 맨 앞에 service 한 단어를 쓰면 질문이 아니라 백그라운드 서비스 명령(macOS 전용)입니다:\n"
+            "  service install | uninstall | start | stop | restart | status | logs [-f] [-n N]\n"
+            "  service run은 서비스가 내부에서 쓰는 명령입니다(직접 실행하지 마세요).\n"
+            "  자세히: python -m mungchi service --help, README의 '백그라운드로 실행하기'"
         ),
         formatter_class=KoreanHelpFormatter,
         add_help=False,
@@ -510,7 +521,10 @@ def build_parser() -> argparse.ArgumentParser:
         "question",
         nargs="?",
         metavar="질문",
-        help="한 번만 물어볼 질문 (기본은 고뭉치에게). slack 이라고만 쓰면 Slack 봇을 실행합니다",
+        help=(
+            "한 번만 물어볼 질문 (기본은 고뭉치에게). slack 이라고만 쓰면 Slack 봇을 실행하고, "
+            "맨 앞의 service 는 백그라운드 서비스 명령입니다"
+        ),
     )
     opts = parser.add_argument_group("옵션")
     opts.add_argument("--brief", action="store_true", help="오늘 브리핑을 한 번 받고 끝냅니다 (cron용)")
@@ -560,9 +574,31 @@ def drop_empty_claude_env(environ: MutableMapping[str, str] | None = None) -> No
             del environ[name]
 
 
+def load_env() -> None:
+    """Load ``.env`` (searched from the working directory upwards), then drop empty Claude settings.
+
+    Runs before any SDK subprocess starts (CLI turns, Slack bots, --brief --slack,
+    the background service): an empty ANTHROPIC_API_KEY= line must not get in
+    the way of gateway auth.
+    """
+    from dotenv import find_dotenv, load_dotenv
+
+    load_dotenv(find_dotenv(usecwd=True))
+    drop_empty_claude_env()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == SERVICE_COMMAND:
+        # ``service <action> [...]`` has its own parser; like ``slack``, the bare
+        # word in the question position is a command, never a question.
+        from .service import service_main
+
+        return service_main(argv[1:])
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.question == SERVICE_COMMAND:
+        parser.error("service 명령은 맨 앞에 쓰고 다른 옵션과 함께 쓸 수 없습니다. 예: python -m mungchi service status")
     if args.list_models and (args.question or args.brief or args.slack or args.agent):
         parser.error("--list-models는 질문이나 다른 옵션(--brief, --slack, --agent, slack)과 함께 쓸 수 없습니다.")
     if args.calendar_setup and (args.question or args.brief or args.slack or args.agent or args.list_models):
@@ -583,12 +619,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     persona = args.agent or MUNGCHI
     label = PERSONA_LABELS[persona]
 
-    from dotenv import find_dotenv, load_dotenv
-
-    load_dotenv(find_dotenv(usecwd=True))
-    # Before any SDK subprocess starts (CLI turns, Slack bots, --brief --slack):
-    # an empty ANTHROPIC_API_KEY= line must not get in the way of gateway auth.
-    drop_empty_claude_env()
+    load_env()
 
     try:
         if args.list_models:

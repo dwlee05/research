@@ -201,17 +201,23 @@ HTTP 200: 모델 2개
    처음이면 macOS 확인 창이 뜹니다. **허용**을 누르세요. 창에는 고뭉치 대신 **터미널**(또는 그 명령을 실행한 앱) 이름이
    나올 수 있습니다. macOS는 권한을 Python을 실행한 앱에 주기 때문입니다.
    허용하면 계정별 캘린더 목록과, 오늘·내일 읽힐 일정 수와 처음 몇 개가 나옵니다. 맞는지 확인하세요.
+   > 봇을 [백그라운드 서비스](#백그라운드로-실행하기-추천)로 돌릴 거라면 여기서 준 터미널 권한은 서비스에 쓰이지 않습니다.
+   > 이 단계는 캘린더 목록과 `MACOS_CALENDARS` 필터를 확인하는 용도로 쓰고, 권한은 서비스를 설치한 뒤
+   > "비서실 고뭉치" 확인 창에서 따로 허용하세요.
 3. (선택) 일부 캘린더만 읽으려면 `.env`의 `MACOS_CALENDARS`에 캘린더 이름을 쉼표로 구분해 적습니다
    (예: `MACOS_CALENDARS=연구,수업`, 대소문자 무시). 비우면 모든 캘린더를 읽습니다. 적은 뒤 `--calendar-setup`을 다시 실행하면
    그 필터로 몇 개가 읽히는지, 찾지 못한 이름이 있는지 알려 줍니다.
 4. `.env`의 `CALENDAR_ICS_URLS`는 **비워 두세요**(값이 있으면 `auto`는 ICS 주소를 읽습니다). 또는 `CALENDAR_SOURCE=macos`로 정합니다.
    예전에 이 용도로 iCloud 캘린더를 공개해 두었다면 이제 **공개 캘린더**를 꺼도 됩니다.
-5. 켜 둔 봇이 있으면 **다시 시작**합니다(`Ctrl+C`로 멈춘 뒤 `python -m mungchi slack`).
+5. 켜 둔 봇이 있으면 **다시 시작**합니다. 백그라운드 서비스면 `python -m mungchi service restart`,
+   터미널 탭에서 돌린다면 `Ctrl+C`로 멈춘 뒤 `python -m mungchi slack`.
 
-- 권한을 거부했거나 "쓰기 전용"으로 정했다면 **시스템 설정 → 개인정보 보호 및 보안 → 캘린더**에서 그 터미널 앱을
-  **전체 접근**으로 바꾼 뒤 봇을 다시 시작하세요. 고뭉치는 일정을 읽기만 하지만, macOS에서 일정을 읽으려면 '전체 접근'이 필요합니다.
-- 봇은 권한을 직접 묻지 않습니다(Mac 앞에 아무도 없을 수 있으니까요). 아직 허용하지 않았으면 '일정' 에이전트가
-  `--calendar-setup`을 실행하라고 알려 줍니다.
+- 권한을 거부했거나 "쓰기 전용"으로 정했다면 **시스템 설정 → 개인정보 보호 및 보안 → 캘린더**에서 봇을 실행하는 앱
+  (백그라운드 서비스면 **비서실 고뭉치**, 터미널에서 띄웠으면 그 터미널 앱)을 **전체 접근**으로 바꾼 뒤 봇을 다시 시작하세요.
+  고뭉치는 일정을 읽기만 하지만, macOS에서 일정을 읽으려면 '전체 접근'이 필요합니다.
+- 터미널에서 띄운 봇은 권한을 직접 묻지 않습니다(Mac 앞에 아무도 없을 수 있으니까요). 아직 허용하지 않았으면 '일정' 에이전트가
+  `--calendar-setup`을 실행하라고 알려 줍니다. 백그라운드 서비스는 시작할 때 아직 정하지 않은 상태면 **한 번** 묻고
+  (최대 5분 기다림), 답이 없어도 봇은 그대로 켭니다.
 - 캘린더 앱에 동기화된 내용을 읽으므로, 다른 기기에서 바꾼 일정은 Mac에 동기화된 뒤에 보입니다.
 
 #### 방법 B. ICS 주소로 읽기
@@ -284,11 +290,18 @@ python -m mungchi --list-models
 # Mac 캘린더 앱 연결 (처음 한 번, macOS 터미널에서. 위 "캘린더"의 방법 A 참고)
 python -m mungchi --calendar-setup
 
+# Slack 봇을 macOS 백그라운드 서비스로 (아래 "백그라운드로 실행하기" 참고)
+python -m mungchi service install
+python -m mungchi service status
+
 # 도움말
 python -m mungchi --help
+python -m mungchi service --help
 ```
 
 `pip install -e .`를 했다면 `python -m mungchi` 대신 `mungchi`로 실행해도 됩니다.
+질문 자리에 `slack` 한 단어만 쓰거나 맨 앞에 `service`를 쓰면 질문이 아니라 명령으로 처리합니다
+(`python -m mungchi "service 상태 알려줘"`처럼 따옴표로 묶은 문장은 그대로 질문입니다).
 고뭉치의 답은 표준 출력(stdout)으로 흘러나오고, `→ 업뎃에게 맡기는 중...` 같은 진행 표시는
 표준 오류(stderr)로 나옵니다. 그래서 `python -m mungchi --brief > 오늘.md`처럼 브리핑만 파일로 저장할 수 있습니다.
 
@@ -319,7 +332,10 @@ Slack 없이 파일에 쌓으려면 `--slack`을 빼면 됩니다(브리핑은 �
 - Claude 인증은 `.env`의 설정(API 키 또는 게이트웨이 설정)을 그대로 씁니다. 셸에서만 `export`한 값은 cron이 읽지 못하니
   `.env`에 넣어 두세요.
 - Dropbox는 몇 시간 뒤 만료되는 액세스 토큰 대신 리프레시 토큰 방식을 쓰세요.
-- Mac 캘린더 앱(방법 A)을 읽는다면 cron에서는 캘린더 권한이 없을 수 있습니다. 아래 [알려진 한계](#알려진-한계)를 보세요.
+- Mac 캘린더 앱(방법 A)을 읽는다면 cron 작업에는 캘린더 권한이 없을 수 있습니다. cron은 터미널도
+  [백그라운드 서비스](#백그라운드로-실행하기-추천) 앱("비서실 고뭉치")도 아니라서, 둘 중 어디에 허용했든 그 권한을 쓰지 못할 수 있습니다
+  (실제로는 확인하지 못했습니다). 그러면 브리핑의 일정 부분이 "권한 없음"으로 나옵니다. 확실한 대안은 ICS 주소(방법 B)입니다.
+  아래 [알려진 한계](#알려진-한계)도 보세요.
 
 ## Slack에서 부르기
 
@@ -444,41 +460,11 @@ Slack 봇 3개를 시작했습니다 (Socket Mode, 허용된 사용자 1명): �
   `~/.claude/projects/` 아래에 폴더별로 저장하므로 **봇과 cron은 항상 같은 폴더(저장소)에서 실행**하세요.
 - 공개 채널에서 부르면 답(공저자 작업, 일정)도 그 채널 사람들이 봅니다. DM이나 비공개 채널을 쓰세요.
 
-**계속 켜 두기**. 가장 간단한 방법은 tmux입니다.
-
-```bash
-tmux new -s mungchi
-cd /path/to/research && .venv/bin/python -m mungchi slack
-# Ctrl+B 다음 D로 빠져나와도 계속 실행됩니다. 다시 보기: tmux attach -t mungchi
-```
-
-`nohup .venv/bin/python -m mungchi slack >> "$HOME/mungchi-slack.log" 2>&1 &`도 됩니다.
-Linux에서 컴퓨터를 켤 때마다 자동으로 실행하려면 systemd 사용자 서비스를 만듭니다
-(`~/.config/systemd/user/mungchi-slack.service`).
-
-```ini
-[Unit]
-Description=비서실 Slack 봇 (고뭉치·업뎃·일정)
-
-[Service]
-WorkingDirectory=/path/to/research
-ExecStart=/path/to/research/.venv/bin/python -m mungchi slack
-Restart=on-failure
-RestartSec=10
-
-[Install]
-WantedBy=default.target
-```
-
-```bash
-systemctl --user daemon-reload
-systemctl --user enable --now mungchi-slack
-journalctl --user -u mungchi-slack -f      # 로그 보기
-loginctl enable-linger "$USER"             # 로그아웃한 뒤에도 계속 실행하려면
-```
-
-macOS에서는 tmux를 쓰거나, 같은 명령을 launchd(`~/Library/LaunchAgents`)에 등록하면 됩니다.
-Mac 캘린더 앱(방법 A)을 읽는다면 터미널에서 띄우는 tmux가 가장 확실합니다(launchd는 [알려진 한계](#알려진-한계) 참고).
+**계속 켜 두기**: 터미널 탭을 열어 두지 않아도 되도록, Mac에서는 아래
+[백그라운드로 실행하기 (추천)](#백그라운드로-실행하기-추천)의 `python -m mungchi service install`을 쓰세요.
+로그인하면 자동으로 켜지고, 봇이 죽으면 다시 켜지고, 캘린더 권한도 그 서비스 앱이 받습니다.
+(tmux·nohup이나 launchd에 `python -m mungchi slack`을 직접 등록하는 예전 방법은 더 이상 권하지 않습니다.
+특히 launchd에 Python을 직접 등록하면 Mac 캘린더 앱을 읽을 권한을 받을 앱이 없습니다.)
 
 ### 8. 브리핑을 Slack으로 받기
 
@@ -502,8 +488,115 @@ python -m mungchi --brief --slack
 - `invalid_auth`: 토큰이 틀렸거나 `xoxb-`와 `xapp-` 토큰을 서로 바꿔 넣었습니다.
 - `not_in_channel` / `channel_not_found`: 채널 ID를 확인하고 `/invite @moongchi`(업뎃은 `@update`, 일정은 `@schedule`)로
   그 봇을 초대하세요.
-- 멘션해도 아무 반응이 없으면 봇 프로그램이 켜져 있는지, 그 채널에 봇이 초대되어 있는지 확인하세요.
-  봇이 꺼져 있을 때 보낸 메시지는 나중에 처리되지 않을 수 있습니다.
+- 멘션해도 아무 반응이 없으면 봇 프로그램이 켜져 있는지(서비스면 `python -m mungchi service status`),
+  그 채널에 봇이 초대되어 있는지 확인하세요. 봇이 꺼져 있을 때 보낸 메시지는 나중에 처리되지 않을 수 있습니다.
+- 어떤 멘션은 답하고 어떤 멘션은 답이 없으면 같은 봇이 두 곳에서 돌고 있을 수 있습니다(예: 서비스와 터미널 탭).
+  `python -m mungchi service status`가 "터미널에서 직접 띄운 봇도 돌고 있습니다"라고 하면 그 터미널 탭에서 Ctrl+C로 끄세요.
+
+## 백그라운드로 실행하기 (추천)
+
+터미널 탭을 열어 두지 않아도 Slack 봇(고뭉치·업뎃·일정)이 계속 돌도록 macOS 서비스로 설치합니다(macOS 전용).
+한 번 설치하면 **로그인할 때 자동으로 켜지고**, 봇이 죽으면 **자동으로 다시 켜집니다**(최소 30초 간격).
+
+**왜 앱으로 감싸나요?** macOS는 캘린더 권한을 프로그램을 띄운 **앱**에 줍니다. 터미널에서 실행하면 터미널이 권한을 받지만,
+launchd(macOS의 서비스 관리자)가 Python을 바로 띄우면 권한을 받을 앱이 없습니다. 그래서 설치할 때 작은 앱
+`~/Applications/MungchiBot.app`("비서실 고뭉치", Dock에는 보이지 않음)을 만들고 봇을 그 안에서 실행합니다.
+캘린더 권한은 이 앱이 받습니다. launchd(`~/Library/LaunchAgents/local.mungchi.bot.plist`)는 로그인할 때와 봇이 멈췄을 때
+이 앱을 띄우는 일만 합니다.
+
+> **먼저 Terminal 탭에서 돌리던 봇은 Ctrl+C로 끄고 설치하세요.** 같은 봇이 두 곳에서 Slack에 연결하면 이벤트가 두 프로세스로
+> 나뉘어 어떤 멘션은 답이 없습니다. 설치할 때 터미널에서 띄운 봇이 보이면 경고해 줍니다.
+
+아래 명령은 모두 저장소 폴더에서 가상환경을 켠 상태(`(.venv)`)로 실행합니다.
+
+1. **설치** (한 번만)
+   ```bash
+   python -m mungchi service install
+   ```
+   설치 전에 가상환경, `.env`, Slack 설정(`python -m mungchi slack`과 같은 검사)을 확인하고, 문제가 있으면 설치하지 않고 알려 줍니다.
+   설치가 끝나고 봇이 시작하면 곧 **"비서실 고뭉치"의 캘린더 접근 확인 창**이 뜹니다. **허용**을 누르세요
+   (창에 `MungchiBot`으로 나올 수도 있습니다). 터미널에 줬던 권한은 이 앱으로 넘어가지 않아서 한 번 더 허용해야 합니다.
+   Mac 캘린더 앱 대신 ICS 주소를 읽도록 설정했다면 창은 뜨지 않습니다.
+2. **상태 보기**
+   ```bash
+   python -m mungchi service status
+   ```
+   설치·launchd 등록 여부, 봇 프로세스 번호(PID), 서비스 앱이 시작할 때 확인한 캘린더 권한, 최근 로그 10줄이 나옵니다.
+   (캘린더 권한은 `status`를 실행한 터미널의 권한이 아니라 서비스 앱의 권한입니다.)
+3. **로그 보기**
+   ```bash
+   python -m mungchi service logs          # 마지막 50줄
+   python -m mungchi service logs -n 200   # 마지막 200줄
+   python -m mungchi service logs -f       # 새 로그를 계속 보기 (Ctrl+C로 그만 보기)
+   ```
+4. **`.env`를 고친 뒤에는 다시 시작**해야 반영됩니다. 코드를 받은 뒤(`git pull`)에도 마찬가지입니다.
+   ```bash
+   python -m mungchi service restart
+   ```
+5. **멈추기**
+   ```bash
+   python -m mungchi service stop
+   ```
+   다음에 로그인하면 다시 켜집니다. 지금 다시 켜려면 `python -m mungchi service start`.
+6. **지우기**
+   ```bash
+   python -m mungchi service uninstall
+   ```
+   서비스를 멈추고 앱과 launchd 설정을 지웁니다. 로그는 남겨 둡니다.
+
+- **로그 위치**: `~/Library/Logs/mungchi/bot.log`(봇 로그)와 `~/Library/Logs/mungchi/launchd.log`(launchd가 앱을 띄우다 난 오류).
+  봇 로그에도 토큰·키는 남기지 않고, `status`·`logs`로 볼 때 한 번 더 지웁니다. 로그는 저절로 지워지지 않으니
+  너무 커지면 서비스를 멈춘 뒤 직접 지우세요.
+- **잠자기**: Mac이 잠자기에 들어가면 봇도 멈춥니다. 계속 답하게 하려면 **시스템 설정 → 에너지**에서
+  **"디스플레이가 꺼져 있을 때 자동으로 잠자기 방지"** 를 켜 두세요.
+- **서비스는 터미널에서 `export`한 값을 읽지 못합니다.** 봇에 필요한 값(Claude 키, `SSL_CERT_FILE` 등)은 모두 `.env`에 넣으세요.
+  설치할 때 터미널에만 있고 `.env`에는 없는 값이 있으면 이름을 알려 줍니다(값은 출력하지 않습니다).
+- 저장소 폴더나 가상환경(`.venv`)을 옮기거나 새로 만들었다면 `install`을 다시 실행하세요. 앱 안에 그 경로가 적혀 있습니다.
+  다시 설치하면 macOS가 캘린더 권한을 다시 물을 수 있습니다.
+- 설치하면 macOS가 "백그라운드 항목이 추가됨" 알림을 보여 줄 수 있습니다. **시스템 설정 → 일반 → 로그인 항목**에서
+  이 항목을 끄면 로그인할 때 서비스가 켜지지 않습니다.
+
+### 서비스 문제 해결
+
+- **캘린더 확인 창이 안 뜨거나 실수로 거부했을 때**
+  1. **시스템 설정 → 개인정보 보호 및 보안 → 캘린더**를 엽니다.
+  2. 목록에서 **비서실 고뭉치**(또는 **MungchiBot**)를 찾아 **전체 접근**으로 바꿉니다.
+  3. `python -m mungchi service restart`를 실행하고, `python -m mungchi service status`의 캘린더 권한이
+     "허용됨(전체 접근)"인지 확인합니다.
+
+  목록에 "비서실 고뭉치"도 "MungchiBot"도 없다면 이 방법이 이 Mac에서는 동작하지 않는 것입니다.
+  `python -m mungchi service status`와 `python -m mungchi service logs -n 100`의 출력을 함께 알려 주세요.
+  그동안은 ICS 주소(캘린더의 방법 B)로 읽거나 터미널 탭에서 `python -m mungchi slack`을 돌리면 됩니다.
+- **로그아웃·재시동·시스템 종료가 "비서실 고뭉치"(또는 MungchiBot) 때문에 멈추면**: `python -m mungchi service stop`을
+  실행한 뒤 다시 시도하고, 이 일을 알려 주세요(아직 실제 Mac에서 확인하지 못한 부분입니다).
+- **봇이 계속 다시 시작하면**: `python -m mungchi service logs`에서 `[오류]` 줄을 보세요. `.env` 설정 오류면 고친 뒤
+  `python -m mungchi service restart`. 앱을 띄우는 단계의 오류는 `~/Library/Logs/mungchi/launchd.log`에 남습니다.
+
+### Linux에서는
+
+`service` 명령은 macOS 전용입니다. Linux에서 컴퓨터를 켤 때마다 자동으로 실행하려면 systemd 사용자 서비스를 만듭니다
+(`~/.config/systemd/user/mungchi-slack.service`).
+
+```ini
+[Unit]
+Description=비서실 Slack 봇 (고뭉치·업뎃·일정)
+
+[Service]
+WorkingDirectory=/path/to/research
+ExecStart=/path/to/research/.venv/bin/python -m mungchi slack
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now mungchi-slack
+journalctl --user -u mungchi-slack -f      # 로그 보기
+loginctl enable-linger "$USER"             # 로그아웃한 뒤에도 계속 실행하려면
+```
 
 ## 문제 해결
 
@@ -536,6 +629,9 @@ open "/Applications/Python 3.14/Install Certificates.command"    # Python 3.14�
 export SSL_CERT_FILE="$(python -m certifi)"
 ```
 
+[백그라운드 서비스](#백그라운드로-실행하기-추천)는 `~/.zshrc`의 `export`를 읽지 못합니다. 서비스에서도 쓰려면
+`python -m certifi`가 출력한 경로를 `.env`에 `SSL_CERT_FILE=<그 경로>`로 넣고 `python -m mungchi service restart`를 실행하세요.
+
 ### `There's an issue with the selected model (...)`
 
 고뭉치는 이때 `[오류] 모델 설정에 문제가 있습니다.`와 함께 `→ .env의 MUNGCHI_MODEL과 ANTHROPIC_BASE_URL을 확인하세요`를 보여 줍니다.
@@ -565,8 +661,8 @@ export SSL_CERT_FILE="$(python -m certifi)"
 - 세 Slack 봇 모두 `SLACK_ALLOWED_USER_IDS`에 있는 사람의 메시지만 에이전트에게 넘기고, 이 값이 비어 있으면 시작하지 않습니다.
   봇 자신이나 우리 봇들끼리, 다른 봇의 메시지, 수정·입장 같은 시스템 메시지, 중복으로 들어온 이벤트는 무시합니다.
 - Slack에 올리는 오류 메시지에는 오류 종류와 확인할 설정만 적습니다(Claude API 오류는 API가 준 오류 문구 일부도 함께).
-  프로그램 오류의 자세한 내용은 봇을 실행한 터미널(표준 오류)에만 남기고, Slack 토큰·Claude 키를 포함한 비밀값은
-  어디에서나 지웁니다.
+  프로그램 오류의 자세한 내용은 봇을 실행한 터미널(표준 오류)에만 남기고(백그라운드 서비스면 `~/Library/Logs/mungchi/bot.log`),
+  Slack 토큰·Claude 키를 포함한 비밀값은 어디에서나 지웁니다.
 - 게이트웨이(방법 2)를 쓰면 에이전트가 읽은 데이터가 게이트웨이 운영 기관을 거쳐 갑니다. 이용 정책을 확인하세요.
 - Slack에 올리는 답에서는 `@channel`·`@here` 같은 전체 알림을 막고, 링크 미리보기(unfurl)를 끕니다.
 
@@ -583,10 +679,13 @@ export SSL_CERT_FILE="$(python -m certifi)"
   스레드의 다른 메시지(다른 봇의 답 포함)는 읽지 않습니다. 대화도 봇마다 따로라서, 업뎃 봇에게 들은 내용을 고뭉치는 모릅니다.
 - Dropbox의 "마지막 확인 시각"은 고뭉치, 업뎃 봇, `--agent update`가 함께 씁니다. 업뎃 봇으로 먼저 확인하면
   다음 고뭉치 브리핑에는 그 뒤의 변경만 나옵니다.
-- **Mac 캘린더 앱 권한은 Python을 실행한 앱(보통 터미널)에 주어집니다.** 그래서 터미널에서 띄운 봇(tmux 포함)은 그 권한을 쓰지만,
-  봇이나 브리핑을 나중에 launchd 같은 백그라운드 서비스나 cron으로 돌리면 권한이 없다고 나올 수 있습니다.
-  그때는 권한을 다시 받거나 다른 방법이 필요할 수 있는데, 이 경우는 아직 실제로 확인하지 못했습니다.
-  확실한 대안은 ICS 주소(방법 B)입니다. iTerm 같은 다른 터미널 앱에서 실행하면 그 앱에 따로 허용해야 합니다.
+- **Mac 캘린더 앱 권한은 Python을 실행한 앱에 주어집니다.** 터미널에서 띄운 봇은 터미널의 권한을,
+  [백그라운드 서비스](#백그라운드로-실행하기-추천)로 띄운 봇은 서비스 앱("비서실 고뭉치")의 권한을 씁니다. 서로 넘어가지 않으니
+  각각 허용해야 하고, iTerm 같은 다른 터미널 앱도 따로 허용해야 합니다. cron으로 돌리는 브리핑(`--brief --slack`)은
+  어느 쪽 권한도 쓰지 못할 수 있습니다(실제로는 확인하지 못했습니다). 확실한 대안은 ICS 주소(방법 B)입니다.
+- 백그라운드 서비스(앱 + launchd)는 이 저장소의 테스트로는 명령 순서와 생성 파일만 확인했고, 실제 Mac에서의 동작
+  (캘린더 확인 창, 로그인 시 자동 시작, 로그아웃·재시동)은 아직 확인하지 못했습니다. 이상하면
+  [서비스 문제 해결](#서비스-문제-해결)을 보고 알려 주세요.
 - 고뭉치에게 물으면 고뭉치·업뎃·일정이 모두 모델을 호출하므로 API 비용이 듭니다. 업뎃·일정을 직접 부르면 한 에이전트만
   호출합니다. Slack 멘션·DM도 한 번마다 비용이 듭니다.
 
@@ -601,6 +700,8 @@ pytest -q
 캘린더는 테스트 안의 ICS 문자열과 고정된 시계로 확인합니다. Mac 캘린더 앱(EventKit)은 가짜 어댑터와 가짜 EventKit 객체로
 확인하므로 macOS가 아니어도 테스트가 돌고, 실제 캘린더 앱에는 접근하지 않습니다. Slack은 가짜 웹 클라이언트와 가짜 `run_turn`으로
 확인하므로 실제 Slack이나 Claude에 연결하지 않습니다. `--list-models`는 가짜 httpx 전송(`MockTransport`)으로 확인합니다.
+백그라운드 서비스(`service`)는 가짜 명령 실행기로 확인하므로 `osacompile`·`codesign`·`launchctl`·`pgrep`·`pkill`을 실제로
+부르지 않습니다(`run-bot.sh`만 bash와 가짜 Python으로 직접 실행해 따옴표 처리를 확인합니다).
 
 ```
 slack_manifests/       # Slack 앱 매니페스트, 봇마다 하나 (moongchi.yaml · update.yaml · schedule.yaml)
@@ -609,6 +710,7 @@ src/mungchi/
 ├── main.py            # 페르소나별 ClaudeAgentOptions 구성, 한 턴 실행(run_turn), CLI(--agent 포함), 출력 스트리밍, 오류 문구
 ├── model_list.py      # --list-models: 모델 목록 확인 (GET /v1/models)
 ├── calendar_setup.py  # --calendar-setup: Mac 캘린더 앱 접근 허용, 캘린더·오늘 일정 확인
+├── service.py         # service: macOS 백그라운드 서비스 (AppleScript 앱 + LaunchAgent), 상태·로그 보기
 ├── personas.py        # 페르소나 키(mungchi·update·schedule), 한글 이름, Slack 핸들
 ├── slack_bot.py       # Slack 봇 세 개(한 프로세스, Socket Mode), 권한 확인, 진행 표시, --brief --slack
 ├── slack_format.py    # Slack용 프롬프트, 봇별 첫 답, 멘션 제거, mrkdwn 변환, 메시지 나누기
