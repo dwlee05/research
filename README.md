@@ -136,6 +136,44 @@ HTTP 200: 모델 2개
 - 실패하면(401, 404 등) 응답 일부와 무엇을 확인할지 한국어로 알려 줍니다. 게이트웨이가 모델 목록을 지원하지 않으면
   404가 나올 수 있으니, 그때는 게이트웨이 안내 문서에서 모델 ID를 확인하세요.
 
+### 크레딧 확인 (Chat KHU)
+
+Chat KHU(Mindlogic) 게이트웨이를 쓰면 남은 크레딧과 이번 달 사용량을 볼 수 있습니다. 게이트웨이의 크레딧 조회 주소
+(`.../v1/gateway/credits/`, `.../v1/gateway/usage/`)만 부르고 에이전트(LLM)는 실행하지 않으므로 **크레딧이 들지 않습니다**.
+
+```bash
+python -m mungchi --credits
+```
+
+```
+💳 Chat KHU 크레딧: 9,050.5 남음 / 10,000 (90.5%) · 11/01 갱신
+이번 달 사용: 949.5 (10/01–10/07, 94회)
+· claude-sonnet-5: 71회 · 536.7
+· claude-opus-5-5: 23회 · 357.2
+이 속도면 이번 달 약 4,200 사용 예상 (한도의 42%)
+```
+
+- 모델별 사용량은 많이 쓴 순서로 5개까지 보여 줍니다. 구매 크레딧이나 기관 지원 크레딧이 있으면 그 줄도 나옵니다.
+- 예상 사용량은 지금까지의 속도로 이번 갱신 주기(갱신일 한 달 전부터 갱신일까지)를 다 쓴다고 보고 계산하며,
+  주기가 시작되고 하루가 지나야 나옵니다.
+- 인증은 `ANTHROPIC_AUTH_TOKEN`(없으면 `ANTHROPIC_API_KEY`)을 쓰고, 키는 출력하지 않습니다. 401·403이 나오면 `.env`의 키를 확인하세요.
+- 주소는 `ANTHROPIC_BASE_URL`에서 끝의 `/claude`를 뺀 것입니다. 다른 주소를 쓰려면 `CREDITS_API_BASE`에 적습니다.
+  Chat KHU가 아닌 게이트웨이나 Anthropic API 키로는 "크레딧 조회는 Chat KHU(Mindlogic) 게이트웨이에서만 됩니다."라고만 알려 줍니다.
+
+**Slack에서 바로 묻기**: 세 봇 어디에서나 짧게 물으면 에이전트를 거치지 않고 바로 답합니다(LLM 호출 없음, 비용 없음).
+
+- 예: `@고뭉치 크레딧`, `@업뎃 남은 크레딧 얼마나 남았어?`, DM으로 `잔액`, `사용량 보여줘`, `credits`
+- `크레딧 아끼려면 어떻게 해?`처럼 긴 질문은 지금처럼 에이전트에게 갑니다.
+- 허용되지 않은 사람에게는 늘 그렇듯 거절만 하고, 이 답은 스레드의 대화 기록에 남기지 않습니다(같은 스레드에서 이어 묻는 대화에 영향 없음).
+
+**잔액 알림**: Slack 봇(`python -m mungchi slack` 또는 [백그라운드 서비스](#백그라운드로-실행하기-추천))이 켜져 있는 동안
+시작 1분 뒤와 그 뒤 1시간마다 크레딧을 확인합니다. 남은 크레딧이 `CREDIT_ALERT_PERCENT`(기본 10)% 아래로 내려가면
+`SLACK_ALLOWED_USER_IDS`의 사람마다 고뭉치 봇(고뭉치 봇이 없으면 켜진 첫 봇)이 경고와 위 요약을 DM으로 보냅니다.
+
+- 갱신 주기마다 **한 번만** 보냅니다(보낸 갱신일은 `.mungchi_state.json`에 기록). 다음 주기에 다시 내려가면 또 알립니다.
+- `CREDIT_ALERT_PERCENT=0`이나 빈 값(`CREDIT_ALERT_PERCENT=`)이면 알림을 끕니다. `.env`를 고친 뒤에는 봇을 다시 시작하세요.
+- 확인이 실패해도 로그에 한 줄 남기고(키는 지움) 봇은 그대로 돕니다. Chat KHU가 아닌 게이트웨이면 아무것도 하지 않습니다.
+
 ## 자격 증명 준비
 
 소스는 필요한 것만 설정해도 됩니다. 설정하지 않은 소스는 고뭉치가 "설정 안 됨"과 함께
@@ -287,6 +325,9 @@ python -m mungchi --brief --slack
 # 쓸 수 있는 모델 ID 확인 (에이전트 실행 없음, 위 "모델 확인" 참고)
 python -m mungchi --list-models
 
+# Chat KHU 남은 크레딧과 이번 달 사용량 (LLM 호출 없음, 위 "크레딧 확인" 참고)
+python -m mungchi --credits
+
 # Mac 캘린더 앱 연결 (처음 한 번, macOS 터미널에서. 위 "캘린더"의 방법 A 참고)
 python -m mungchi --calendar-setup
 
@@ -360,7 +401,8 @@ Slack 없이 파일에 쌓으려면 `--slack`을 빼면 됩니다(브리핑은 �
 
 > **비용 주의**: 어느 봇이든 멘션이나 DM 한 번마다 Claude API를 호출합니다. 고뭉치는 업뎃·일정까지 모델을 부르고,
 > 업뎃·일정 봇은 자기 에이전트 하나만 부릅니다. 동시에 처리하는 요청 수는 세 봇을 합쳐
-> `SLACK_MAX_CONCURRENT`(기본 2)로 제한합니다.
+> `SLACK_MAX_CONCURRENT`(기본 2)로 제한합니다. 단, `크레딧`처럼 크레딧만 묻는 짧은 말은 모델을 부르지 않습니다
+> ([크레딧 확인](#크레딧-확인-chat-khu) 참고).
 
 ### 1. 매니페스트로 앱 만들기 (앱마다 반복)
 
@@ -703,6 +745,8 @@ export SSL_CERT_FILE="$(python -m certifi)"
   프로그램 오류의 자세한 내용은 봇을 실행한 터미널(표준 오류)에만 남기고(백그라운드 서비스면 `~/Library/Logs/mungchi/bot.log`),
   Slack 토큰·Claude 키를 포함한 비밀값은 어디에서나 지웁니다.
 - 게이트웨이(방법 2)를 쓰면 에이전트가 읽은 데이터가 게이트웨이 운영 기관을 거쳐 갑니다. 이용 정책을 확인하세요.
+- 크레딧 확인(`--credits`, Slack의 크레딧 답, 잔액 알림)은 게이트웨이의 크레딧 조회 주소만 부르고 모델은 부르지 않습니다.
+  키는 요청 헤더에만 넣고 출력·Slack·로그에는 남기지 않습니다. Slack에서 묻더라도 허용 목록 확인이 먼저입니다.
 - Slack에 올리는 답에서는 `@channel`·`@here` 같은 전체 알림을 막고, 링크 미리보기(unfurl)를 끕니다.
 
 ## 알려진 한계
@@ -739,7 +783,8 @@ pytest -q
 테스트는 네트워크를 쓰지 않습니다. Dropbox 클라이언트는 가짜 객체로 대신하고,
 캘린더는 테스트 안의 ICS 문자열과 고정된 시계로 확인합니다. Mac 캘린더 앱(EventKit)은 가짜 어댑터와 가짜 EventKit 객체로
 확인하므로 macOS가 아니어도 테스트가 돌고, 실제 캘린더 앱에는 접근하지 않습니다. Slack은 가짜 웹 클라이언트와 가짜 `run_turn`으로
-확인하므로 실제 Slack이나 Claude에 연결하지 않습니다. `--list-models`는 가짜 httpx 전송(`MockTransport`)으로 확인합니다.
+확인하므로 실제 Slack이나 Claude에 연결하지 않습니다. `--list-models`와 크레딧 확인(`--credits`, Slack의 크레딧 답, 잔액 알림)은
+가짜 httpx 전송(`MockTransport`)과 고정된 시계로 확인합니다.
 백그라운드 서비스(`service`)는 가짜 명령 실행기로 확인하므로 `osacompile`·`codesign`·`launchctl`·`pgrep`·`pkill`을 실제로
 부르지 않습니다(`run-bot.sh`만 bash와 가짜 Python으로 직접 실행해 따옴표 처리를 확인합니다).
 
@@ -749,11 +794,12 @@ src/mungchi/
 ├── __main__.py        # python -m mungchi
 ├── main.py            # 페르소나별 ClaudeAgentOptions 구성, 한 턴 실행(run_turn), CLI(--agent 포함), 출력 스트리밍, 오류 문구
 ├── model_list.py      # --list-models: 모델 목록 확인 (GET /v1/models)
+├── credits.py         # --credits, Slack의 크레딧 바로 답, 잔액 알림 문구: Chat KHU 크레딧·사용량 조회 (LLM 호출 없음)
 ├── calendar_setup.py  # --calendar-setup: Mac 캘린더 앱 접근 허용, 캘린더·오늘 일정 확인
 ├── dropbox_check.py   # --dropbox-check: 업뎃이 Dropbox 변경을 못 찾을 때 원인 확인 (읽기 전용)
 ├── service.py         # service: macOS 백그라운드 서비스 (AppleScript 앱 + LaunchAgent), 상태·로그 보기
 ├── personas.py        # 페르소나 키(mungchi·update·schedule), 한글 이름, Slack 핸들
-├── slack_bot.py       # Slack 봇 세 개(한 프로세스, Socket Mode), 권한 확인, 진행 표시, --brief --slack
+├── slack_bot.py       # Slack 봇 세 개(한 프로세스, Socket Mode), 권한 확인, 진행 표시, 크레딧 바로 답·잔액 알림, --brief --slack
 ├── slack_format.py    # Slack용 프롬프트, 봇별 첫 답, 멘션 제거, mrkdwn 변환, 메시지 나누기
 ├── agents.py          # 고뭉치 프롬프트, 업뎃·일정 프롬프트(하위 에이전트용·직접 대화용), AgentDefinition, 도구 권한 훅
 ├── config.py          # 환경변수 읽기(봇별 Slack 토큰 포함), 설정 누락 안내 문구

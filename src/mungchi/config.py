@@ -81,6 +81,40 @@ def get_anthropic_auth_token(env: Mapping[str, str] | None = None) -> str:
     return _get(env, "ANTHROPIC_AUTH_TOKEN")
 
 
+# ---------------------------------------------------------------- Chat KHU credits
+
+# Below this share of the total credits left, the running Slack bots DM the
+# owner once per renewal period. Unset: this default; empty or 0: off.
+DEFAULT_CREDIT_ALERT_PERCENT = 10.0
+
+
+def get_credits_api_base(env: Mapping[str, str] | None = None) -> str:
+    """``CREDITS_API_BASE`` without a trailing slash ("" when unset)."""
+    return _get(env, "CREDITS_API_BASE").rstrip("/")
+
+
+def get_credit_alert_percent(env: Mapping[str, str] | None = None) -> float:
+    """``CREDIT_ALERT_PERCENT`` as a number from 0 (off) to 100.
+
+    Unset means the default (10); an empty value or 0 turns the alert off.
+    A value that is not a number keeps the default rather than silently
+    switching the alert off. A trailing ``%`` is accepted.
+    """
+    raw = _env(env).get("CREDIT_ALERT_PERCENT")
+    if raw is None:
+        return DEFAULT_CREDIT_ALERT_PERCENT
+    raw = raw.strip().rstrip("%").strip()
+    if not raw:
+        return 0.0
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_CREDIT_ALERT_PERCENT
+    if value != value:  # NaN
+        return DEFAULT_CREDIT_ALERT_PERCENT
+    return min(max(value, 0.0), 100.0)
+
+
 def get_timezone_name(env: Mapping[str, str] | None = None) -> str:
     return _get(env, "TIMEZONE") or DEFAULT_TIMEZONE
 

@@ -1120,3 +1120,288 @@ def test_slack_command_runs_all_configured_bots(monkeypatch):
     monkeypatch.setattr(slack_bot, "setup_logging", lambda: None)
     assert main(["slack"]) == 0
     assert seen == [["mungchi", "update", "schedule"]]
+
+
+# ---------------------------------------------------------------- credit shortcut (no LLM)
+
+
+class FakeCredits:
+    """Stands in for ``credits.slack_credit_text``: counts calls, returns a canned summary."""
+
+    TEXT = "💳 *Chat KHU 크레딧*: 9,050.5 남음 / 10,000 (90.5%) · 11/01 갱신\n이번 달 사용: 949.5 (10/01–10/07, 94회)"
+
+    def __init__(self, result=None):
+        self.result = result if result is not None else self.TEXT
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        if isinstance(self.result, BaseException):
+            raise self.result
+        return self.result
+
+
+@pytest.mark.parametrize("persona", ["mungchi", "update", "schedule"])
+@pytest.mark.parametrize(
+    "event,source",
+    [
+        (mention(f"<@{BOT}> 크레딧"), "mention"),
+        (mention(f"<@{BOT}>  남은 크레딧 얼마나 남았어?"), "mention"),
+        (dm("credits"), "dm"),
+        (dm("사용량 보여줘"), "dm"),
+    ],
+)
+def test_credit_shortcut_answers_without_an_agent_turn(tmp_path, persona, event, source):
+    fake = FakeCredits()
+    handler, client, run = make_handler(tmp_path, persona=persona, credit_text=fake)
+    asyncio.run(handler.handle_event(event, event_id="Ev1", source=source))
+    assert run.calls == []  # run_turn is never called: no LLM
+    assert fake.calls == 1
+    [post] = client.posts
+    assert post["text"] == FakeCredits.TEXT
+    assert post["thread_ts"] == event["ts"] and post["channel"] == event["channel"]
+    assert client.updates == []  # no placeholder to edit
+    # No session / thread-map entry for a shortcut reply.
+    assert not (tmp_path / "threads.json").exists()
+    assert handler.sessions.threads() == {}
+
+
+def test_credit_shortcut_in_a_thread_replies_there_and_keeps_the_threads_session(tmp_path):
+    root = "1700000000.000100"
+    handler, client, run = make_handler(tmp_path, credit_text=FakeCredits())
+    handler.sessions.set(CHANNEL, root, SESSION_1, persona="mungchi")
+    asyncio.run(handler.handle_event(mention(f"<@{BOT}> 크레딧?", ts="1700000000.000500", thread_ts=root), event_id="E", source="mention"))
+    assert run.calls == []
+    assert client.posts[0]["thread_ts"] == root
+    assert handler.sessions.threads() == {f"mungchi:{CHANNEL}:{root}": SESSION_1}
+
+
+@pytest.mark.parametrize("persona", ["mungchi", "update", "schedule"])
+def test_credit_shortcut_still_refuses_strangers(tmp_path, persona):
+    fake = FakeCredits()
+    handler, client, run = make_handler(tmp_path, persona=persona, credit_text=fake)
+
+    async def scenario():
+        await handler.handle_event(mention(f"<@{BOT}> 크레딧", user=STRANGER), event_id="Ev1", source="mention")
+        await handler.handle_event(dm("크레딧", user=STRANGER), event_id="Ev2", source="dm")
+
+    asyncio.run(scenario())
+    assert fake.calls == 0 and run.calls == []
+    assert [p["text"] for p in client.posts] == [REFUSAL_TEXT, REFUSAL_TEXT]
+
+
+def test_longer_credit_questions_go_to_the_agent(tmp_path):
+    fake = FakeCredits()
+    handler, client, run = make_handler(tmp_path, credit_text=fake)
+    asyncio.run(handler.handle_event(mention(f"<@{BOT}> 크레딧 아끼려면 어떻게 해?"), event_id="Ev1", source="mention"))
+    assert fake.calls == 0
+    assert [c["prompt"] for c in run.calls] == ["크레딧 아끼려면 어떻게 해?"]
+
+
+def test_credit_shortcut_failure_is_a_short_korean_note_without_secrets(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    fake = FakeCredits(RuntimeError(f"boom {SLACK_TOKEN}"))
+    handler, client, run = make_handler(tmp_path, credit_text=fake)
+    with caplog.at_level(logging.ERROR, logger="mungchi.slack"):
+        asyncio.run(handler.handle_event(mention(f"<@{BOT}> 크레딧"), event_id="Ev1", source="mention"))
+    assert run.calls == []
+    assert [p["text"] for p in client.posts] == [slack_bot.CREDIT_CRASH_TEXT.format(kind="RuntimeError")]
+    assert SLACK_TOKEN not in caplog.text
+
+
+def test_default_credit_text_calls_only_the_gateway(tmp_path, monkeypatch):
+    import httpx
+
+    from mungchi import credits
+
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://factchat-cloud.mindlogic.ai/v1/gateway/claude")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "gw-slack-test-token-0123456789")
+    paths = []
+
+    def handle(request):
+        paths.append(request.url.path)
+        if request.url.path.endswith("/credits/"):
+            return httpx.Response(200, json={"total": {"quota": 100, "used": 25, "remaining": 75}})
+        return httpx.Response(200, json={"rows": []})
+
+    real_client = httpx.Client
+    monkeypatch.setattr(credits.httpx, "Client", lambda **kw: real_client(transport=httpx.MockTransport(handle), timeout=kw.get("timeout")))
+    handler, client, run = make_handler(tmp_path)  # default credit_text
+    asyncio.run(handler.handle_event(dm("크레딧"), event_id="Ev1", source="dm"))
+    assert run.calls == []
+    assert paths == ["/v1/gateway/credits/", "/v1/gateway/usage/"]
+    assert client.posts[0]["text"].startswith("💳 *Chat KHU 크레딧*: 75 남음 / 100 (75%)")
+    assert "gw-slack-test-token" not in client.posts[0]["text"]
+
+
+# ---------------------------------------------------------------- low-credit alert
+
+
+GATEWAY_ENV = {
+    "ANTHROPIC_BASE_URL": "https://factchat-cloud.mindlogic.ai/v1/gateway/claude",
+    "ANTHROPIC_AUTH_TOKEN": "gw-alert-test-token-0123456789",
+}
+ALERT_NOW = datetime(2026, 10, 20, 3, 0, tzinfo=timezone.utc)
+
+
+def low_report(remaining=850.0, renewal="2026-11-01T00:00:00+09:00"):
+    from mungchi import credits
+
+    payload = {
+        "monthly_allocated": {"quota": 10000.0, "used": 10000.0 - remaining, "remaining": remaining, "renewal_date": renewal},
+        "total": {"quota": 10000.0, "used": 10000.0 - remaining, "remaining": remaining},
+    }
+    return credits.CreditReport(balance=credits.parse_balance(payload))
+
+
+class FakeFetch:
+    def __init__(self, *reports):
+        self.reports = list(reports)
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        report = self.reports[min(self.calls, len(self.reports)) - 1]
+        if isinstance(report, BaseException):
+            raise report
+        return report
+
+
+def alert(client, store, fetch, env=None, users=(OWNER, "UOTHER1")):
+    return asyncio.run(
+        slack_bot.check_low_credits(client, users, env=env or GATEWAY_ENV, store=store, fetch=fetch, now=ALERT_NOW)
+    )
+
+
+def test_low_credits_dm_every_allowed_user_once_per_renewal_period(tmp_path):
+    from mungchi.state import StateStore
+
+    store = StateStore(tmp_path / "state.json")
+    client = FakeSlackClient()
+    assert alert(client, store, FakeFetch(low_report())) == "alerted"
+    assert sorted(p["channel"] for p in client.posts) == sorted([OWNER, "UOTHER1"])  # DMs: channel=<user id>
+    text = client.posts[0]["text"]
+    assert text.startswith("⚠️ *Chat KHU 크레딧이 얼마 남지 않았어요* (남은 비율 8.5%, 알림 기준 10%)")
+    assert "💳 *Chat KHU 크레딧*: 850 남음 / 10,000 (8.5%) · 11/01 갱신" in text
+    assert "gw-alert-test-token" not in text
+    assert store.credit_alert_period() == "2026-11-01T00:00:00+09:00"
+
+    # The same period: no second DM, even an hour later with less left.
+    assert alert(client, store, FakeFetch(low_report(remaining=300.0))) == "already"
+    assert len(client.posts) == 2
+
+    # A new renewal date (the next cycle) alerts again.
+    assert alert(client, store, FakeFetch(low_report(renewal="2026-12-01T00:00:00+09:00"))) == "alerted"
+    assert len(client.posts) == 4
+    assert store.credit_alert_period() == "2026-12-01T00:00:00+09:00"
+
+
+def test_enough_credits_or_a_disabled_alert_send_nothing(tmp_path):
+    from mungchi.state import StateStore
+
+    store = StateStore(tmp_path / "state.json")
+    client = FakeSlackClient()
+    assert alert(client, store, FakeFetch(low_report(remaining=1500.0))) == "ok"  # 15% left
+    for value in ("0", ""):
+        fetch = FakeFetch(low_report())
+        assert alert(client, store, fetch, env={**GATEWAY_ENV, "CREDIT_ALERT_PERCENT": value}) == "disabled"
+        assert fetch.calls == 0  # not even fetched
+    assert alert(client, store, FakeFetch(low_report(remaining=1500.0)), env={**GATEWAY_ENV, "CREDIT_ALERT_PERCENT": "20"}) == "alerted"
+    assert client.posts and "알림 기준 20%" in client.posts[0]["text"]
+
+
+def test_other_gateways_are_skipped_silently(tmp_path, caplog):
+    from mungchi.state import StateStore
+
+    fetch = FakeFetch(low_report())
+    client = FakeSlackClient()
+    with caplog.at_level(logging.INFO, logger="mungchi"):
+        outcome = alert(client, StateStore(tmp_path / "s.json"), fetch, env={"ANTHROPIC_API_KEY": "x" * 30})
+    assert outcome == "unsupported" and fetch.calls == 0 and client.calls == []
+    assert caplog.text == ""
+
+
+def test_failed_checks_and_failed_dms_are_logged_scrubbed_and_never_raise(tmp_path, monkeypatch, caplog):
+    from mungchi import credits
+    from mungchi.state import StateStore
+
+    store = StateStore(tmp_path / "state.json")
+    token = GATEWAY_ENV["ANTHROPIC_AUTH_TOKEN"]
+    for key, value in GATEWAY_ENV.items():
+        monkeypatch.setenv(key, value)
+    failing = credits.CreditReport(error=f"크레딧을 확인하지 못했습니다 (HTTP 401). {token}")
+    with caplog.at_level(logging.WARNING, logger="mungchi.slack"):
+        assert alert(FakeSlackClient(), store, FakeFetch(failing)) == "failed"
+        assert alert(FakeSlackClient(), store, FakeFetch(credits.CreditReport(balance=credits.parse_balance({})))) == "failed"
+
+    class BrokenSlack(FakeSlackClient):
+        async def chat_postMessage(self, **kwargs):
+            raise RuntimeError(f"slack down {token}")
+
+    with caplog.at_level(logging.WARNING, logger="mungchi.slack"):
+        assert alert(BrokenSlack(), store, FakeFetch(low_report())) == "failed"
+    assert store.credit_alert_period() is None  # nobody got it: try again next hour
+    assert "HTTP 401" in caplog.text and "slack down" in caplog.text
+    assert token not in caplog.text
+
+
+def test_alert_loop_checks_after_a_minute_then_hourly_and_survives_errors():
+    sleeps, checks = [], []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) > 3:
+            raise asyncio.CancelledError
+
+    async def flaky_check(client, users, *, env=None):
+        checks.append(set(users))
+        raise RuntimeError("gateway exploded")
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(slack_bot.credit_alert_loop("client", [OWNER], sleep=fake_sleep, check=flaky_check))
+    assert sleeps == [60.0, 3600.0, 3600.0, 3600.0]
+    assert checks == [{OWNER}] * 3
+
+
+def test_run_bots_starts_the_alert_with_moongchis_client_and_stops_it(tmp_path, monkeypatch, capsys):
+    _no_network(monkeypatch)
+    FakeSocket.instances = []
+    built = _patch_build_apps(monkeypatch, tmp_path)
+    for key, value in GATEWAY_ENV.items():
+        monkeypatch.setenv(key, value)
+    started, stopped = [], []
+
+    async def fake_alert(client, users):
+        started.append((client, set(users)))
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.append(True)
+
+    async def let_it_start():
+        await asyncio.sleep(0)
+
+    cfg = config.load_slack_config(ALL_BOTS_ENV)
+    assert asyncio.run(slack_bot.run_bots(cfg, socket_factory=FakeSocket, wait=let_it_start, credit_alert=fake_alert)) == 0
+    mungchi_app = next(app for bot, app, _h in built if bot.persona == "mungchi")
+    assert started == [(mungchi_app.client, {OWNER})] and stopped == [True]
+    assert "크레딧 잔액 알림: 남은 크레딧이 10% 아래로 내려가면 고뭉치(@moongchi) 봇이 DM으로 알립니다" in capsys.readouterr().err
+
+
+def test_run_bots_uses_the_first_configured_bot_without_moongchi(tmp_path, monkeypatch):
+    _no_network(monkeypatch)
+    FakeSocket.instances = []
+    built = _patch_build_apps(monkeypatch, tmp_path)
+    started = []
+
+    async def fake_alert(client, users):
+        started.append(client)
+
+    async def let_it_start():
+        await asyncio.sleep(0)
+
+    env = {k: v for k, v in ALL_BOTS_ENV.items() if not k.startswith(("SLACK_BOT", "SLACK_APP"))}
+    cfg = config.load_slack_config(env)
+    assert asyncio.run(slack_bot.run_bots(cfg, socket_factory=FakeSocket, wait=let_it_start, credit_alert=fake_alert)) == 0
+    assert [bot.persona for bot, _a, _h in built] == ["update", "schedule"]
+    assert started == [built[0][1].client]

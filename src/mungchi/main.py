@@ -517,6 +517,7 @@ def build_parser() -> argparse.ArgumentParser:
             '  python -m mungchi --agent update "누가 무슨 파일 고쳤어?"   # 업뎃에게 바로 묻기\n'
             "  python -m mungchi --agent schedule      # '일정'과 바로 대화\n"
             "  python -m mungchi --list-models         # 쓸 수 있는 모델 ID 확인 (MUNGCHI_MODEL 고르기)\n"
+            "  python -m mungchi --credits             # Chat KHU 남은 크레딧과 이번 달 사용량 (LLM 호출 없음)\n"
             "  python -m mungchi --calendar-setup      # Mac 캘린더 앱 연결 (처음 한 번, 터미널에서)\n"
             "  python -m mungchi --dropbox-check --hours 72   # 업뎃이 Dropbox 변경을 못 찾을 때 원인 확인 (최근 72시간)\n"
             "  python -m mungchi service install       # (macOS) Slack 봇을 백그라운드 서비스로 설치 (로그인하면 자동 시작)\n"
@@ -563,6 +564,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Claude API(또는 ANTHROPIC_BASE_URL의 게이트웨이)에서 쓸 수 있는 모델 ID를 보여 주고 끝냅니다 "
             "(에이전트는 실행하지 않음)"
+        ),
+    )
+    opts.add_argument(
+        "--credits",
+        action="store_true",
+        help=(
+            "Chat KHU(Mindlogic 게이트웨이)의 남은 크레딧, 이번 달 사용량과 모델별 사용량을 보여 주고 끝냅니다 "
+            "(에이전트는 실행하지 않음, LLM 호출 없음)"
         ),
     )
     opts.add_argument(
@@ -634,6 +643,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("service 명령은 맨 앞에 쓰고 다른 옵션과 함께 쓸 수 없습니다. 예: python -m mungchi service status")
     if args.list_models and (args.question or args.brief or args.slack or args.agent):
         parser.error("--list-models는 질문이나 다른 옵션(--brief, --slack, --agent, slack)과 함께 쓸 수 없습니다.")
+    if args.credits and (
+        args.question
+        or args.brief
+        or args.slack
+        or args.agent
+        or args.list_models
+        or args.calendar_setup
+        or args.dropbox_check
+    ):
+        parser.error(
+            "--credits는 질문이나 다른 옵션(--brief, --slack, --agent, --list-models, --calendar-setup, "
+            "--dropbox-check, slack)과 함께 쓸 수 없습니다."
+        )
     if args.calendar_setup and (args.question or args.brief or args.slack or args.agent or args.list_models):
         parser.error(
             "--calendar-setup은 질문이나 다른 옵션(--brief, --slack, --agent, --list-models, slack)과 함께 쓸 수 없습니다."
@@ -670,6 +692,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             from .model_list import list_models
 
             return list_models()
+        if args.credits:
+            from .credits import run_credits_cli
+
+            return run_credits_cli()
         if args.calendar_setup:
             from .calendar_setup import run_calendar_setup
 

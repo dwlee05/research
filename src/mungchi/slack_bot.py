@@ -27,7 +27,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 
-from . import config
+from . import config, credits
 from .main import TurnResult, briefing_prompt, run_turn
 from .personas import MUNGCHI, PERSONA_LABELS, PERSONAS, SCHEDULE, SLACK_HANDLES, UPDATE, josa
 from .slack_format import (
@@ -39,16 +39,23 @@ from .slack_format import (
     strip_mention,
     to_mrkdwn,
 )
-from .state import ThreadSessions
+from .state import StateStore, ThreadSessions, utcnow
 from .tools.common import safe_error, scrub
 
 log = logging.getLogger("mungchi.slack")
 
 RunTurn = Callable[..., Awaitable[TurnResult]]
+# Returns the Slack text for the credit shortcut (blocking: run in a worker thread).
+CreditText = Callable[[], str]
 
 REFUSAL_TEXT = "죄송하지만 이 봇은 소유자만 사용할 수 있어요."
 FRESH_SESSION_NOTE = "이 스레드의 이전 대화는 이어 갈 수 없어서, 다음 메시지부터는 새 대화로 시작해요."
 BRIEF_CRASH_TEXT = "⚠️ 오늘 브리핑을 만들지 못했어요 ({kind}). 실행 로그를 확인해 주세요."
+CREDIT_CRASH_TEXT = "⚠️ 크레딧을 확인하지 못했어요 ({kind}). 잠시 후 다시 시도해 주세요."
+
+# Low-credit alert inside the running bots: first check shortly after start, then hourly.
+CREDIT_CHECK_FIRST_DELAY_SECONDS = 60.0
+CREDIT_CHECK_INTERVAL_SECONDS = 3_600.0
 
 # What a bare mention (no text) asks for. 고뭉치's default is today's briefing.
 EMPTY_MENTION_PROMPTS = {
@@ -323,6 +330,7 @@ class SlackHandler:
         semaphore: asyncio.Semaphore | None = None,
         our_bot_user_ids: set[str] | None = None,
         status_interval: float = STATUS_INTERVAL_SECONDS,
+        credit_text: CreditText | None = None,
     ):
         self.allowed_user_ids = frozenset(allowed_user_ids)
         if not self.allowed_user_ids:
@@ -339,6 +347,8 @@ class SlackHandler:
         # User ids of all bots in this process; their messages are never answered.
         self.our_bot_user_ids = our_bot_user_ids if our_bot_user_ids is not None else set()
         self.status_interval = status_interval
+        # The credit shortcut: gateway endpoints only, never an agent turn.
+        self.credit_text = credit_text or credits.slack_credit_text
         self._semaphore = semaphore or asyncio.Semaphore(max(1, max_concurrent))
         self._locks: dict[str, list[Any]] = {}
         self._seen = RecentKeys()
@@ -372,10 +382,6 @@ class SlackHandler:
         """What a bare mention asks for: today's briefing for 고뭉치, a fixed request otherwise."""
         return EMPTY_MENTION_PROMPTS.get(self.persona) or briefing_prompt()
 
-    def build_prompt(self, text: str) -> str:
-        """The user's text without this bot's mention; empty means ``default_prompt()``."""
-        return strip_mention(text, self.bot_user_id) or self.default_prompt()
-
     # -- entry point
 
     async def handle_event(self, event: Mapping[str, Any], *, event_id: str | None = None, source: str) -> None:
@@ -393,16 +399,35 @@ class SlackHandler:
             return
         thread_ts = str(event.get("thread_ts") or ts)
         user = str(event["user"])
+        # The allow-list comes first: strangers get the refusal, whatever they asked.
         if not self.is_allowed(user):
             await self._refuse(channel, thread_ts, user)
             return
-        await self._answer(channel, thread_ts, self.build_prompt(str(event.get("text") or "")))
+        # The user's text without this bot's mention; empty means ``default_prompt()``.
+        request = strip_mention(str(event.get("text") or ""), self.bot_user_id)
+        if credits.is_credit_query(request):
+            await self._answer_credits(channel, thread_ts)
+            return
+        await self._answer(channel, thread_ts, request or self.default_prompt())
 
     async def _refuse(self, channel: str, thread_ts: str, user: str) -> None:
         log.warning("%s 봇: 허용되지 않은 사용자(%s)의 요청을 거절했습니다.", self.texts.label, user)
         if self._refused.seen(f"{channel}:{thread_ts}"):
             return  # refuse once per thread
         await self._post(channel, thread_ts, REFUSAL_TEXT)
+
+    # -- credit shortcut (no agent turn, no LLM call, no session)
+
+    async def _answer_credits(self, channel: str, thread_ts: str) -> None:
+        """Reply in the thread with the credit summary; the thread -> session map is not touched."""
+        log.info("%s: 스레드 %s:%s 크레딧 바로 답변 (에이전트 실행 없음)", self.texts.label, channel, thread_ts)
+        try:
+            text = await asyncio.to_thread(self.credit_text)
+        except Exception as exc:  # noqa: BLE001 - reported in Slack without details
+            _log_exception("크레딧을 확인하지 못했습니다.", exc)
+            text = CREDIT_CRASH_TEXT.format(kind=type(exc).__name__)
+        for chunk in to_slack_chunks(text) or [CREDIT_CRASH_TEXT.format(kind="빈 응답")]:
+            await self._post(channel, thread_ts, chunk)
 
     # -- running a turn
 
@@ -583,19 +608,130 @@ async def _wait_forever() -> None:
     await asyncio.Event().wait()
 
 
+# ---------------------------------------------------------------- low-credit alert
+
+
+async def check_low_credits(
+    client: Any,
+    user_ids: Iterable[str],
+    *,
+    env: Mapping[str, str] | None = None,
+    store: StateStore | None = None,
+    fetch: Callable[[], credits.CreditReport] | None = None,
+    now: datetime | None = None,
+) -> str:
+    """One low-credit check: DM every allowed user once per renewal period when credits run low.
+
+    Returns what happened: ``"disabled"`` (CREDIT_ALERT_PERCENT empty or 0),
+    ``"unsupported"`` (not the Chat KHU gateway: skipped silently), ``"failed"``
+    (logged, scrubbed), ``"ok"`` (enough left), ``"already"`` (alerted this
+    period) or ``"alerted"``. Only the gateway's credit endpoints are called,
+    never a model. Raises nothing for a failed check or a failed DM.
+    """
+    threshold = config.get_credit_alert_percent(env)
+    if threshold <= 0:
+        return "disabled"
+    if credits.gateway_root(env) is None:
+        return "unsupported"
+    report = await asyncio.to_thread(fetch or (lambda: credits.fetch_report(env)))
+    if not report.supported:
+        return "unsupported"
+    if not report.ok or report.balance is None:
+        log.warning("크레딧을 확인하지 못해 잔액 알림을 건너뜁니다: %s", scrub(" ".join((report.error or "").split())))
+        return "failed"
+    left = credits.remaining_percent(report.balance)
+    if left is None:
+        log.warning("남은 크레딧 비율을 알 수 없어 잔액 알림을 건너뜁니다 (total.quota/remaining 없음).")
+        return "failed"
+    if left >= threshold:
+        return "ok"
+    now = now or utcnow()
+    store = store or StateStore(config.get_state_path(env))
+    period = credits.alert_period(report.balance, now)
+    if store.credit_alert_period() == period:
+        return "already"
+    chunks = to_slack_chunks(credits.alert_text(report, threshold, env=env, now=now))
+    sent = 0
+    for user in sorted(user_ids):
+        try:
+            for chunk in chunks:
+                await client.chat_postMessage(channel=user, text=chunk, unfurl_links=False, unfurl_media=False)
+        except Exception as exc:  # noqa: BLE001 - try the others, retry next hour if nobody got it
+            log.error("크레딧 알림 DM을 보내지 못했습니다(%s): %s", user, describe_slack_error(exc))
+        else:
+            sent += 1
+    if not sent:
+        return "failed"
+    try:
+        store.mark_credit_alert(period, now)
+    except OSError as exc:
+        log.warning("크레딧 알림을 보낸 기록을 저장하지 못했습니다: %s", safe_error(exc))
+    log.info(
+        "남은 크레딧 %s%%: 알림 기준(%s%%) 아래라 %d명에게 DM을 보냈습니다.",
+        credits.fmt_number(left),
+        credits.fmt_number(threshold),
+        sent,
+    )
+    return "alerted"
+
+
+async def credit_alert_loop(
+    client: Any,
+    user_ids: Iterable[str],
+    *,
+    env: Mapping[str, str] | None = None,
+    first_delay: float = CREDIT_CHECK_FIRST_DELAY_SECONDS,
+    interval: float = CREDIT_CHECK_INTERVAL_SECONDS,
+    sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+    check: Callable[..., Awaitable[str]] = check_low_credits,
+) -> None:
+    """Check the credits ``first_delay`` seconds after start, then every ``interval`` seconds.
+
+    Runs until cancelled. A failed check is logged (scrubbed) and never stops
+    the loop or the bots.
+    """
+    users = frozenset(user_ids)
+    delay = first_delay
+    while True:
+        await sleep(delay)
+        delay = interval
+        try:
+            await check(client, users, env=env)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the bots keep running whatever happens here
+            log.warning("크레딧 잔액을 확인하지 못했습니다 (봇은 그대로 돕니다): %s", safe_error(exc))
+
+
+def _alert_bot(bots: list[tuple[config.SlackBotConfig, Any, SlackHandler]]) -> tuple[config.SlackBotConfig, Any]:
+    """The bot that sends the alert: 고뭉치 when configured, else the first configured bot."""
+    for bot, app, _handler in bots:
+        if bot.persona == MUNGCHI:
+            return bot, app
+    bot, app, _handler = bots[0]
+    return bot, app
+
+
 async def run_bots(
     cfg: config.SlackConfig,
     *,
     socket_factory: Callable[[Any, str], Any] | None = None,
     wait: Callable[[], Awaitable[None]] = _wait_forever,
+    credit_alert: Callable[..., Awaitable[None]] | None = None,
 ) -> int:
-    """Connect every configured bot over Socket Mode and serve them in one event loop."""
+    """Connect every configured bot over Socket Mode and serve them in one event loop.
+
+    While they run, ``credit_alert`` (default ``credit_alert_loop``) watches the
+    Chat KHU credits and DMs the allowed users through 고뭉치's bot (or the
+    first configured bot) when they run low.
+    """
     if socket_factory is None:
         from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 
         socket_factory = AsyncSocketModeHandler
     bots = build_apps(cfg)
     sockets: list[Any] = []
+    alert_task: asyncio.Task[None] | None = None
     try:
         for bot, app, handler in bots:
             try:
@@ -623,8 +759,22 @@ async def run_bots(
         if idle:
             names = ", ".join(f"{_describe_bot(bot)}: {bot.bot_env}, {bot.app_env}" for bot in idle)
             print(f"토큰이 없어 켜지 않은 봇: {names}", file=sys.stderr)
+        if bots:
+            alert_bot, alert_app = _alert_bot(bots)
+            threshold = config.get_credit_alert_percent()
+            if threshold > 0 and credits.gateway_root() is not None:
+                print(
+                    f"크레딧 잔액 알림: 남은 크레딧이 {credits.fmt_number(threshold)}% 아래로 내려가면 "
+                    f"{_describe_bot(alert_bot)} 봇이 DM으로 알립니다 (1시간마다 확인, 갱신 주기마다 한 번).",
+                    file=sys.stderr,
+                )
+            alert_task = asyncio.create_task((credit_alert or credit_alert_loop)(alert_app.client, cfg.allowed_user_ids))
         await wait()
     finally:
+        if alert_task is not None:
+            alert_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await alert_task
         for socket in sockets:
             with contextlib.suppress(Exception):
                 await socket.close_async()

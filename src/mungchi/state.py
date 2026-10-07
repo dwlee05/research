@@ -57,7 +57,12 @@ def _parse_iso(value: Any) -> datetime | None:
 
 
 class StateStore:
-    """Tiny JSON store: ``{"last_checked": {"<source>": "<iso8601>"}}``."""
+    """Tiny JSON store.
+
+    ``{"last_checked": {"<source>": "<iso8601>"},
+    "credit_alert": {"renewal_date": "<renewal_date>", "alerted_at": "<iso8601>"}}``.
+    Every write keeps the other keys as they are.
+    """
 
     def __init__(self, path: Path | str):
         self.path = Path(path)
@@ -66,7 +71,23 @@ class StateStore:
         return _read_json(self.path)
 
     def last_checked(self, source: str) -> datetime | None:
-        return _parse_iso(self.load().get("last_checked", {}).get(source))
+        stamps = self.load().get("last_checked")
+        return _parse_iso(stamps.get(source)) if isinstance(stamps, dict) else None
+
+    def credit_alert_period(self) -> str | None:
+        """The renewal date (period key) the low-credit alert was last sent for, if any."""
+        record = self.load().get("credit_alert")
+        period = record.get("renewal_date") if isinstance(record, dict) else None
+        return period if isinstance(period, str) and period else None
+
+    def mark_credit_alert(self, period: str, when: datetime) -> None:
+        with _LOCK:
+            data = self.load()
+            data["credit_alert"] = {
+                "renewal_date": period,
+                "alerted_at": ensure_aware(when).astimezone(timezone.utc).isoformat(),
+            }
+            _write_json(self.path, data)
 
     def mark_checked(self, source: str, when: datetime) -> None:
         with _LOCK:
