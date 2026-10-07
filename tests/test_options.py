@@ -1102,13 +1102,7 @@ def test_help_says_mungchi_checks_tokens_and_weather_itself():
 
 # ---------------------------------------------------------------- calendar events from a pasted note
 
-from mungchi.agents import (  # noqa: E402
-    SCHEDULE_DESCRIPTION,
-    SCHEDULE_PROMPT,
-    UPDATE_PROMPT,
-    build_propose_section,
-    build_voice_section,
-)
+from mungchi.agents import SCHEDULE_DESCRIPTION, SCHEDULE_PROMPT, UPDATE_PROMPT, build_propose_section  # noqa: E402
 from mungchi.state import StateStore, utcnow  # noqa: E402
 from mungchi.tools import event_proposals, macos_calendar  # noqa: E402
 from mungchi.tools.event_proposals import CONFIRM_QUESTION, CreationOutcome, CreationResult  # noqa: E402
@@ -1241,13 +1235,10 @@ def test_prompts_propose_and_end_with_the_exact_question():
     assert "고뭉치가 맡긴 글 맨 앞의 [지금: ...] 줄의 날짜를 기준으로" in SCHEDULE_PROMPT
     assert "고뭉치에게 그대로 보고하고" in SCHEDULE_PROMPT
     # 업뎃 handles notes directly, but its subagent under 고뭉치 never proposes.
-    assert (
-        "아래 '메모로 일정 추가'대로, 사진을 보내면 아래 '사진으로 일정 추가'대로, "
-        "음성 메시지 받아쓰기가 오면 아래 '음성으로 일정 추가'대로 직접 처리한다"
-    ) in direct["update"]
+    assert "아래 '메모로 일정 추가'대로, 사진을 보내면 아래 '사진으로 일정 추가'대로 직접 처리한다" in direct["update"]
     assert "propose_calendar_events" not in UPDATE_PROMPT
     assert options().agents["schedule"].prompt == SCHEDULE_PROMPT
-    assert SCHEDULE_PROMPT == build_schedule_prompt() + build_propose_section() + build_voice_section()
+    assert SCHEDULE_PROMPT == build_schedule_prompt() + build_propose_section()
 
 
 def test_mungchi_routes_notes_to_schedule_and_relays_the_question():
@@ -1595,134 +1586,3 @@ def test_cli_image_chat_mode_sends_the_photos_with_the_first_message_only(image_
     assert without_now_line(first["message"]["content"][-1]["text"]) == "이 이미지에 있는 일정을 캘린더에 등록해줘"
     assert isinstance(second, str) and without_now_line(second) == "고마워"
     assert "사진 1장을 첫 메시지와 함께 보냅니다" in capsys.readouterr().out
-
-
-# ---------------------------------------------------------------- voice messages -> calendar: prompts, --audio, --voice-setup
-
-from mungchi import voice  # noqa: E402
-
-HEARD = "다음 주 화요일 오후 세 시에 연구실 회의"
-
-
-class VoiceBackend:
-    """Stands in for PyAV + mlx-whisper in the CLI."""
-
-    def __init__(self, text=HEARD):
-        self.text = text
-        self.decoded: list[bytes] = []
-
-    def check(self, model):
-        pass
-
-    def decode(self, data, *, max_seconds):
-        self.decoded.append(data)
-        return voice.DecodedAudio(samples=data, seconds=2.0)
-
-    def recognize(self, samples, *, model, language):
-        return {"text": self.text, "segments": [{"no_speech_prob": 0.01}]}
-
-    def download(self, model):
-        return f"/cache/{model}"
-
-
-@pytest.fixture
-def voice_backend(monkeypatch):
-    backend = VoiceBackend()
-    monkeypatch.setattr(voice, "default_backend", lambda: backend)
-    return backend
-
-
-def _memo(tmp_path, data=b"m4a-bytes"):
-    path = tmp_path / "memo.m4a"
-    path.write_bytes(data)
-    return str(path)
-
-
-def test_every_prompt_that_gets_voice_messages_explains_recognition_errors():
-    direct = {p: build_options(env={}, persona=p).system_prompt for p in ("update", "schedule")}
-    for prompt in (*direct.values(), SCHEDULE_PROMPT):
-        section = prompt[prompt.index("## 음성으로 일정 추가") :]
-        assert "[음성 메시지 받아쓰기]가 붙은 글은 사용자의 음성 메시지를 프로그램이 음성 인식으로 받아 적은 것이다" in section
-        assert "특히 이름·장소·숫자(날짜, 시각, 금액)가 잘못 들리기 쉽다" in section
-        assert "메모와 똑같이 다룬다" in section and "source_note에는 받아쓰기 글을 그대로 적는다" in section
-        assert "미리보기에서 무엇을 알아들었는지 보이게 한다" in section and "짐작해서 고치지 않는다" in section
-        assert '"…이(가) 맞나요?"처럼 한 줄씩 묻는다' in section and "마지막 줄은 그대로 결과의 confirm_question이다" in section
-        assert "날짜를 알아들을 수 없으면 propose_calendar_events를 부르지 말고" in section
-        assert "Agent" not in section.split("## 지금 시각")[0]
-    assert "고뭉치가 맡긴 글에서 [음성 메시지 받아쓰기]" in SCHEDULE_PROMPT and "평소처럼 고뭉치에게 보고한다" in SCHEDULE_PROMPT
-    assert "사용자 메시지에서 [음성 메시지 받아쓰기]" in direct["update"]
-    # 고뭉치 hands a transcript to 일정 like a note, word for word, with the caution.
-    mungchi = options().system_prompt
-    section = mungchi[mungchi.index("## 음성 메시지") : mungchi.index("## 그 밖의 요청")]
-    assert "잘못 알아들은 글자가 있을 수 있고, 특히 이름·장소·숫자(날짜, 시각)가 잘못 들리기 쉽다" in section
-    assert "메모처럼 '일정' 에이전트에게 맡긴다" in section and "받아쓰기 글 전체(고치지 말고 그대로)" in section
-    assert "짐작해서 고치지 말고 사용자에게 묻는다" in section
-    assert "## 음성으로 일정 추가" not in UPDATE_PROMPT  # 업뎃 under 고뭉치 never proposes
-    assert "음성 메시지 받아쓰기" in SCHEDULE_DESCRIPTION
-    # The voice texts never carry a time, so the prompts stay cacheable (see the byte-identity test above).
-    assert voice.VOICE_TAG in voice.voice_prompt("", HEARD)
-
-
-def test_cli_voice_option_rules(capsys):
-    parser = build_parser()
-    assert parser.parse_args(["--agent", "schedule", "--audio", "memo.m4a"]).audio == "memo.m4a"
-    assert parser.parse_args(["--voice-setup"]).voice_setup is True
-    help_text = parser.format_help()
-    assert "--voice-setup" in help_text and "--audio" in help_text and "약 1.6GB" in help_text
-    assert "--agent schedule --audio memo.m4a" in help_text
-    for argv, message in (
-        (["--voice-setup", "질문"], "--voice-setup은 질문이나 다른 옵션과 함께 쓸 수 없습니다"),
-        (["--voice-setup", "--agent", "schedule"], "--voice-setup은 질문이나 다른 옵션과 함께 쓸 수 없습니다"),
-        (["--audio", "a.m4a", "--image", "b.jpg", "--agent", "update"], "--audio는 --brief, --slack, --image"),
-        (["--audio", "a.m4a", "--brief"], "--audio는 --brief"),
-        (["--audio", "a.m4a", "slack"], "--audio는 --brief"),
-    ):
-        with pytest.raises(SystemExit) as caught:
-            main(argv)
-        assert caught.value.code == 2 and message in capsys.readouterr().err
-
-
-def test_cli_voice_setup_runs_the_setup(monkeypatch):
-    seen = []
-    monkeypatch.setattr(voice, "run_voice_setup", lambda: seen.append("setup") or 0)
-    assert main(["--voice-setup"]) == 0 and seen == ["setup"]
-
-
-def test_cli_audio_one_shot_prints_the_transcript_then_asks_the_agent(fake_sdk, voice_backend, tmp_path, capsys):
-    assert main(["--agent", "schedule", "--audio", _memo(tmp_path), "Research로"]) == 0
-    assert voice_backend.decoded == [b"m4a-bytes"]
-    [client] = fake_sdk.instances
-    [prompt] = client.prompts
-    assert without_now_line(prompt) == voice.voice_prompt("Research로", HEARD)
-    assert client.options.system_prompt == build_options(env={}, persona="schedule").system_prompt
-    out, err = capsys.readouterr()
-    assert out.startswith(f'🎙️ 들은 내용: "{HEARD}"\n') and "🎙️ 음성을 글로 옮기는 중…" in err
-
-
-def test_cli_audio_chat_sends_the_transcript_with_the_first_message(fake_sdk, voice_backend, tmp_path, monkeypatch, capsys):
-    lines = iter(["", "고마워", "종료"])
-    monkeypatch.setattr("builtins.input", lambda prompt="": next(lines))
-    assert main(["--audio", _memo(tmp_path)]) == 0  # 고뭉치 (it hands the transcript to 일정)
-    [client] = fake_sdk.instances
-    assert [without_now_line(p) for p in client.prompts] == [voice.voice_prompt("", HEARD), "고마워"]
-    assert client.options.agents and "schedule" in client.options.agents
-    assert "들은 내용을 첫 메시지와 함께 보냅니다" in capsys.readouterr().out
-
-    fake_sdk.instances = []
-    lines = iter(["11월 것만", "종료"])
-    monkeypatch.setattr("builtins.input", lambda prompt="": next(lines))
-    assert main(["--agent", "update", "--audio", _memo(tmp_path)]) == 0
-    [client] = fake_sdk.instances
-    assert [without_now_line(p) for p in client.prompts] == [voice.voice_prompt("11월 것만", HEARD)]
-
-
-def test_cli_audio_problems_are_korean_and_never_reach_the_agent(fake_sdk, monkeypatch, tmp_path, capsys):
-    monkeypatch.setattr(voice, "default_backend", lambda: VoiceBackend(text="  "))
-    assert main(["--agent", "schedule", "--audio", _memo(tmp_path), "q"]) == 1
-    assert "[오류] 음성에서 내용을 알아듣지 못했어요. 다시 녹음해 주세요." in capsys.readouterr().err
-    assert main(["--agent", "schedule", "--audio", str(tmp_path / "missing.m4a")]) == 1
-    assert "[오류] 음성 파일을 찾을 수 없어요" in capsys.readouterr().err
-    monkeypatch.setattr(voice, "default_backend", voice.MlxWhisperBackend)
-    assert main(["--agent", "schedule", "--audio", _memo(tmp_path), "q"]) == 1  # Linux: the real backend
-    assert f"[오류] {voice.UNSUPPORTED_PLATFORM_TEXT}" in capsys.readouterr().err
-    assert fake_sdk.instances == []

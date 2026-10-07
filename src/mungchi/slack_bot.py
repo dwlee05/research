@@ -17,13 +17,6 @@ with an image, or a DM) is downloaded with the bot token, shrunk in memory
 like a pasted note. The allow-list is checked before anything is
 downloaded. 고뭉치 points photos to 업뎃 / 일정 without an agent turn.
 
-A voice message (Slack's mic button, or an audio file) sent to any of the
-three bots is downloaded the same way, transcribed on this Mac
-(``voice``: PyAV + mlx-whisper, nothing leaves the computer), shown as
-"🎙️ 들은 내용: …" and sent to the agent as text, so the usual preview and
-category question follow (고뭉치 hands it to 일정 like a pasted note). The
-transcript and the audio are never logged.
-
 One process runs up to three Slack apps, one per persona: 고뭉치 (@moongchi,
 the orchestrator), 업뎃 (@update) and 일정 (@schedule), each with its own
 ``AsyncApp`` and Socket Mode connection. They share the allow-list, the
@@ -54,7 +47,7 @@ import httpx
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 
-from . import briefing, config, credits, images, quick_info, version, voice, weather
+from . import briefing, config, credits, images, quick_info, version, weather
 from .briefing import BRIEF_CRASH_TEXT, Briefing, build_briefing
 from .main import TurnResult, run_turn
 from .personas import MUNGCHI, PERSONA_LABELS, PERSONAS, SCHEDULE, SLACK_HANDLES, UPDATE, josa
@@ -82,8 +75,7 @@ BriefingBuilder = Callable[..., Awaitable[Briefing]]
 # ``event_proposals.create_proposal_events``-like (blocking: run in a worker thread).
 EventCreator = Callable[[Mapping[str, Any]], event_proposals.CreationOutcome]
 # ``download_slack_file``-like: (url_private_download, bot token) -> the file's bytes.
-# Audio downloads also pass ``max_bytes`` and ``too_big_text``.
-FileFetcher = Callable[..., Awaitable[bytes]]
+FileFetcher = Callable[[str, str], Awaitable[bytes]]
 
 REFUSAL_TEXT = "죄송하지만 이 봇은 소유자만 사용할 수 있어요."
 FRESH_SESSION_NOTE = "이 스레드의 이전 대화는 이어 갈 수 없어서, 다음 메시지부터는 새 대화로 시작해요."
@@ -104,9 +96,6 @@ MAX_BUTTON_TEXT_CHARS = 75
 IMAGE_REDIRECT_TEXT = "사진 속 일정 등록은 @업뎃이나 @일정에게 보내주세요"
 FILE_SHARE_SUBTYPE = "file_share"
 NO_IMAGE_READ_TEXT = "보낸 사진을 하나도 읽지 못했어요."
-# Voice messages: every bot listens (고뭉치 hands the transcript to 일정 like a note).
-VOICE_WITH_IMAGES_TEXT = "음성과 사진이 함께 와서 음성만 들을게요. 사진은 따로 보내 주세요."
-VOICE_WITH_IMAGES_MUNGCHI_TEXT = "음성과 사진이 함께 와서 음성만 들을게요. " + IMAGE_REDIRECT_TEXT
 FILE_DOWNLOAD_TIMEOUT_SECONDS = 30.0
 
 # Low-credit alert inside the running bots: first check shortly after start, then hourly.
@@ -261,7 +250,6 @@ async def download_slack_file(
     max_bytes: int = images.MAX_FILE_BYTES,
     transport: httpx.AsyncBaseTransport | None = None,
     timeout: float = FILE_DOWNLOAD_TIMEOUT_SECONDS,
-    too_big_text: str = images.TOO_BIG_TEXT,
 ) -> bytes:
     """A Slack file's bytes (``url_private_download`` with ``Authorization: Bearer <bot token>``), in memory.
 
@@ -285,7 +273,7 @@ async def download_slack_file(
                 async for chunk in response.aiter_bytes():
                     total += len(chunk)
                     if total > max_bytes:
-                        raise FileDownloadError(too_big_text)
+                        raise FileDownloadError(images.TOO_BIG_TEXT)
                     chunks.append(chunk)
     except FileDownloadError:
         raise
@@ -548,7 +536,6 @@ class SlackHandler:
         create_events: EventCreator | None = None,
         bot_token: str | None = None,
         file_fetcher: FileFetcher | None = None,
-        transcriber: voice.Transcriber | None = None,
     ):
         self.allowed_user_ids = frozenset(allowed_user_ids)
         if not self.allowed_user_ids:
@@ -578,8 +565,6 @@ class SlackHandler:
         # Photos are downloaded with this bot's own token (never logged).
         self.bot_token = bot_token if bot_token is not None else getattr(client, "token", None)
         self.file_fetcher = file_fetcher or download_slack_file
-        # Voice messages: transcribed on this Mac (mlx-whisper), one at a time.
-        self.transcriber = transcriber or voice.Transcriber()
         # Threads with an agent turn running or queued: a "네" sent meanwhile came
         # before its preview was shown, so it never confirms anything.
         self._turns: dict[str, int] = {}
@@ -654,8 +639,7 @@ class SlackHandler:
         # The user's text without this bot's mention; empty means 고뭉치's briefing
         # or ``default_prompt()``.
         request = strip_mention(str(event.get("text") or ""), self.bot_user_id)
-        # Voice messages, photos (and other files) attached to the message. Only
-        # after the allow-list: nothing of a stranger's is ever downloaded.
+        # Photos (and other files) attached to the message. Checked after the allow-list.
         files = [file for file in (event.get("files") or []) if isinstance(file, Mapping)]
         if files and await self._answer_files(channel, thread_ts, request, files):
             return
@@ -870,22 +854,16 @@ class SlackHandler:
         if not await self._apply_answer(channel, thread_ts, pending, answer, deliver):
             await self._ephemeral(channel, user, thread_ts, STALE_ACTION_TEXT)
 
-    # -- photos -> calendar (업뎃 and 일정), voice messages -> calendar (every bot)
+    # -- photos -> calendar (업뎃 and 일정)
 
     async def _answer_files(self, channel: str, thread_ts: str, request: str, files: list[Mapping[str, Any]]) -> bool:
         """A message with files. True: handled here; False: go on with its text as before.
 
-        A voice message (any bot) is transcribed and its text goes to the
-        agent (``_answer_voice``); photos sent with it are left for a
-        separate message. Otherwise 업뎃 / 일정: up to 5 images go to the
-        agent with the text (``_answer`` with ``files``); notes about skipped
-        files are posted first. 고뭉치: an image gets ``IMAGE_REDIRECT_TEXT``
-        (no agent turn). Files without any image or audio: a short note,
-        then the text (if any) as an ordinary message.
+        업뎃 / 일정: up to 5 images go to the agent with the text (``_answer``
+        with ``files``); notes about skipped files are posted first. 고뭉치:
+        an image gets ``IMAGE_REDIRECT_TEXT`` (no agent turn). Files without
+        any image: a short note, then the text (if any) as an ordinary message.
         """
-        audio = voice.select_audio(files, max_seconds=self.transcriber.max_seconds)
-        if audio.any_audio:
-            return await self._answer_audio_files(channel, thread_ts, request, files, audio)
         selection = images.select_images(files)
         log.info(
             "%s: 스레드 %s:%s 파일 %d개 (읽을 사진 %d장)", self.texts.label, channel, thread_ts, len(files), len(selection.images)
@@ -942,114 +920,6 @@ class SlackHandler:
                 notes.append(f"{name}: 사진을 받지 못했어요 ({type(exc).__name__}).")
         log.info("%s: 사진 %d장 준비, %d장 실패", self.texts.label, len(prepared), len(notes))
         return prepared, notes
-
-    async def _answer_audio_files(
-        self,
-        channel: str,
-        thread_ts: str,
-        request: str,
-        files: list[Mapping[str, Any]],
-        selection: voice.AudioSelection,
-    ) -> bool:
-        """A message with audio: notes about what is not heard, then the one voice message (``_answer_voice``)."""
-        log.info(
-            "%s: 스레드 %s:%s 파일 %d개 (들을 음성 %d개)",
-            self.texts.label,
-            channel,
-            thread_ts,
-            len(files),
-            1 if selection.audio is not None else 0,
-        )
-        notes = list(selection.notes)
-        if images.select_images(files).any_image:
-            notes.append(VOICE_WITH_IMAGES_MUNGCHI_TEXT if self.persona == MUNGCHI else VOICE_WITH_IMAGES_TEXT)
-        if notes:
-            await self._post_shortcut(channel, thread_ts, "\n".join(notes))
-        if selection.audio is None:
-            return not request
-        await self._answer_voice(channel, thread_ts, request, selection.audio)
-        return True
-
-    async def _answer_voice(self, channel: str, thread_ts: str, request: str, file: Mapping[str, Any]) -> None:
-        """Transcribe one voice message, show what was heard, then run the agent on the text.
-
-        "🎙️ 음성을 글로 옮기는 중…" first; it becomes "🎙️ 들은 내용: …"
-        (or a Korean reason, with no agent turn: nothing heard, too long, no
-        mlx-whisper ...). The agent gets ``voice.voice_prompt`` (the user's
-        own text, the transcript and a caution about recognition errors) in
-        this thread, bound to this thread's conversation key as usual, so a
-        proposal it makes is answered here by category (buttons or text). A
-        transcript never answers a proposal by itself: like any new message
-        it replaces the one waiting in this thread.
-        """
-        key = self._conversation_key(channel, thread_ts)
-        # Counted before the first await: a "네" typed meanwhile never confirms the old proposal.
-        self._turns[key] = self._turns.get(key, 0) + 1
-        try:
-            placeholder = await self._post(channel, thread_ts, voice.TRANSCRIBING_TEXT)
-            async with self._thread_lock(f"{self.persona}:{channel}:{thread_ts}"):
-                transcript = await self._transcribe(channel, thread_ts, placeholder, file)
-                if transcript is None:
-                    return
-                await self._replace_proposal(channel, thread_ts)
-                answer_placeholder = await self._post(channel, thread_ts, self.texts.placeholder)
-                async with self._semaphore:
-                    await self._run_and_reply(
-                        channel, thread_ts, answer_placeholder, voice.voice_prompt(request, transcript)
-                    )
-        finally:
-            self._turns[key] -= 1
-            if not self._turns[key]:
-                del self._turns[key]
-
-    async def _transcribe(
-        self, channel: str, thread_ts: str, placeholder: str | None, file: Mapping[str, Any]
-    ) -> str | None:
-        """The transcript, shown in place of the placeholder; None after a Korean note instead.
-
-        Checks that transcription can run here before downloading anything.
-        Downloads with the bot token (``*.slack.com`` only, 25 MB at most),
-        in memory. Logs only lengths and error kinds, never the transcript
-        or the audio.
-        """
-        label = self.texts.label
-        try:
-            await self.transcriber.check()
-            full = await self._full_file(file)
-            url = str(full.get("url_private_download") or full.get("url_private") or "")
-            if not url or not self.bot_token:
-                raise FileDownloadError("파일 주소나 봇 토큰이 없어요")
-            data = await self.file_fetcher(
-                url, self.bot_token, max_bytes=voice.MAX_AUDIO_BYTES, too_big_text=voice.TOO_BIG_TEXT
-            )
-            try:
-                transcript = await self.transcriber.transcribe(data)
-            finally:
-                del data
-        except FileDownloadError as exc:
-            log.warning("%s 봇: 음성 파일을 받지 못했습니다: %s", label, scrub(str(exc)))
-            if exc.missing_scope:
-                reply = (
-                    f"봇에 files:read 권한이 없어 음성 파일을 받지 못했어요. "
-                    f"slack_manifests/{self.texts.handle}.yaml대로 권한을 주고 앱을 다시 설치하세요."
-                )
-            else:
-                reply = voice.DOWNLOAD_FAILED_TEXT.format(reason=scrub(str(exc)))
-        except voice.VoiceError as exc:
-            log.warning("%s 봇: 음성을 글로 옮기지 못했습니다 (%s)", label, type(exc).__name__)
-            reply = str(exc)
-        except Exception as exc:  # noqa: BLE001 - a Korean note; never the message (it could quote the audio)
-            log.warning("%s 봇: 음성을 글로 옮기지 못했습니다 (%s)", label, type(exc).__name__)
-            reply = voice.FAILED_TEXT.format(kind=type(exc).__name__)
-        else:
-            if transcript:
-                log.info("%s: 스레드 %s:%s 음성 받아쓰기 끝 (%d자)", label, channel, thread_ts, len(transcript))
-                await self._finish(channel, thread_ts, placeholder, to_slack_chunks(voice.heard_text(transcript)))
-                return transcript
-            log.info("%s: 스레드 %s:%s 음성에서 알아들은 말이 없습니다 (에이전트 실행 없음)", label, channel, thread_ts)
-            reply = voice.EMPTY_TRANSCRIPT_TEXT
-        await self._finish(channel, thread_ts, placeholder, to_slack_chunks(reply))
-        return None
 
     # -- weather and credit shortcuts (no agent turn, no LLM call, no session)
     #

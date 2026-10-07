@@ -14,11 +14,6 @@ A note pasted to put in the calendar is turned into a proposal
 is read the same way (``IMAGE_SECTION``). The agent only suggests a category
 (Family, Teaching, Research, Event-Outside, Event-KHU); nobody can create
 events: code does, after the user picks the category (or says "네").
-
-A voice message arrives as text: the program transcribes it on the Mac and
-sends ``[음성 메시지 받아쓰기] …`` (``voice.voice_prompt``). Every prompt that
-can get one (고뭉치, 일정 direct and as subagent, 업뎃 direct) treats it like a
-note, with a caution that names and numbers may be misheard (``build_voice_section``).
 """
 
 from __future__ import annotations
@@ -165,11 +160,6 @@ MUNGCHI_SYSTEM_PROMPT = """\
 - 카테고리(넣을 캘린더)는 사용자가 고른다. '일정' 에이전트가 추천한 카테고리를 네가 정한 것처럼 말하지 않는다.
 - 캘린더에 넣는 일은 사용자가 카테고리를 고르거나 "네"라고 답한 뒤 프로그램이 한다. 일정이 추가되었다거나 등록되었다고 절대 말하지 않는다.
 - 사용자가 "네"·"아니요"·카테고리 번호나 이름이 아니라 고칠 내용(예: "시간은 1시로 바꿔줘", "1번은 Research, 2번은 Event-KHU")이나 질문을 보내면 앞의 제안은 이미 취소된 것이다. 질문이면 답하고, 메모 원문과 고칠 내용을 함께 '일정' 에이전트에게 다시 맡겨 새 미리보기를 받아 보고의 확인 질문으로 끝낸다. 사용자가 "네"나 카테고리를 답했는데 그 말이 너에게 왔다면 확인할 제안이 없는 것(시간이 지나 사라짐 등)이니 메모 원문과 그 답을 함께 다시 맡긴다.
-
-## 음성 메시지
-- 사용자 메시지에 [음성 메시지 받아쓰기]가 붙은 글은 사용자의 음성 메시지를 프로그램이 음성 인식으로 받아 적은 것이다. 잘못 알아들은 글자가 있을 수 있고, 특히 이름·장소·숫자(날짜, 시각)가 잘못 들리기 쉽다.
-- 날짜·시간이 들어 있거나 일정을 넣어 달라는 말이면 메모처럼 '일정' 에이전트에게 맡긴다. Agent 도구의 prompt에는 [지금: ...] 줄, "이 음성 메시지 받아쓰기의 일정을 캘린더 추가 제안으로 만들어 줘"라는 요청, [음성 메시지 받아쓰기]로 시작하는 받아쓰기 글 전체(고치지 말고 그대로), 사용자가 덧붙인 글을 모두 적고, 음성 인식이라 틀린 글자가 있을 수 있다는 것도 함께 적는다. 보고는 위 '메모로 일정 추가'대로 옮긴다.
-- 일정이 아니라 질문이면 평소처럼 직접 답하거나 맡긴다. 받아쓰기에서 말이 안 되거나 두 가지로 읽히는 부분은 짐작해서 고치지 말고 사용자에게 묻는다.
 
 ## 그 밖의 요청
 - 공저자 작업에 관한 질문은 업뎃에게, 일정에 관한 질문은 '일정' 에이전트에게만 맡긴다. 둘 다 필요하면 동시에 맡긴다.
@@ -383,30 +373,6 @@ IMAGE_SECTION = """
 """
 
 
-# ---------------------------------------------------------------- voice messages -> calendar proposals
-#
-# 일정 (direct and subagent) and 업뎃 (direct). {source}: where the transcript
-# arrives, {answer}: how a question that is not about events is answered.
-
-_VOICE_BODY = """
-## 음성으로 일정 추가
-{source} [음성 메시지 받아쓰기]가 붙은 글은 사용자의 음성 메시지를 프로그램이 음성 인식으로 받아 적은 것이다. 잘못 알아들은 글자가 있을 수 있고, 특히 이름·장소·숫자(날짜, 시각, 금액)가 잘못 들리기 쉽다.
-1. 메모와 똑같이 다룬다: 날짜·시간이 들어 있거나 일정을 넣어 달라는 말이면 위 '메모로 일정 추가'대로 propose_calendar_events를 한 번 부른다(source_note에는 받아쓰기 글을 그대로 적는다). 일정이 아니라 질문이면 평소처럼 {answer}.
-2. 알아들은 제목·날짜·시각·장소를 그대로 넣어 미리보기에서 무엇을 알아들었는지 보이게 한다. 말이 안 되거나 두 가지로 읽히는 부분(비슷하게 들리는 이름, '두 시'와 '열두 시' 같은 숫자)은 짐작해서 고치지 않는다. 그 칸은 비우거나 들은 그대로 두고, 미리보기 뒤에 "…이(가) 맞나요?"처럼 한 줄씩 묻는다. 마지막 줄은 그대로 결과의 confirm_question이다.
-3. 날짜를 알아들을 수 없으면 propose_calendar_events를 부르지 말고, 들은 내용을 짧게 옮긴 뒤 날짜를 묻는다.
-"""
-
-_VOICE_FRAMING = {
-    "subagent": {"source": "고뭉치가 맡긴 글에서", "answer": "고뭉치에게 보고한다"},
-    "direct": {"source": "사용자 메시지에서", "answer": "답한다"},
-}
-
-
-def build_voice_section(*, direct: bool = False) -> str:
-    """How 일정 / 업뎃 treat a transcribed voice message (time-free, cacheable)."""
-    return _VOICE_BODY.format(**_VOICE_FRAMING["direct" if direct else "subagent"])
-
-
 # Only in the direct version: the user talks to 업뎃 / 일정 without 고뭉치.
 _CREDITS_NOTE = (
     "- 이 시스템에서 '토큰'·'크레딧'은 Chat KHU(Mindlogic) API 크레딧을 말한다(암호화폐가 아님. "
@@ -418,7 +384,7 @@ _DIRECT_TAIL = {
     UPDATE: """\
 
 ## 대화
-- 공저자 업데이트와 상관없는 요청은 직접 처리하지 않는다. 일정·약속·날씨는 '일정' 에이전트, 종합 브리핑은 고뭉치 담당이라고 짧게 안내한다. 단, 메모를 붙여 넣고 캘린더에 넣어 달라고 하면(또는 날짜·시간이 든 메모·공지를 붙여 넣으면) 아래 '메모로 일정 추가'대로, 사진을 보내면 아래 '사진으로 일정 추가'대로, 음성 메시지 받아쓰기가 오면 아래 '음성으로 일정 추가'대로 직접 처리한다.
+- 공저자 업데이트와 상관없는 요청은 직접 처리하지 않는다. 일정·약속·날씨는 '일정' 에이전트, 종합 브리핑은 고뭉치 담당이라고 짧게 안내한다. 단, 메모를 붙여 넣고 캘린더에 넣어 달라고 하면(또는 날짜·시간이 든 메모·공지를 붙여 넣으면) 아래 '메모로 일정 추가'대로, 사진을 보내면 아래 '사진으로 일정 추가'대로 직접 처리한다.
 """
     + _CREDITS_NOTE
     + """\
@@ -458,8 +424,8 @@ def build_schedule_prompt(*, direct: bool = False) -> str:
 
 
 UPDATE_PROMPT = build_update_prompt()
-# 일정 as 고뭉치's subagent also turns notes (and voice transcripts) into calendar proposals; 업뎃's subagent never does.
-SCHEDULE_PROMPT = build_schedule_prompt() + build_propose_section() + build_voice_section()
+# 일정 as 고뭉치's subagent also turns notes into calendar proposals; 업뎃's subagent never does.
+SCHEDULE_PROMPT = build_schedule_prompt() + build_propose_section()
 
 
 UPDATE_DESCRIPTION = (
@@ -474,7 +440,6 @@ SCHEDULE_DESCRIPTION = (
     "일정·약속·회의 시간 질문, 날씨 때문에 야외 일정이나 이동이 달라질지 묻는 질문과 "
     "브리핑의 ① 오늘의 일정은 반드시 이 에이전트에게 맡긴다. 사용자가 붙여 넣은 메모·공지의 일정을 캘린더에 추가해 달라는 부탁도 "
     "이 에이전트에게 맡긴다(메모 원문을 그대로 전하면 캘린더 추가 제안과 미리보기를 만든다). "
-    "음성 메시지 받아쓰기([음성 메시지 받아쓰기])의 일정도 받아쓰기 글을 그대로 전해 똑같이 맡긴다. "
     "날씨만 묻는 단순한 날씨 질문은 고뭉치가 get_weather로 직접 답한다."
 )
 
@@ -492,14 +457,7 @@ def build_direct_prompt(persona: str) -> str:
         body = build_schedule_prompt(direct=True)
     else:
         raise ValueError(f"no direct prompt for persona {persona!r}")
-    return (
-        body
-        + _DIRECT_TAIL[persona]
-        + build_propose_section(direct=True)
-        + IMAGE_SECTION
-        + build_voice_section(direct=True)
-        + _DIRECT_OUTPUT
-    )
+    return body + _DIRECT_TAIL[persona] + build_propose_section(direct=True) + IMAGE_SECTION + _DIRECT_OUTPUT
 
 
 def build_agents() -> dict[str, AgentDefinition]:

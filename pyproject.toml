@@ -25,10 +25,6 @@ dependencies = [
     "pillow-heif>=0.16",
     # Reads the macOS Calendar app (EventKit). Imported lazily, only on a Mac.
     "pyobjc-framework-EventKit>=10.0; sys_platform == 'darwin'",
-    # Voice messages -> calendar: local transcription on Apple Silicon (MLX Whisper) and in-memory
-    # audio decoding (PyAV, bundles FFmpeg: no ffmpeg binary needed). Imported only when audio arrives.
-    "mlx-whisper>=0.4.3; sys_platform == 'darwin' and platform_machine == 'arm64'",
-    "av>=14.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
 
 [project.optional-dependencies]

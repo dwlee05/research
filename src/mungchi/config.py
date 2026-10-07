@@ -478,45 +478,6 @@ def get_calendar_categories(env: Mapping[str, str] | None = None) -> list[Calend
     return categories
 
 
-# ---------------------------------------------------------------- voice messages (local mlx-whisper)
-
-# Hugging Face repo (or a local folder) of the MLX Whisper model. The default
-# is a one-time download of about 1.6 GB (``python -m mungchi --voice-setup``).
-DEFAULT_WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
-DEFAULT_WHISPER_LANGUAGE = "ko"
-# Longest voice message transcribed (seconds).
-DEFAULT_VOICE_MAX_SECONDS = 300
-MAX_VOICE_MAX_SECONDS = 3_600
-_WHISPER_AUTO_LANGUAGE = frozenset({"", "auto"})
-
-
-def get_whisper_model(env: Mapping[str, str] | None = None) -> str:
-    """``WHISPER_MODEL``: Hugging Face repo id or local folder (default ``mlx-community/whisper-large-v3-turbo``)."""
-    return _get(env, "WHISPER_MODEL") or DEFAULT_WHISPER_MODEL
-
-
-def get_whisper_language(env: Mapping[str, str] | None = None) -> str | None:
-    """``WHISPER_LANGUAGE``: the spoken language (default ``ko``); empty or ``auto``: detected (None).
-
-    Unset means the default; an empty value means auto-detect (like ``CALENDAR_CATEGORIES``).
-    """
-    raw = _env(env).get("WHISPER_LANGUAGE")
-    if raw is None:
-        return DEFAULT_WHISPER_LANGUAGE
-    value = raw.strip().lower()
-    return None if value in _WHISPER_AUTO_LANGUAGE else value
-
-
-def get_voice_max_seconds(env: Mapping[str, str] | None = None) -> int:
-    """``VOICE_MAX_SECONDS`` (default 300); anything but a whole number from 1 to 3600 keeps the default."""
-    raw = _get(env, "VOICE_MAX_SECONDS")
-    try:
-        seconds = int(raw) if raw else DEFAULT_VOICE_MAX_SECONDS
-    except ValueError:
-        return DEFAULT_VOICE_MAX_SECONDS
-    return seconds if 1 <= seconds <= MAX_VOICE_MAX_SECONDS else DEFAULT_VOICE_MAX_SECONDS
-
-
 # ---------------------------------------------------------------- Slack
 
 # Member ids start with U (or W on Enterprise Grid); channel ids with C/G,

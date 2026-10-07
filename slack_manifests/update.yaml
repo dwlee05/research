@@ -23,7 +23,7 @@ oauth_config:
     bot:
       - app_mentions:read
       - chat:write
-      # 사진·음성으로 일정 등록: 멘션·DM에 붙인 사진과 음성 메시지를 내려받습니다(봇이 받은 메시지의 파일만).
+      # 사진 속 일정 등록: 멘션·DM에 붙인 사진을 내려받습니다(봇이 받은 메시지의 파일만).
       - files:read
       - im:history
       - im:read
