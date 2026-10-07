@@ -79,9 +79,17 @@ class FakeRun:
         self.active = 0
         self.max_active = 0
 
-    async def __call__(self, prompt, *, resume=None, on_status=None, extra_system_prompt="", persona="mungchi"):
+    async def __call__(
+        self, prompt, *, resume=None, on_status=None, extra_system_prompt="", persona="mungchi", briefing=False
+    ):
         self.calls.append(
-            {"prompt": prompt, "resume": resume, "extra_system_prompt": extra_system_prompt, "persona": persona}
+            {
+                "prompt": prompt,
+                "resume": resume,
+                "extra_system_prompt": extra_system_prompt,
+                "persona": persona,
+                "briefing": briefing,
+            }
         )
         self.active += 1
         self.max_active = max(self.max_active, self.active)
@@ -149,7 +157,13 @@ def test_mention_end_to_end_placeholder_status_and_chunked_answer(tmp_path):
     placeholder_ts = first[1]["_ts"]
     # 2) the agent ran once with the stripped prompt and Slack formatting
     assert run.calls == [
-        {"prompt": "오늘 일정 알려줘", "resume": None, "extra_system_prompt": SLACK_FORMAT_PROMPT, "persona": "mungchi"}
+        {
+            "prompt": "오늘 일정 알려줘",
+            "resume": None,
+            "extra_system_prompt": SLACK_FORMAT_PROMPT,
+            "persona": "mungchi",
+            "briefing": False,  # Slack turns never move the Dropbox briefing checkpoint
+        }
     ]
     # 3) status updates edited the placeholder
     status_updates = [u for u in client.updates if u["text"].startswith(PLACEHOLDER_TEXT)]
@@ -218,6 +232,8 @@ def test_empty_mention_means_briefing(tmp_path):
     prompt = run.calls[0]["prompt"]
     assert prompt.startswith("업뎃과 '일정' 에이전트에게 일을 맡겨서 오늘(")
     assert "브리핑" in prompt
+    # Asked for in Slack, it is still an ad-hoc run: only --brief moves the checkpoint.
+    assert run.calls[0]["briefing"] is False
 
 
 # ---------------------------------------------------------------- authorization
@@ -527,6 +543,7 @@ def test_post_briefing_posts_header_and_threads_overflow(tmp_path):
     assert "2026-10-05 (월요일)" in run.calls[0]["prompt"]
     assert run.calls[0]["extra_system_prompt"] == SLACK_FORMAT_PROMPT
     assert run.calls[0]["persona"] == "mungchi"
+    assert run.calls[0]["briefing"] is True  # --brief --slack is the scheduled briefing
     first, *rest = client.posts
     assert first["channel"] == CHANNEL and "thread_ts" not in first
     assert first["text"].startswith("☀️ *오늘의 브리핑 (2026-10-05)*\n\n*섹션 0*")

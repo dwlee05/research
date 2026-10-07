@@ -2,8 +2,10 @@
 
 Lists the same folder the ``check_dropbox_updates`` tool lists and sorts every
 file with the tool's own ``classify_entry``, so what is printed here is
-exactly what 업뎃 would include or leave out. Read-only: no Claude API call,
-the stored "last checked" time is read but never moved, and no token is
+exactly what 업뎃 would include or leave out. Without ``--hours`` the window
+is the ad-hoc one (the last 24 hours, as when 업뎃 or 고뭉치 is asked without a
+period), and the stored briefing checkpoint is shown next to it. Read-only:
+no Claude API call, the checkpoint is read but never moved, and no token is
 printed (every line is scrubbed).
 """
 
@@ -20,8 +22,12 @@ from .state import StateStore, ensure_aware, utcnow
 from .tools import dropbox_tool
 from .tools.common import scrub
 from .tools.dropbox_tool import (
+    BASIS_BRIEFING_CHECKPOINT,
+    BASIS_DEFAULT_24H,
+    BASIS_SINCE_HOURS,
     EXCLUDED_BEFORE_WINDOW,
     EXCLUDED_MINE,
+    EXCLUDED_TEMP,
     EXCLUDED_UNKNOWN_MODIFIER,
     INCLUDED,
 )
@@ -34,13 +40,14 @@ NO_INFO = "(정보 없음)"
 
 DECISION_LABELS = {
     INCLUDED: "포함",
+    EXCLUDED_TEMP: "제외: 임시 파일",
     EXCLUDED_MINE: "제외: 내가 수정",
     EXCLUDED_UNKNOWN_MODIFIER: "제외: 수정자 정보 없음(공유 폴더 아님)",
     EXCLUDED_BEFORE_WINDOW: "제외: 기간 이전 (기준 시각 이전)",
 }
 TABLE_HEADERS = ("경로", "수정 시각", "수정한 사람", "공유 폴더", "판정")
 
-HEADER_TEXT = "Dropbox 변경 확인 진단 (읽기 전용: Claude API를 쓰지 않고, 마지막 확인 시각도 바꾸지 않습니다)"
+HEADER_TEXT = "Dropbox 변경 확인 진단 (읽기 전용: Claude API를 쓰지 않고, 브리핑 기준 시각도 바꾸지 않습니다)"
 NOT_FOUND_HINT = (
     "DROPBOX_ROOT_FOLDER에 Dropbox 맨 위부터의 전체 경로를 적었는지 확인하세요(예: /Research/20_연구-진행). "
     "Dropbox 팀 계정(팀 스페이스)을 쓰면 웹에서 보이는 경로와 이 프로그램이 보는 경로가 다를 수 있습니다: "
@@ -78,11 +85,17 @@ def _display_name(account: Any) -> str:
 
 
 def _basis_text(basis: str, hours: int, lookback_days: int) -> str:
-    if basis == "since_hours":
+    if basis == BASIS_SINCE_HOURS:
         return f"--hours {hours} (최근 {hours}시간)"
-    if basis == "last_check":
-        return "마지막 확인 시각 (고뭉치·업뎃이 Dropbox를 마지막으로 확인한 때)"
-    return f"확인 기록이 없어 최근 {lookback_days}일 (LOOKBACK_DAYS)"
+    if basis == BASIS_DEFAULT_24H:
+        return "최근 24시간 (기간 없이 업뎃·고뭉치에게 물을 때와 같음)"
+    if basis == BASIS_BRIEFING_CHECKPOINT:
+        return "지난 브리핑 이후 (--brief가 Dropbox를 마지막으로 확인한 때)"
+    return f"브리핑 기록이 없어 최근 {lookback_days}일 (LOOKBACK_DAYS)"
+
+
+def _included(stats: Mapping[str, int]) -> int:
+    return stats["changed_in_window"] - stats["excluded_mine"] - stats["excluded_unknown_modifier"]
 
 
 def run_dropbox_check(
@@ -137,14 +150,32 @@ def run_dropbox_check(
 
     classified = dropbox_tool.classify_files(entries, my_account_id, since)
     stats = dropbox_tool.tally(decision for _entry, decision in classified)
-    included = stats["changed_in_window"] - stats["excluded_mine"] - stats["excluded_unknown_modifier"]
+    included = _included(stats)
+    zone = config.get_timezone_name(env)
+    lookback_days = config.get_lookback_days(env)
     say("폴더: 있음")
     say(f"계정: {my_name}")
     say(
-        f"기간: {since.astimezone(tz):%Y-%m-%d %H:%M} ({config.get_timezone_name(env)}) 이후"
-        f" — 기준: {_basis_text(basis, hours or 0, config.get_lookback_days(env))}"
+        f"기간: {since.astimezone(tz):%Y-%m-%d %H:%M} ({zone}) 이후"
+        f" — 기준: {_basis_text(basis, hours or 0, lookback_days)}"
     )
+    if not hours:
+        # What the next --brief would look at. The checkpoint is only read here.
+        brief_since, brief_basis = dropbox_tool.resolve_window(0, store, now, env, briefing=True)
+        brief_stats = dropbox_tool.tally(
+            decision for _entry, decision in dropbox_tool.classify_files(entries, my_account_id, brief_since)
+        )
+        if brief_basis == BASIS_BRIEFING_CHECKPOINT:
+            when = f"{brief_since.astimezone(tz):%Y-%m-%d %H:%M} ({zone}) 이후 — --brief가 Dropbox를 마지막으로 확인한 때"
+        else:
+            when = f"기록 없음 — 다음 브리핑은 최근 {lookback_days}일(LOOKBACK_DAYS)을 봅니다"
+        say(f"브리핑 기준 시각: {when} (이 시각은 브리핑만 바꿉니다)")
+        say(f"  - 지금 브리핑하면 나올 공저자 파일: {_included(brief_stats)}개")
     say(f"훑어본 파일: {stats['scanned']}개 (하위 폴더 포함)")
+    say(
+        f"  - {DECISION_LABELS[EXCLUDED_TEMP]}: {stats['excluded_temp']}개 "
+        "(~$·.~lock.로 시작하는 파일, .DS_Store, *.tmp 등. 기간과 상관없이 먼저 뺌)"
+    )
     say(f"기간 안에 바뀐 파일: {stats['changed_in_window']}개")
     say(f"  - {DECISION_LABELS[INCLUDED]}: {included}개 (업뎃이 알려 주는 파일)")
     say(f"  - {DECISION_LABELS[EXCLUDED_MINE]}: {stats['excluded_mine']}개")
@@ -166,10 +197,16 @@ def run_dropbox_check(
         classified,
         key=lambda item: (-ensure_aware(item[0].server_modified).timestamp(), dropbox_tool.relative_path(item[0], root)),
     )
-    changed = [item for item in newest_first if item[1] != EXCLUDED_BEFORE_WINDOW]
+    # Temporary files are counted apart, but the table still shows the ones that changed in the window.
+    changed = [
+        item
+        for item in newest_first
+        if item[1] != EXCLUDED_BEFORE_WINDOW
+        and (item[1] != EXCLUDED_TEMP or ensure_aware(item[0].server_modified) > since)
+    ]
 
     say()
-    say(f"기간 안에 바뀐 파일 (최근 수정 순, 최대 {MAX_TABLE_ROWS}개):")
+    say(f"기간 안에 바뀐 파일 (최근 수정 순, 최대 {MAX_TABLE_ROWS}개, 임시 파일도 표시):")
     if changed:
         for line in format_table([row(*item) for item in changed[:MAX_TABLE_ROWS]]):
             say(line)

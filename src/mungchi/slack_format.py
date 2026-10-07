@@ -21,17 +21,31 @@ PLACEHOLDERS = {
 PLACEHOLDER_TEXT = PLACEHOLDERS[MUNGCHI]
 BRIEF_HEADER = "☀️ *오늘의 브리핑 ({date})*"
 
-SLACK_FORMAT_PROMPT = """\
+# One Dropbox subfolder, as the prompts show it: the folder's link exactly
+# once. In the terminal the bare link goes on the line under the folder name;
+# in Slack the folder name is bold and the link follows on the same line.
+EXAMPLE_FOLDER_LINK = "https://www.dropbox.com/home/20_%EC%97%B0%EA%B5%AC-%EC%A7%84%ED%96%89/01_Youn"
+SLACK_FOLDER_LINK_LABEL = "📂 열기"
+SLACK_FOLDER_LINE_EXAMPLE = f"• *01_Youn* <{EXAMPLE_FOLDER_LINK}|{SLACK_FOLDER_LINK_LABEL}>"
+
+SLACK_FORMAT_PROMPT = (
+    """\
 ## Slack 출력 (위 '출력' 지침보다 우선)
 이 대화는 Slack 메시지로 오가고, 네 답은 Slack 스레드에 그대로 올라간다. 답은 Slack mrkdwn 문법으로 쓴다.
 - 굵게는 *굵게*(별표 하나), 기울임은 _기울임_, 취소선은 ~취소선~ 으로 쓴다. **별표 두 개**는 쓰지 않는다.
 - 제목에 # 을 쓰지 않는다. 섹션 제목은 *① 공저자 업데이트* 처럼 굵은 한 줄로 쓴다.
 - 목록은 "• " 로 시작하는 짧은 줄로 쓰고, 들여쓰기는 한 단계까지만 한다.
 - Markdown 표를 쓰지 않는다. 표가 필요하면 목록으로 바꾼다.
-- 링크는 <https://example.com|보이는 글자> 형식으로 쓴다. [글자](주소) 형식은 쓰지 않는다. Dropbox 폴더 링크는 <주소|폴더 열기> 로 쓴다.
+- 링크는 <https://example.com|보이는 글자> 형식으로 쓴다. [글자](주소) 형식은 쓰지 않는다.
+- Dropbox 하위 폴더는 위에서 말한 '이름 다음 줄에 주소' 대신, 폴더 이름을 굵게 쓰고 그 뒤에 그 폴더의 link를 한 번만 붙여 한 줄로 쓴다. 예:
+"""
+    + SLACK_FOLDER_LINE_EXAMPLE
+    + """
+  '폴더 열기:' 같은 말을 링크 앞에 덧붙이거나 같은 링크를 두 번 쓰지 않는다. 사람별 파일 줄은 그 아래에 들여 쓴다.
 - 코드나 diff 조각은 ``` 로 감싼다.
 - @channel, @here 같은 전체 알림은 절대 쓰지 않는다.
 """
+)
 
 # ---------------------------------------------------------------- incoming text
 
@@ -109,6 +123,12 @@ _BOLD_ITALIC_RE = re.compile(r"\*\*\*(?=\S)(.+?)(?<=\S)\*\*\*")
 _BOLD_RE = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*")
 _STRIKE_RE = re.compile(r"~~(?=\S)(.+?)(?<=\S)~~")
 _LINK_RE = re.compile(r"\[([^\[\]\n]+)\]\(((?:https?://|mailto:)[^\s()<>]+)\)")
+# "폴더 열기: <url|폴더 열기>", possibly in parentheses, shows the same label twice in Slack
+# ("01_Youn (폴더 열기: 폴더 열기)"). The label in front of the link is dropped.
+_DUPLICATE_LABEL_RE = re.compile(
+    r"(\(\s*)?(?<![^\s(])([^\s()<>|:：][^()<>|:：\n]{0,40}?)\s*[:：]\s*"
+    r"<((?:https?://|mailto:)[^|>\s]+)\|\2>(\s*\))?"
+)
 # @channel/@here/@everyone pings and user-group pings are never sent by the bots.
 _BROADCAST_RE = re.compile(r"<!(here|channel|everyone)(?:\|[^>]*)?>")
 _SUBTEAM_RE = re.compile(r"<!subteam\^[A-Z0-9]+(?:\|([^>]*))?>")
@@ -125,8 +145,17 @@ def _outside_inline_code(line: str, convert: Callable[[str], str]) -> str:
     return "".join(out)
 
 
+def _drop_duplicate_label(match: re.Match[str]) -> str:
+    opened, label, url, closed = match.groups()
+    # Parentheses that wrapped only "label: <link>" go with the label; a lone one stays.
+    before = opened if opened and not closed else ""
+    after = closed if closed and not opened else ""
+    return f"{before}<{url}|{label}>{after}"
+
+
 def _inline(text: str) -> str:
     text = _LINK_RE.sub(lambda m: f"<{m.group(2)}|{m.group(1).replace('|', '/')}>", text)
+    text = _DUPLICATE_LABEL_RE.sub(_drop_duplicate_label, text)
     text = _BOLD_ITALIC_RE.sub(r"*_\1_*", text)
     text = _BOLD_RE.sub(r"*\1*", text)
     return _STRIKE_RE.sub(r"~\1~", text)
@@ -150,7 +179,8 @@ def to_mrkdwn(text: str) -> str:
     """Conservative Markdown -> Slack mrkdwn safety net.
 
     Converts ``**x**`` -> ``*x*``, ``# heading`` -> ``*heading*``,
-    ``[text](url)`` -> ``<url|text>`` (plus ``~~x~~`` and ``*``/``+`` bullets).
+    ``[text](url)`` -> ``<url|text>`` (plus ``~~x~~`` and ``*``/``+`` bullets),
+    and drops a label written twice (``폴더 열기: <url|폴더 열기>`` -> ``<url|폴더 열기>``).
     Code fences and inline code are left untouched. Broadcast pings
     (``<!channel>``, ``<!here>``, ...) are neutralized everywhere.
     """

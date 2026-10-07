@@ -800,6 +800,10 @@ async def post_briefing(
     so it reads without opening anything; longer briefings continue as
     replies in that message's thread. The thread is mapped to 고뭉치's
     briefing session, so mentioning @moongchi in it continues the conversation.
+
+    This is a briefing run (``briefing=True``): its Dropbox check looks at the
+    time since the last briefing and moves that checkpoint. A later mention in
+    the thread is an ordinary turn again.
     """
     tz = config.get_timezone(env)
     now = (now or datetime.now(tz)).astimezone(tz)
@@ -807,7 +811,11 @@ async def post_briefing(
     run = run or run_turn
     try:
         result = await run(
-            briefing_prompt(now, env), on_status=on_status, extra_system_prompt=SLACK_FORMAT_PROMPT, persona=MUNGCHI
+            briefing_prompt(now, env),
+            on_status=on_status,
+            extra_system_prompt=SLACK_FORMAT_PROMPT,
+            persona=MUNGCHI,
+            briefing=True,
         )
     except Exception as exc:  # noqa: BLE001
         _log_exception("브리핑을 만들지 못했습니다.", exc)

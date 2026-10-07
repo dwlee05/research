@@ -47,8 +47,8 @@ from mungchi.main import (
     run_turn,
     stamp_prompt,
 )
-from mungchi.slack_format import SLACK_FORMAT_PROMPT
-from mungchi.tools import ALL_TOOLS, CALENDAR_TOOL, DATA_TOOLS, DROPBOX_TOOL, SERVER_NAME, UPDATE_TOOLS
+from mungchi.slack_format import EXAMPLE_FOLDER_LINK, SLACK_FOLDER_LINE_EXAMPLE, SLACK_FORMAT_PROMPT, to_mrkdwn
+from mungchi.tools import ALL_TOOLS, CALENDAR_TOOL, DATA_TOOLS, DROPBOX_TOOL, SERVER_NAME, UPDATE_TOOLS, dropbox_tool
 from mungchi.tools.dropbox_tool import check_dropbox_updates
 
 NOW = datetime(2026, 10, 5, 8, 0, tzinfo=ZoneInfo("Asia/Seoul"))
@@ -351,7 +351,6 @@ def test_prompts_never_promise_content_summaries():
     for text in (MUNGCHI_SYSTEM_PROMPT, UPDATE_PROMPT, UPDATE_DESCRIPTION):
         assert "diff" not in text.replace("diff는 없다", "")
         assert "요약한다" not in text
-    assert "폴더 열기" in MUNGCHI_SYSTEM_PROMPT and "폴더 열기" in UPDATE_PROMPT
     assert "내용은 직접 확인해 주세요." in MUNGCHI_SYSTEM_PROMPT
     assert "내용은 직접 확인해 주세요." in UPDATE_PROMPT
     for key in ("groups", "by", "path", "modified", "omitted", "total_files", "link"):
@@ -366,9 +365,20 @@ def test_update_prompts_turn_periods_into_since_hours_and_explain_empty_results(
         assert '"최근 3일"' in prompt and "→ 72" in prompt
         assert '"오늘" → 오늘 0시' in prompt and '"이번 주" → 이번 주 월요일 0시' in prompt
         # Why nothing was found, from stats and since_basis.
-        for key in ("stats", "since_basis", "changed_in_window", "excluded_mine", "excluded_unknown_modifier", "last_check"):
+        for key in (
+            "stats",
+            "since_basis",
+            "changed_in_window",
+            "excluded_mine",
+            "excluded_unknown_modifier",
+            "default_24h",
+            "briefing_checkpoint",
+            "lookback_default",
+        ):
             assert key in prompt
-        assert "마지막 확인(10/06 14:20) 이후 바뀐 파일이 없어요" in prompt
+        assert "last_check" not in prompt and "마지막 확인" not in prompt
+        assert "최근 24시간 동안 공저자가 바꾼 파일이 없어요" in prompt
+        assert "지난 브리핑(10/06 07:50) 이후 바뀐 파일이 없어요" in prompt
         assert "기간 안에 바뀐 파일 5개는 모두 내가 수정했어요" in prompt
         assert "수정한 사람을 알 수 없어 뺐어요 (공유 폴더가 아닌 곳에 있을 수 있어요)" in prompt
 
@@ -387,6 +397,28 @@ def test_update_prompts_turn_periods_into_since_hours_and_explain_empty_results(
 
     description = SINCE_HOURS_SCHEMA["properties"]["since_hours"]["description"]
     assert "'최근 3일' → 72" in description and "'오늘'" in description and "'이번 주'" in description
+    assert "최근 24시간" in description and "마지막 확인" not in description
+    # 고뭉치 does not pick the mode either: without a period it leaves since_hours out.
+    assert "since_hours 없이 맡긴다" in mungchi and "마지막 확인" not in mungchi
+
+
+def test_folder_link_example_line_is_in_every_prompt_that_writes_one():
+    """One link per subfolder: never "(폴더 열기: 폴더 열기)" again."""
+    terminal_example = f"- 01_Youn\n  {EXAMPLE_FOLDER_LINK}\n  - 김공저: draft.tex (<modified>)"
+    assert terminal_example in build_update_prompt()  # 업뎃 reporting to 고뭉치
+    assert terminal_example in build_options(env={}, persona="update").system_prompt  # 업뎃 answering directly
+    assert terminal_example.replace("\n", "\n  ") in MUNGCHI_SYSTEM_PROMPT  # 고뭉치 relaying it, indented
+    assert SLACK_FOLDER_LINE_EXAMPLE == (
+        "• *01_Youn* <https://www.dropbox.com/home/20_%EC%97%B0%EA%B5%AC-%EC%A7%84%ED%96%89/01_Youn|📂 열기>"
+    )
+    for persona in ("mungchi", "update"):  # in Slack, the one-line form overrides the layout above
+        slack_prompt = build_options(env={}, persona=persona, extra_system_prompt=SLACK_FORMAT_PROMPT).system_prompt
+        assert "\n" + SLACK_FOLDER_LINE_EXAMPLE + "\n" in slack_prompt
+    for prompt in (MUNGCHI_SYSTEM_PROMPT, build_update_prompt(), build_update_prompt(direct=True), SLACK_FORMAT_PROMPT):
+        assert "(폴더 열기: <" not in prompt and "<주소|폴더 열기>" not in prompt and "<link>)" not in prompt
+        assert "'폴더 열기:' 같은 말을" in prompt
+    # The Slack safety net leaves the intended line alone.
+    assert to_mrkdwn(SLACK_FOLDER_LINE_EXAMPLE) == SLACK_FOLDER_LINE_EXAMPLE
 
 
 # ---------------------------------------------------------------- personas (direct 업뎃 / 일정)
@@ -442,7 +474,8 @@ def test_mungchi_options_are_unchanged_by_personas(server_spy):
     assert set(explicit.agents) == {"update", "schedule"}
     assert explicit.hooks["PreToolUse"][0].hooks == [tool_gate]
     assert TOOL_GATES["mungchi"] is tool_gate
-    assert server_spy == [None, None]  # 고뭉치's server keeps every data tool for its subagents
+    # 고뭉치's server keeps every data tool for its subagents (built for this run).
+    assert server_spy == [["check_dropbox_updates", "get_schedule"]] * 2
 
 
 def test_unknown_persona_is_rejected():
@@ -744,3 +777,58 @@ def test_chat_loop_puts_the_current_time_in_every_message(fake_sdk, monkeypatch,
         "[지금: 2026-10-07(수) 00:01 KST]\n내일 일정은?",
     ]
     assert client.options.system_prompt == build_options(persona="schedule").system_prompt
+
+
+# ---------------------------------------------------------------- briefing mode per run
+
+
+@pytest.fixture
+def server_tools(monkeypatch):
+    """The tool objects each built MCP server gets, in build order."""
+    built: list[list] = []
+    real = main_module.build_server
+
+    def spy(tools=None):
+        tools = None if tools is None else list(tools)
+        built.append(tools)
+        return real(tools)
+
+    monkeypatch.setattr(main_module, "build_server", spy)
+    return built
+
+
+def _dropbox_mode(tools, monkeypatch) -> bool:
+    """Call the run's Dropbox tool and report the briefing flag it passes to run_check."""
+    seen: list[bool] = []
+
+    def fake_run_check(since_hours=0, *, briefing=False):
+        seen.append(briefing)
+        return {"configured": False, "missing": [], "hint": ""}
+
+    monkeypatch.setattr(dropbox_tool, "run_check", fake_run_check)
+    [tool] = [t for t in tools if t.name == "check_dropbox_updates"]
+    asyncio.run(tool.handler({}))
+    return seen[-1]
+
+
+def test_only_the_brief_run_gets_a_briefing_dropbox_tool(fake_sdk, server_tools, monkeypatch, capsys):
+    assert main(["--brief"]) == 0
+    assert main(["어제 공저자들이 뭐 고쳤어?"]) == 0
+    assert main(["--agent", "update", "누가 무슨 파일 고쳤어?"]) == 0
+    asyncio.run(run_turn("업데이트 알려줘", extra_system_prompt=SLACK_FORMAT_PROMPT))  # a Slack turn
+    assert [_dropbox_mode(tools, monkeypatch) for tools in server_tools] == [True, False, False, False]
+    # Every run builds its own tool object, so a flag can never leak from one run to another.
+    dropbox_tools = [t for tools in server_tools for t in tools if t.name == "check_dropbox_updates"]
+    assert len({id(t) for t in dropbox_tools}) == 4
+    assert all(t is not check_dropbox_updates for t in dropbox_tools)
+
+
+def test_build_options_binds_briefing_into_its_own_server(server_tools, monkeypatch):
+    briefing = build_options(env={}, briefing=True)
+    ad_hoc = build_options(env={})
+    direct = build_options(env={}, persona="update", briefing=True)
+    assert [_dropbox_mode(tools, monkeypatch) for tools in server_tools] == [True, False, True]
+    # Apart from the server, the options are the same: nothing else depends on the mode.
+    for field in (*SAFETY_FIELDS, "system_prompt"):
+        assert getattr(briefing, field) == getattr(ad_hoc, field), field
+    assert direct.allowed_tools == [DROPBOX_TOOL]

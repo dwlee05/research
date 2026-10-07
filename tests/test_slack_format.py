@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -164,4 +166,37 @@ def test_default_limit_is_3500():
 
 
 def test_slack_prompt_formats_dropbox_folder_links():
-    assert "<주소|폴더 열기>" in SLACK_FORMAT_PROMPT
+    from mungchi.slack_format import SLACK_FOLDER_LINE_EXAMPLE
+
+    assert SLACK_FOLDER_LINE_EXAMPLE.startswith("• *01_Youn* <https://www.dropbox.com/home/")
+    assert SLACK_FOLDER_LINE_EXAMPLE.endswith("|📂 열기>")
+    assert "\n" + SLACK_FOLDER_LINE_EXAMPLE + "\n" in SLACK_FORMAT_PROMPT
+    assert "<주소|폴더 열기>" not in SLACK_FORMAT_PROMPT
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("• 01_Youn (폴더 열기: <https://x.y/a|폴더 열기>)", "• 01_Youn <https://x.y/a|폴더 열기>"),
+        ("- 01_Youn (폴더 열기: [폴더 열기](https://x.y/a))", "- 01_Youn <https://x.y/a|폴더 열기>"),
+        ("폴더 열기: <https://x.y/a|폴더 열기>", "<https://x.y/a|폴더 열기>"),
+        ("• 01_Youn 폴더 열기：<https://x.y/a|폴더 열기> 끝", "• 01_Youn <https://x.y/a|폴더 열기> 끝"),
+        ("(폴더 열기: <https://x.y/a|폴더 열기>", "(<https://x.y/a|폴더 열기>"),
+    ],
+)
+def test_mrkdwn_never_shows_a_link_label_twice(text, expected):
+    assert to_mrkdwn(text) == expected
+    assert to_mrkdwn(expected) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "• *01_Youn* <https://x.y/a|📂 열기>",
+        "참고: <https://x.y/a|문서>",  # different label: left alone
+        "• 01_Youn\n  https://x.y/a",  # terminal layout: plain URL on its own line
+        "a" * 5_000,
+    ],
+)
+def test_mrkdwn_keeps_single_labels_as_they_are(text):
+    assert to_mrkdwn(text) == text

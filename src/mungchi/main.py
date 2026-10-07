@@ -38,7 +38,7 @@ from .agents import (
     with_now_line,
 )
 from .personas import DIRECT_PERSONAS, MUNGCHI, PERSONA_LABELS, PERSONAS, SCHEDULE, UPDATE, josa
-from .tools import DATA_TOOLS, SERVER_NAME, build_server, tools_named
+from .tools import DATA_TOOLS, SERVER_NAME, build_server, data_tools, tools_named
 from .tools.common import scrub
 
 # Built-in tools that must never be reachable (belt and braces: ``tools``
@@ -225,6 +225,7 @@ def build_options(
     resume: str | None = None,
     extra_system_prompt: str = "",
     persona: str = MUNGCHI,
+    briefing: bool = False,
 ) -> ClaudeAgentOptions:
     """The single place where agent options are built (CLI and Slack).
 
@@ -235,6 +236,12 @@ def build_options(
 
     ``resume`` continues an earlier session by id; ``extra_system_prompt`` is
     appended to the system prompt (e.g. Slack formatting rules).
+
+    ``briefing=True`` (only the ``--brief`` paths) builds this run's Dropbox
+    tool in briefing mode: it looks at the time since the last briefing and
+    moves that checkpoint. The mode is bound to the tool objects of these
+    options, so it is fixed per run, never chosen by the model, and never
+    leaks into other runs of the same process.
 
     Nothing here depends on the clock: the system prompts carry no date or
     time, so they can be cached. The time is added per turn (``stamp_prompt``).
@@ -249,7 +256,7 @@ def build_options(
         # by the PreToolUse hook (``tool_gate``) and denied for 고뭉치 itself.
         allowed_tools = [SUBAGENT_TOOL]
         disallowed_tools = list(BLOCKED_BUILTINS)
-        server = build_server()
+        server = build_server(data_tools(briefing=briefing))
         agents = build_agents()
     else:
         system_prompt = build_direct_prompt(persona)
@@ -259,7 +266,7 @@ def build_options(
         # the persona's PreToolUse gate denies everything else.
         allowed_tools = list(PERSONA_TOOLS[persona])
         disallowed_tools = [*BLOCKED_BUILTINS, SUBAGENT_TOOL]
-        server = build_server(tools_named(allowed_tools))
+        server = build_server(tools_named(allowed_tools, briefing=briefing))
         agents = None
     if extra_system_prompt.strip():
         system_prompt += "\n" + extra_system_prompt.strip() + "\n"
@@ -450,6 +457,7 @@ async def run_turn(
     renderer: Renderer | None = None,
     persona: str = MUNGCHI,
     clock: Clock | None = None,
+    briefing: bool = False,
 ) -> TurnResult:
     """Run one turn of ``persona`` in a fresh session (or ``resume`` an earlier one).
 
@@ -457,15 +465,18 @@ async def run_turn(
     ``on_status`` receives the same status lines the CLI prints, e.g.
     "→ 업뎃에게 맡기는 중...". Without ``renderer`` nothing is printed.
     The prompt is sent with the current time in front (``stamp_prompt``).
+    ``briefing=True`` only for briefing runs (see ``build_options``).
     """
-    options = build_options(resume=resume, extra_system_prompt=extra_system_prompt, persona=persona)
+    options = build_options(
+        resume=resume, extra_system_prompt=extra_system_prompt, persona=persona, briefing=briefing
+    )
     renderer = renderer or Renderer(echo=False)
     async with ClaudeSDKClient(options=options) as client:
         return await stream_turn(client, stamp_prompt(prompt, clock), renderer, on_status)
 
 
-async def run_once(prompt: str, persona: str = MUNGCHI) -> int:
-    result = await run_turn(prompt, renderer=Renderer(), persona=persona)
+async def run_once(prompt: str, persona: str = MUNGCHI, *, briefing: bool = False) -> int:
+    result = await run_turn(prompt, renderer=Renderer(), persona=persona, briefing=briefing)
     return 1 if result.failed else 0
 
 
@@ -588,14 +599,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "업뎃이 Dropbox 변경을 못 찾을 때 원인을 확인합니다: 폴더·계정, 기간 안에 바뀐 파일마다 "
             "포함/제외 이유, 기간과 상관없이 최근에 바뀐 파일 (읽기 전용, Claude API는 쓰지 않고 "
-            "마지막 확인 시각도 바꾸지 않음)"
+            "브리핑 기준 시각도 바꾸지 않음)"
         ),
     )
     opts.add_argument(
         "--hours",
         type=int,
         metavar="N",
-        help="--dropbox-check와 함께: 최근 N시간을 봅니다 (없으면 마지막 확인 이후, 기록이 없으면 LOOKBACK_DAYS일)",
+        help="--dropbox-check와 함께: 최근 N시간을 봅니다 (없으면 최근 24시간을 보고, 브리핑 기준 시각도 함께 보여 줌)",
     )
     opts.add_argument("-h", "--help", action="help", help="이 도움말을 보여 주고 끝냅니다")
     return parser
@@ -713,7 +724,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             return post_briefing_cli()
         if args.brief:
-            return asyncio.run(run_once(briefing_prompt()))
+            # The only briefing run in the terminal: it alone moves the Dropbox checkpoint.
+            return asyncio.run(run_once(briefing_prompt(), briefing=True))
         if args.question:
             return asyncio.run(run_once(args.question, persona))
         return asyncio.run(run_chat(build_options(persona=persona), persona))

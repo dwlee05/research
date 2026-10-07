@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import threading
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -20,15 +21,19 @@ from mungchi.tools import dropbox_tool
 from mungchi.tools.dropbox_tool import (
     EXCLUDED_BEFORE_WINDOW,
     EXCLUDED_MINE,
+    EXCLUDED_TEMP,
     EXCLUDED_UNKNOWN_MODIFIER,
     INCLUDED,
     MAX_LISTED_FILES,
+    TEMP_FILE_PATTERNS,
     UNKNOWN_MODIFIER,
     check_dropbox_updates,
     classify_entry,
     classify_modifier,
     collect_updates,
     folder_link,
+    is_temp_file,
+    make_check_dropbox_updates,
     normalize_root,
     relative_path,
     run_check,
@@ -53,7 +58,7 @@ _rev_counter = iter(range(0x100000000, 0x1FFFFFFFF))
 ALLOWED_KEYS = {
     "configured", "folder", "since", "since_basis", "total_files", "stats", "groups", "omitted",
     "subfolder", "link", "by", "name", "files", "path", "modified",
-    "scanned", "changed_in_window", "excluded_mine", "excluded_unknown_modifier",
+    "scanned", "changed_in_window", "excluded_mine", "excluded_unknown_modifier", "excluded_temp",
 }
 
 
@@ -170,9 +175,21 @@ def test_classify_entry_gives_exactly_one_decision():
 
 
 def test_tally_counts_decisions():
-    decisions = [INCLUDED, INCLUDED, EXCLUDED_MINE, EXCLUDED_UNKNOWN_MODIFIER, EXCLUDED_BEFORE_WINDOW]
-    assert tally(decisions) == {"scanned": 5, "changed_in_window": 4, "excluded_mine": 1, "excluded_unknown_modifier": 1}
-    assert tally([]) == {"scanned": 0, "changed_in_window": 0, "excluded_mine": 0, "excluded_unknown_modifier": 0}
+    decisions = [INCLUDED, INCLUDED, EXCLUDED_MINE, EXCLUDED_UNKNOWN_MODIFIER, EXCLUDED_BEFORE_WINDOW, EXCLUDED_TEMP]
+    assert tally(decisions) == {
+        "scanned": 6,
+        "changed_in_window": 4,  # temporary files are taken out before the window
+        "excluded_mine": 1,
+        "excluded_unknown_modifier": 1,
+        "excluded_temp": 1,
+    }
+    assert tally([]) == {
+        "scanned": 0,
+        "changed_in_window": 0,
+        "excluded_mine": 0,
+        "excluded_unknown_modifier": 0,
+        "excluded_temp": 0,
+    }
 
 
 def test_normalize_root_handles_korean_hyphen_and_slashes():
@@ -229,7 +246,13 @@ def test_collect_updates_output_shape_order_and_time_format():
         "since": "2026-10-01T09:00+09:00",
         "total_files": 5,
         # 8 files (the folder is not counted); old.tex is before the window.
-        "stats": {"scanned": 8, "changed_in_window": 7, "excluded_mine": 1, "excluded_unknown_modifier": 1},
+        "stats": {
+            "scanned": 8,
+            "changed_in_window": 7,
+            "excluded_mine": 1,
+            "excluded_unknown_modifier": 1,
+            "excluded_temp": 0,
+        },
         "groups": [
             {
                 "subfolder": "Paper-B",
@@ -319,7 +342,7 @@ def test_default_root_folder_when_unset_or_empty(tmp_path):
         assert cfg.configured and cfg.missing == []
         assert cfg.root_folder == "/20_연구-진행"
 
-    dbx = FakeDropbox([fm(f"{ROOT}/논문A/a.tex", at(3), modified_by=KIM)], names={KIM: "김공저"})
+    dbx = FakeDropbox([fm(f"{ROOT}/논문A/a.tex", at(4), modified_by=KIM)], names={KIM: "김공저"})
     store = StateStore(tmp_path / "state.json")
     payload = run_check(env=env_with(), now=NOW, client_factory=lambda cfg: dbx, store=store)
     assert dbx.listed_paths == ["/20_연구-진행"]
@@ -329,7 +352,7 @@ def test_default_root_folder_when_unset_or_empty(tmp_path):
 
 @pytest.mark.parametrize("raw", ["20_연구-진행", "/20_연구-진행/", "20_연구-진행/"])
 def test_configured_root_is_normalized(raw, tmp_path):
-    dbx = FakeDropbox([fm(f"{ROOT}/논문A/a.tex", at(3), modified_by=KIM)], names={KIM: "김공저"})
+    dbx = FakeDropbox([fm(f"{ROOT}/논문A/a.tex", at(4), modified_by=KIM)], names={KIM: "김공저"})
     store = StateStore(tmp_path / "state.json")
     env = env_with(DROPBOX_ROOT_FOLDER=raw)
     payload = run_check(env=env, now=NOW, client_factory=lambda cfg: dbx, store=store)
@@ -363,7 +386,7 @@ def test_tool_handler_unconfigured_returns_json():
 
 def test_tool_handler_returns_compact_list_only_json(monkeypatch):
     monkeypatch.setenv("DROPBOX_ACCESS_TOKEN", TOKEN)
-    dbx = FakeDropbox([fm(f"{ROOT}/논문A/a.tex", at(3), modified_by=KIM, size=123_456)], names={KIM: "김공저"})
+    dbx = FakeDropbox([fm(f"{ROOT}/논문A/a.tex", at(4), modified_by=KIM, size=123_456)], names={KIM: "김공저"})
     monkeypatch.setattr(dropbox_tool, "make_client", lambda cfg: dbx)
     monkeypatch.setattr(dropbox_tool, "utcnow", lambda: NOW)
     result = asyncio.run(check_dropbox_updates.handler({}))
@@ -371,30 +394,92 @@ def test_tool_handler_returns_compact_list_only_json(monkeypatch):
     data = json.loads(text)
     assert set(data) == {"configured", "folder", "since", "since_basis", "total_files", "stats", "groups", "omitted"}
     assert set(all_keys(data)) <= ALLOWED_KEYS
-    assert data["groups"][0]["by"] == [{"name": "김공저", "files": [{"path": "a.tex", "modified": "2026-10-03 18:00"}]}]
+    assert data["since_basis"] == "default_24h"
+    assert data["groups"][0]["by"] == [{"name": "김공저", "files": [{"path": "a.tex", "modified": "2026-10-04 18:00"}]}]
     assert "논문A" in text and "123456" not in text
     assert dbx.forbidden == []
 
 
-def test_run_check_uses_and_updates_state(tmp_path):
-    store = StateStore(tmp_path / "state.json")
-    last = datetime(2026, 10, 3, 0, 0, tzinfo=timezone.utc)
-    store.mark_checked("dropbox", last)
-    entries = [
-        fm(f"{ROOT}/논문A/fig.png", at(2), modified_by=KIM),  # before last check
-        fm(f"{ROOT}/논문A/fig2.png", at(4), modified_by=KIM),
+CHECKPOINT = datetime(2026, 10, 2, 0, 0, tzinfo=timezone.utc)  # 10-02 09:00 in Seoul, 72 hours before NOW
+
+
+def checkpoint_entries():
+    return [
+        fm(f"{ROOT}/논문A/fig.png", at(1, 12), modified_by=KIM),  # before the checkpoint
+        fm(f"{ROOT}/논문A/fig2.png", at(3), modified_by=KIM),  # after the checkpoint, before the last 24 hours
+        fm(f"{ROOT}/논문A/fig3.png", at(4, 6), modified_by=KIM),  # in the last 24 hours
     ]
-    dbx = FakeDropbox(entries, names={KIM: "김공저"})
+
+
+def test_ad_hoc_run_uses_the_last_24_hours_and_never_writes_state(tmp_path):
+    state_file = tmp_path / "state.json"
+    dbx = FakeDropbox(checkpoint_entries(), names={KIM: "김공저"})
+    payload = run_check(env=env_with(), now=NOW, client_factory=lambda cfg: dbx, store=StateStore(state_file))
+    assert payload["since_basis"] == "default_24h" and payload["since"] == "2026-10-04T09:00+09:00"
+    assert [f["path"] for g in payload["groups"] for p in g["by"] for f in p["files"]] == ["fig3.png"]
+    assert not state_file.exists()  # nothing written, not even a file
+
+    # A stored briefing checkpoint is ignored and left alone.
+    store = StateStore(state_file)
+    store.mark_checked("dropbox", CHECKPOINT)
     payload = run_check(env=env_with(), now=NOW, client_factory=lambda cfg: dbx, store=store)
-    assert payload["total_files"] == 1
-    assert payload["since"] == "2026-10-03T09:00+09:00"
+    assert payload["since_basis"] == "default_24h" and payload["total_files"] == 1
+    assert store.last_checked("dropbox") == CHECKPOINT
+
+
+def test_briefing_run_uses_the_checkpoint_and_moves_it(tmp_path):
+    store = StateStore(tmp_path / "state.json")
+    store.mark_checked("dropbox", CHECKPOINT)
+    dbx = FakeDropbox(checkpoint_entries(), names={KIM: "김공저"})
+    payload = run_check(env=env_with(), now=NOW, client_factory=lambda cfg: dbx, store=store, briefing=True)
+    assert payload["since_basis"] == "briefing_checkpoint" and payload["since"] == "2026-10-02T09:00+09:00"
+    assert payload["total_files"] == 2
     assert store.last_checked("dropbox") == NOW
+
+    # The next briefing starts where this one stopped.
+    again = run_check(env=env_with(), now=NOW, client_factory=lambda cfg: dbx, store=store, briefing=True)
+    assert again["since_basis"] == "briefing_checkpoint" and again["total_files"] == 0
+
+
+def test_first_briefing_falls_back_to_lookback_days(tmp_path):
+    store = StateStore(tmp_path / "state.json")
+    dbx = FakeDropbox(checkpoint_entries(), names={KIM: "김공저"})
+    env = env_with(LOOKBACK_DAYS="3")
+    payload = run_check(env=env, now=NOW, client_factory=lambda cfg: dbx, store=store, briefing=True)
+    assert payload["since_basis"] == "lookback_default" and payload["since"] == "2026-10-02T09:00+09:00"
+    assert store.last_checked("dropbox") == NOW
+
+
+def test_since_hours_overrides_and_never_moves_the_checkpoint(tmp_path):
+    store = StateStore(tmp_path / "state.json")
+    store.mark_checked("dropbox", CHECKPOINT)
+    dbx = FakeDropbox(checkpoint_entries(), names={KIM: "김공저"})
+    for briefing in (False, True):
+        payload = run_check(
+            since_hours=24 * 7, env=env_with(), now=NOW, client_factory=lambda cfg: dbx, store=store, briefing=briefing
+        )
+        assert payload["since_basis"] == "since_hours" and payload["since"] == "2026-09-28T09:00+09:00"
+        assert payload["total_files"] == 3
+        assert store.last_checked("dropbox") == CHECKPOINT
+
+
+def test_failed_briefing_check_keeps_the_checkpoint(tmp_path):
+    store = StateStore(tmp_path / "state.json")
+    store.mark_checked("dropbox", CHECKPOINT)
+
+    def boom(cfg):
+        raise RuntimeError("network down")
+
+    payload = run_check(env=env_with(), now=NOW, client_factory=boom, store=store, briefing=True)
+    assert payload["ok"] is False
+    assert store.last_checked("dropbox") == CHECKPOINT
 
 
 def test_run_check_reports_since_basis_and_stats(tmp_path):
     entries = [
         fm(f"{ROOT}/논문A/mine.tex", at(4), modified_by=ME),
         fm(f"{ROOT}/개인/notes.txt", at(4), shared=False),
+        fm(f"{ROOT}/논문A/~$draft.docx", at(4), modified_by=KIM),
         fm(f"{ROOT}/논문A/old.tex", datetime(2026, 9, 1), modified_by=KIM),
     ]
     store = StateStore(tmp_path / "state.json")
@@ -403,14 +488,27 @@ def test_run_check_reports_since_basis_and_stats(tmp_path):
         dbx = FakeDropbox(entries, names={KIM: "김공저"})
         return run_check(env=env_with(), now=NOW, client_factory=lambda cfg: dbx, store=store, **kwargs)
 
-    first = check()  # no record yet: LOOKBACK_DAYS (7 days)
-    assert first["since_basis"] == "lookback_default" and first["since"] == "2026-09-28T09:00+09:00"
-    assert first["total_files"] == 0 and first["groups"] == []
-    assert first["stats"] == {"scanned": 3, "changed_in_window": 2, "excluded_mine": 1, "excluded_unknown_modifier": 1}
+    ad_hoc = check()
+    assert ad_hoc["since_basis"] == "default_24h" and ad_hoc["total_files"] == 0 and ad_hoc["groups"] == []
+    assert ad_hoc["stats"] == {
+        "scanned": 4,
+        "changed_in_window": 2,
+        "excluded_mine": 1,
+        "excluded_unknown_modifier": 1,
+        "excluded_temp": 1,
+    }
 
-    second = check()  # the first check moved the checkpoint to NOW
-    assert second["since_basis"] == "last_check" and second["since"] == "2026-10-05T09:00+09:00"
-    assert second["stats"] == {"scanned": 3, "changed_in_window": 0, "excluded_mine": 0, "excluded_unknown_modifier": 0}
+    first = check(briefing=True)  # no checkpoint yet: LOOKBACK_DAYS (7 days)
+    assert first["since_basis"] == "lookback_default" and first["since"] == "2026-09-28T09:00+09:00"
+    second = check(briefing=True)  # the first briefing moved the checkpoint to NOW
+    assert second["since_basis"] == "briefing_checkpoint" and second["since"] == "2026-10-05T09:00+09:00"
+    assert second["stats"] == {
+        "scanned": 4,
+        "changed_in_window": 0,
+        "excluded_mine": 0,
+        "excluded_unknown_modifier": 0,
+        "excluded_temp": 1,
+    }
 
     asked = check(since_hours=24 * 90)
     assert asked["since_basis"] == "since_hours" and asked["since"] == "2026-07-07T09:00+09:00"
@@ -449,17 +547,19 @@ def test_make_client_prefers_refresh_token_trio():
 
 # ---------------------------------------------------------------- --dropbox-check
 
-LAST_CHECK = datetime(2026, 10, 3, 0, 0, tzinfo=timezone.utc)  # 10-03 09:00 in Seoul
+LAST_CHECK = datetime(2026, 10, 3, 0, 0, tzinfo=timezone.utc)  # 10-03 09:00 in Seoul: the briefing checkpoint, NOW - 48h
 
 
 def diagnosis_entries():
     return [
         FolderMetadata(name="논문A", path_lower=f"{ROOT}/논문a", path_display=f"{ROOT}/논문A", id="id:folder00"),
+        fm(f"{ROOT}/논문A/~$intro.docx", at(4, 4), modified_by=KIM),  # 10-04 13:00 Seoul, Word owner file
         fm(f"{ROOT}/논문A/intro.tex", at(4, 1), modified_by=KIM),  # 10-04 10:00 Seoul
         fm(f"{ROOT}/논문A/mine.tex", at(4, 2), modified_by=ME),  # 10-04 11:00
         fm(f"{ROOT}/개인/notes.txt", at(4, 3), shared=False),  # 10-04 12:00
         fm(f"{ROOT}/Paper-B/refs.bib", at(3, 5), modified_by=None),  # 10-03 14:00, shared, modifier unknown
-        fm(f"{ROOT}/논문A/old.tex", at(2, 9), modified_by=PARK),  # 10-02 18:00, before the last check
+        fm(f"{ROOT}/논문A/old.tex", at(2, 9), modified_by=PARK),  # 10-02 18:00, before the checkpoint
+        fm(f"{ROOT}/.DS_Store", at(2, 1), shared=False),  # 10-02 10:00
         *[fm(f"{ROOT}/Archive/a{i}.txt", at(1, i), modified_by=KIM) for i in range(1, 9)],  # 10-01 10:00..17:00
     ]
 
@@ -482,38 +582,46 @@ def table_after(text, title):
     return [tuple(cell.strip() for cell in line.split(" | ")) for line in lines]
 
 
+HEADER = ("경로", "수정 시각", "수정한 사람", "공유 폴더", "판정")
+TEMP_ROW = ("논문A/~$intro.docx", "10-04 13:00", "김공저", "예", "제외: 임시 파일")
+
+
 def test_dropbox_check_explains_every_file_without_moving_the_checkpoint(tmp_path):
     state_file = tmp_path / "state.json"
-    code, out, store = run_diagnosis(diagnosis_entries(), tmp_path)
+    code, out, store = run_diagnosis(diagnosis_entries(), tmp_path, hours=48)
     assert code == 0
     assert out.startswith("Dropbox 변경 확인 진단 (읽기 전용")
+    assert "브리핑 기준 시각도 바꾸지 않습니다" in out.splitlines()[0]
     for line in (
         "확인할 폴더: /20_연구-진행 (기본값)",
         "폴더: 있음",
         "계정: 나연구",
-        "기간: 2026-10-03 09:00 (Asia/Seoul) 이후 — 기준: 마지막 확인 시각 (고뭉치·업뎃이 Dropbox를 마지막으로 확인한 때)",
-        "훑어본 파일: 13개 (하위 폴더 포함)",
+        "기간: 2026-10-03 09:00 (Asia/Seoul) 이후 — 기준: --hours 48 (최근 48시간)",
+        "훑어본 파일: 15개 (하위 폴더 포함)",
+        "  - 제외: 임시 파일: 2개 (~$·.~lock.로 시작하는 파일, .DS_Store, *.tmp 등. 기간과 상관없이 먼저 뺌)",
         "기간 안에 바뀐 파일: 4개",
         "  - 포함: 2개 (업뎃이 알려 주는 파일)",
         "  - 제외: 내가 수정: 1개",
         "  - 제외: 수정자 정보 없음(공유 폴더 아님): 1개",
     ):
         assert line + "\n" in out
+    assert "\n브리핑 기준 시각:" not in out  # only without --hours
 
-    header = ("경로", "수정 시각", "수정한 사람", "공유 폴더", "판정")
     changed = [
         ("개인/notes.txt", "10-04 12:00", "(정보 없음)", "아니오", "제외: 수정자 정보 없음(공유 폴더 아님)"),
         ("논문A/mine.tex", "10-04 11:00", "나연구", "예", "제외: 내가 수정"),
         ("논문A/intro.tex", "10-04 10:00", "김공저", "예", "포함"),
         ("Paper-B/refs.bib", "10-03 14:00", "(정보 없음)", "예", "포함"),
     ]
-    assert table_after(out, "기간 안에 바뀐 파일 (최근 수정 순") == [header, *changed]
+    # The temporary file changed in the window, so it is listed with its own label.
+    assert table_after(out, "기간 안에 바뀐 파일 (최근 수정 순") == [HEADER, TEMP_ROW, *changed]
 
     recent = table_after(out, "기간과 상관없이 가장 최근에 바뀐 파일 10개")
-    assert recent[0] == header and len(recent) == 11
-    assert recent[1:5] == changed
-    assert recent[5] == ("논문A/old.tex", "10-02 18:00", "박공저", "예", "제외: 기간 이전 (기준 시각 이전)")
-    assert [row[0] for row in recent[6:]] == [f"Archive/a{i}.txt" for i in (8, 7, 6, 5, 4)]
+    assert recent[0] == HEADER and len(recent) == 11
+    assert recent[1:6] == [TEMP_ROW, *changed]
+    assert recent[6] == ("논문A/old.tex", "10-02 18:00", "박공저", "예", "제외: 기간 이전 (기준 시각 이전)")
+    assert recent[7] == (".DS_Store", "10-02 10:00", "(정보 없음)", "아니오", "제외: 임시 파일")
+    assert [row[0] for row in recent[8:]] == [f"Archive/a{i}.txt" for i in (8, 7, 6)]
 
     assert out.rstrip().splitlines()[-1].startswith("참고: 삭제·이동·이름 바꾸기는 감지하지 않습니다.")
     # Read-only: the checkpoint is where it was, and no token is printed.
@@ -522,36 +630,72 @@ def test_dropbox_check_explains_every_file_without_moving_the_checkpoint(tmp_pat
     assert TOKEN not in out
 
 
+def test_dropbox_check_without_hours_shows_24h_and_the_briefing_checkpoint(tmp_path):
+    state_file = tmp_path / "state.json"
+    code, out, store = run_diagnosis(diagnosis_entries(), tmp_path)
+    assert code == 0
+    lines = out.splitlines()
+    period = lines.index("기간: 2026-10-04 09:00 (Asia/Seoul) 이후 — 기준: 최근 24시간 (기간 없이 업뎃·고뭉치에게 물을 때와 같음)")
+    assert lines[period + 1 : period + 3] == [
+        "브리핑 기준 시각: 2026-10-03 09:00 (Asia/Seoul) 이후 — --brief가 Dropbox를 마지막으로 확인한 때 "
+        "(이 시각은 브리핑만 바꿉니다)",
+        "  - 지금 브리핑하면 나올 공저자 파일: 2개",  # intro.tex and refs.bib
+    ]
+    assert "기간 안에 바뀐 파일: 3개" in lines and "  - 포함: 1개 (업뎃이 알려 주는 파일)" in lines
+    assert [row[0] for row in table_after(out, "기간 안에 바뀐 파일 (최근 수정 순")[1:]] == [
+        "논문A/~$intro.docx",
+        "개인/notes.txt",
+        "논문A/mine.tex",
+        "논문A/intro.tex",
+    ]
+    assert store.last_checked("dropbox") == LAST_CHECK
+    assert json.loads(state_file.read_text(encoding="utf-8")) == {"last_checked": {"dropbox": LAST_CHECK.isoformat()}}
+
+    fresh = tmp_path / "fresh"
+    code, out, _store = run_diagnosis(diagnosis_entries(), fresh, last_check=None, env=env_with(LOOKBACK_DAYS="3"))
+    assert code == 0
+    assert (
+        "브리핑 기준 시각: 기록 없음 — 다음 브리핑은 최근 3일(LOOKBACK_DAYS)을 봅니다 (이 시각은 브리핑만 바꿉니다)\n"
+        "  - 지금 브리핑하면 나올 공저자 파일: 3개\n"  # old.tex (10-02 18:00) is inside 3 days
+    ) in out
+    assert not (fresh / "state.json").exists()  # nothing written
+
+
 def test_dropbox_check_matches_what_the_tool_reports(tmp_path):
     entries = diagnosis_entries()
-    _code, out, _store = run_diagnosis(entries, tmp_path)
 
+    def reported(payload):
+        return {f"{g['subfolder']}/{f['path']}" for g in payload["groups"] for p in g["by"] for f in p["files"]}
+
+    def included(out):
+        return {row[0] for row in table_after(out, "기간 안에 바뀐 파일 (최근 수정 순")[1:] if row[4] == "포함"}
+
+    # Without --hours: what 업뎃 reports when asked without a period (last 24 hours).
+    _code, out, _store = run_diagnosis(entries, tmp_path / "a")
+    dbx = FakeDropbox(entries, names={KIM: "김공저", PARK: "박공저"})
+    payload = run_check(env=env_with(), now=NOW, client_factory=lambda cfg: dbx, store=StateStore(tmp_path / "x.json"))
+    assert reported(payload) == included(out) == {"논문A/intro.tex"}
+
+    # --hours 48 covers the same window as a briefing from the 48-hour-old checkpoint.
+    _code, out, _store = run_diagnosis(entries, tmp_path / "b", hours=48)
     tool_store = StateStore(tmp_path / "tool-state.json")
     tool_store.mark_checked("dropbox", LAST_CHECK)
     dbx = FakeDropbox(entries, names={KIM: "김공저", PARK: "박공저"})
-    payload = run_check(env=env_with(), now=NOW, client_factory=lambda cfg: dbx, store=tool_store)
-
-    reported = {f"{g['subfolder']}/{f['path']}" for g in payload["groups"] for p in g["by"] for f in p["files"]}
-    included = {row[0] for row in table_after(out, "기간 안에 바뀐 파일 (최근 수정 순")[1:] if row[4] == "포함"}
-    assert reported == included == {"논문A/intro.tex", "Paper-B/refs.bib"}
+    payload = run_check(env=env_with(), now=NOW, client_factory=lambda cfg: dbx, store=tool_store, briefing=True)
+    assert reported(payload) == included(out) == {"논문A/intro.tex", "Paper-B/refs.bib"}
     stats = payload["stats"]
     assert f"훑어본 파일: {stats['scanned']}개" in out
     assert f"기간 안에 바뀐 파일: {stats['changed_in_window']}개" in out
     assert f"제외: 내가 수정: {stats['excluded_mine']}개" in out
+    assert f"제외: 임시 파일: {stats['excluded_temp']}개" in out
 
 
-def test_dropbox_check_window_from_hours_or_lookback(tmp_path):
+def test_dropbox_check_window_from_hours(tmp_path):
     code, out, store = run_diagnosis(diagnosis_entries(), tmp_path, hours=72)
     assert code == 0
     assert "기간: 2026-10-02 09:00 (Asia/Seoul) 이후 — 기준: --hours 72 (최근 72시간)" in out
-    assert "기간 안에 바뀐 파일: 5개" in out  # old.tex (10-02 18:00) is now inside
+    assert "기간 안에 바뀐 파일: 5개" in out  # old.tex (10-02 18:00) is now inside; .DS_Store (10-02 10:00) is not counted
     assert store.last_checked("dropbox") == LAST_CHECK
-
-    no_record = tmp_path / "fresh"
-    code, out, store = run_diagnosis(diagnosis_entries(), no_record, last_check=None, env=env_with(LOOKBACK_DAYS="3"))
-    assert code == 0
-    assert "기간: 2026-10-02 09:00 (Asia/Seoul) 이후 — 기준: 확인 기록이 없어 최근 3일 (LOOKBACK_DAYS)" in out
-    assert not (no_record / "state.json").exists()  # nothing written
 
 
 class MissingFolderDropbox(FakeDropbox):
@@ -614,3 +758,116 @@ def test_cli_dropbox_check_dispatch_help_and_conflicts(monkeypatch, capsys):
     assert "--dropbox-check는 질문이나 다른 옵션" in err
     assert "--hours는 --dropbox-check와 함께 써야 합니다" in err
     assert "--hours에는 1 이상의 정수" in err
+
+
+# ---------------------------------------------------------------- temporary and lock files
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "~$draft.docx",
+        "~$슬라이드.pptx",
+        "~WRL0001.tmp",
+        "~draft.tex",
+        ".~lock.data.xlsx#",
+        ".DS_Store",
+        ".ds_store",
+        "Thumbs.db",
+        "desktop.ini",
+        "Desktop.INI",
+        "Icon\r",
+        "analysis.do.stswp",
+        "model.STSWP",
+        "upload.tmp",
+        "cache.temp",
+        ".main.tex.swp",
+        ".main.tex.swo",
+    ],
+)
+def test_temp_and_lock_files_are_recognised(name):
+    assert is_temp_file(name)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["draft.docx", "main.tex", "data.xlsx", "Icon.png", "temperature.csv", "tmp_results.csv", "notes~.txt", "a.swap", ""],
+)
+def test_ordinary_files_are_not_temp_files(name):
+    assert not is_temp_file(name)
+
+
+def test_temp_patterns_live_in_one_constant():
+    assert TEMP_FILE_PATTERNS == (
+        "~*",
+        ".~lock.*",
+        ".DS_Store",
+        "Thumbs.db",
+        "desktop.ini",
+        "Icon\r",
+        "*.stswp",
+        "*.tmp",
+        "*.temp",
+        "*.swp",
+        "*.swo",
+    )
+
+
+def test_temp_files_are_excluded_before_classification_and_counted():
+    entries = [
+        fm(f"{ROOT}/논문A/main.tex", at(4), modified_by=KIM),
+        fm(f"{ROOT}/논문A/~$main.docx", at(4, 1), modified_by=KIM),  # in the window, by a co-author
+        fm(f"{ROOT}/논문A/.~lock.data.xlsx#", at(4, 2), modified_by=PARK),
+        fm(f"{ROOT}/분석/model.do.stswp", at(4, 3), modified_by=ME),
+        fm(f"{ROOT}/.DS_Store", datetime(2026, 9, 1), shared=False),  # long before the window
+    ]
+    assert classify_entry(entries[1], ME, SINCE) == EXCLUDED_TEMP
+    assert classify_entry(entries[4], ME, SINCE) == EXCLUDED_TEMP  # temp wins over "before the window"
+    dbx = FakeDropbox(entries, names={KIM: "김공저", PARK: "박공저"})
+    payload = collect_updates(dbx, ROOT, SINCE, SEOUL, name_cache={})
+    assert payload["total_files"] == 1
+    assert [f["path"] for g in payload["groups"] for p in g["by"] for f in p["files"]] == ["main.tex"]
+    assert payload["stats"] == {
+        "scanned": 5,
+        "changed_in_window": 1,
+        "excluded_mine": 0,
+        "excluded_unknown_modifier": 0,
+        "excluded_temp": 4,
+    }
+
+
+# ---------------------------------------------------------------- briefing mode is bound per run
+
+
+def test_concurrent_briefing_and_ad_hoc_runs_keep_their_own_modes(tmp_path, monkeypatch):
+    """Tools run in-process: two runs at once must not share a briefing flag."""
+    state_file = tmp_path / "state.json"
+    StateStore(state_file).mark_checked("dropbox", CHECKPOINT)
+    monkeypatch.setenv("DROPBOX_ACCESS_TOKEN", TOKEN)
+    monkeypatch.setenv("MUNGCHI_STATE_FILE", str(state_file))
+    monkeypatch.setattr(dropbox_tool, "utcnow", lambda: NOW)
+    both_listing = threading.Barrier(2, timeout=5)
+
+    class OverlappingDropbox(FakeDropbox):
+        def files_list_folder(self, path, recursive=False):
+            both_listing.wait()  # each run waits until the other one is in flight too
+            return super().files_list_folder(path, recursive=recursive)
+
+    monkeypatch.setattr(
+        dropbox_tool, "make_client", lambda cfg: OverlappingDropbox(checkpoint_entries(), names={KIM: "김공저"})
+    )
+    briefing_tool = make_check_dropbox_updates(briefing=True)
+    ad_hoc_tool = make_check_dropbox_updates()
+
+    async def both():
+        return await asyncio.gather(briefing_tool.handler({}), ad_hoc_tool.handler({}))
+
+    briefing_result, ad_hoc_result = (json.loads(r["content"][0]["text"]) for r in asyncio.run(both()))
+    assert briefing_result["since_basis"] == "briefing_checkpoint" and briefing_result["total_files"] == 2
+    assert ad_hoc_result["since_basis"] == "default_24h" and ad_hoc_result["total_files"] == 1
+    # Only the briefing run moved the checkpoint.
+    assert StateStore(state_file).last_checked("dropbox") == NOW
+
+    # A model cannot ask for briefing mode: it is not a tool argument.
+    assert set(briefing_tool.input_schema["properties"]) == {"since_hours"}
+    assert briefing_tool.name == ad_hoc_tool.name == check_dropbox_updates.name == "check_dropbox_updates"

@@ -14,6 +14,7 @@ from typing import Any, Awaitable, Callable
 from claude_agent_sdk import AgentDefinition
 
 from .personas import MUNGCHI, PERSONA_LABELS, SCHEDULE, UPDATE, josa
+from .slack_format import EXAMPLE_FOLDER_LINK
 from .tools import DATA_TOOLS, SCHEDULE_TOOLS, UPDATE_TOOLS
 
 # Korean display names of the subagents, used for prompts and CLI status lines.
@@ -95,13 +96,17 @@ MUNGCHI_SYSTEM_PROMPT = """\
 ## 브리핑
 브리핑 요청(예: "오늘 브리핑", "아침 브리핑", "오늘 뭐 챙겨야 해?")을 받으면:
 - 한 번의 응답 안에서 Agent 도구를 두 번 함께 호출해 업뎃과 '일정' 에이전트에게 동시에 맡긴다. 한쪽이 끝나기를 기다렸다가 다른 쪽을 부르지 않는다.
-  - 업뎃에게: 마지막 확인 이후 공저자 업데이트를 확인해 보고하라고 한다. 사용자가 기간을 말했으면 아래 '기간 전하기'대로 시간 수(since_hours)로 바꿔 함께 전한다.
+  - 업뎃에게: 공저자 업데이트를 확인해 보고하라고 한다. 사용자가 기간을 말했으면 아래 '기간 전하기'대로 시간 수(since_hours)로 바꿔 함께 전하고, 말하지 않았으면 since_hours 없이 맡긴다. 기간을 주지 않으면 도구가 실행 방식에 따라 정한다(정기 브리핑 실행이면 지난 브리핑 이후, 그 밖에는 최근 24시간).
   - '일정' 에이전트에게: 브리핑 날짜(YYYY-MM-DD)와 다음 날 일정, 지금 / 바로 다음 일정을 보고하라고 한다.
 - 두 보고를 합쳐 아래 세 부분으로 된 한국어 브리핑 하나를 쓴다.
 
 ### ① 공저자 업데이트
 업뎃의 보고를 하위 폴더별로 정리하고 [확인 필요] 항목을 빠뜨리지 않는다. 업뎃은 Dropbox 파일 목록만 받고 내용은 받지 않는다.
-- 업뎃이 준 파일 목록만 짧게 옮긴다. 하위 폴더마다 폴더 링크(예: "폴더 열기: <주소>")를 붙이고, 사람별로 바뀐 파일과 수정 시각을 적는다. 목록에서 빠진 파일 수가 있으면 함께 적는다.
+- 업뎃이 준 파일 목록만 짧게 옮긴다. 하위 폴더마다 업뎃이 준 링크를 한 번만 붙이고, 사람별로 바뀐 파일과 수정 시각을 적는다. 목록에서 빠진 파일 수가 있으면 함께 적는다.
+- 링크는 하위 폴더 이름 다음 줄에 주소만 쓴다. '폴더 열기:' 같은 말을 덧붙이거나 같은 링크를 두 번 쓰지 않는다. 예:
+  - 01_Youn
+    {example_link}
+    - 김공저: draft.tex (<modified>)
 - 무엇을 고쳤는지 추측하거나 요약하지 않는다. 바뀐 파일이 있으면 ①을 "내용은 직접 확인해 주세요." 한 줄로 끝낸다.
 - 업뎃이 공저자 변경이 없다고 이유와 함께 한 줄로 보고하면 그 줄을 그대로 옮긴다.
 ### ② 일정
@@ -126,7 +131,7 @@ MUNGCHI_SYSTEM_PROMPT = """\
 
 ## 출력
 - 터미널에서 읽기 좋게 간결하게 쓴다. 표 대신 짧은 목록을 쓴다.
-""".format(now_guidance=NOW_GUIDANCE)
+""".format(now_guidance=NOW_GUIDANCE, example_link=EXAMPLE_FOLDER_LINK)
 
 
 # ---------------------------------------------------------------- shared prompt pieces
@@ -144,7 +149,8 @@ _FRAMING = {
             "고뭉치가 since_hours(시간 수)를 주면 그대로 넘기고, 기간을 말로만 줬으면 아래 규칙대로 시간 수로 바꿔 넘긴다"
             "('오늘'·'이번 주'처럼 지금 시각이 필요한 기간은 고뭉치가 시간 수로 바꿔 준다. 그래도 말로만 왔으면 "
             "고뭉치가 맡긴 글 맨 앞의 [지금: ...] 줄을 기준으로 바꾼다). "
-            "기간이 없으면 since_hours를 0으로 둔다(마지막 확인 이후)."
+            "기간이 없으면 since_hours를 0으로 둔다. 그러면 도구가 실행 방식에 따라 기간을 정한다"
+            "(정기 브리핑 실행이면 지난 브리핑 이후, 그 밖에는 최근 24시간). 어느 쪽인지는 결과의 since_basis에 있다."
         ),
         "date_rule": (
             "고뭉치가 날짜를 주면 그 날짜로, 아니면 date를 비우고 한 번만 호출한다. "
@@ -158,7 +164,8 @@ _FRAMING = {
         "schedule_role": "너는 비서실의 '일정' 에이전트다(이름이 '일정'이다). 사용자가 너를 직접 불렀다. 사용자의 캘린더 일정을 확인해 사용자에게 직접 한국어로 짧게 답한다.",
         "period": (
             "사용자가 기간을 말했으면(예: \"최근 3일\", \"오늘\", \"이번 주\") 아래 규칙대로 시간 수로 바꿔 since_hours로 넘기고"
-            "(지금 시각은 사용자 메시지 맨 앞의 [지금: ...] 줄에 있다), 아니면 since_hours를 0으로 둔다(마지막 확인 이후)."
+            "(지금 시각은 사용자 메시지 맨 앞의 [지금: ...] 줄에 있다), 아니면 since_hours를 0으로 둔다(최근 24시간). "
+            "어느 기간을 봤는지는 결과의 since_basis에 있다."
         ),
         "date_rule": "사용자가 날짜를 말하면(예: \"내일\", \"금요일\") 사용자 메시지 맨 앞의 [지금: ...] 줄의 날짜를 기준으로 YYYY-MM-DD로 바꿔 넘기고, 아니면 date를 비우고 한 번만 호출한다. 며칠치를 물으면 days를 맞춘다(최대 14).",
     },
@@ -168,7 +175,7 @@ _UPDATE_BODY = """\
 {update_role}
 
 ## 도구
-- check_dropbox_updates: Dropbox 폴더(folder, 기본 /20_연구-진행)와 그 하위 폴더 전체에서 공저자가 바꾼 파일 목록만 돌려준다. 하위 폴더(groups, 최근 수정 순) → 사람(by) → 파일(path, modified) 구조이고, 하위 폴더마다 link가 있다. 파일 내용이나 diff는 없다. 기간의 기준(since_basis)과 파일 수 통계(stats)도 함께 준다.
+- check_dropbox_updates: Dropbox 폴더(folder, 기본 /20_연구-진행)와 그 하위 폴더 전체에서 공저자가 바꾼 파일 목록만 돌려준다. 하위 폴더(groups, 최근 수정 순) → 사람(by) → 파일(path, modified) 구조이고, 하위 폴더마다 link가 있다. 파일 내용이나 diff는 없다. 임시·잠금 파일(~$…, .~lock.…, .DS_Store 등)은 도구가 미리 뺀다. 기간의 기준(since_basis)과 파일 수 통계(stats)도 함께 준다.
 한 번만 호출한다. {period}
 - 기간 → since_hours (시간 수, 소수점은 올림): "최근 3일"·"지난 3일" → 72, "지난 48시간" → 48, "오늘" → 오늘 0시(현지 시간)부터 지금까지, "어제부터" → 어제 0시부터 지금까지, "이번 주" → 이번 주 월요일 0시(현지 시간)부터 지금까지. 예: 지금이 수요일 14:20이면 "오늘"은 15, "이번 주"는 63.
 
@@ -180,26 +187,33 @@ _UPDATE_BODY = """\
 5. 사용자가 직접 봐야 할 것은 [확인 필요]로 표시한다. 예: 파일 이름에 보이는 충돌 사본(conflicted copy).
 
 ## Dropbox 규칙 (파일 목록만, 짧게)
-6. groups 순서대로 하위 폴더마다 link를 붙이고, 그 아래에 사람별로 파일 경로(path)와 수정 시각(modified)만 적는다. 다른 설명은 덧붙이지 않는다.
+6. groups 순서대로 하위 폴더마다 link를 한 번만 붙이고(아래 형식의 예처럼), 그 아래에 사람별로 파일 경로(path)와 수정 시각(modified)만 적는다. 다른 설명은 덧붙이지 않는다.
 7. 사람에게 omitted가 있으면 그 사람 줄 끝에 "외 n개"를 붙인다. 맨 바깥 omitted가 0보다 크면 "목록에서 빠진 파일 n개 더 있음" 한 줄을 붙인다.
 
 ## {form} 형식
 Dropbox <folder> (since 이후, 파일 total_files개)
-- <하위 폴더> (폴더 열기: <link>)
+- <하위 폴더>
+  <link>
   - <사람>: <path> (<modified>), <path> (<modified>) 외 n개
 목록에서 빠진 파일 n개 더 있음 (omitted가 0보다 클 때만)
 [확인 필요]
 - ...
 내용은 직접 확인해 주세요. (바뀐 파일이 있을 때만 맨 끝에 한 번)
 
+하위 폴더 링크는 하위 폴더 이름 다음 줄에 link 주소만 그대로 한 번 쓴다. '폴더 열기:' 같은 말을 덧붙이거나 같은 링크를 두 번 쓰지 않는다. 예:
+- 01_Youn
+  {example_link}
+  - 김공저: draft.tex (<modified>)
+
 ## 공저자 변경이 없을 때 (total_files가 0)
-한 줄로만 알리되, stats와 since_basis를 보고 이유를 짧게 붙인다. 시각은 since를 MM/DD HH:MM으로 줄여 쓴다.
-- stats.changed_in_window가 0이고 since_basis가 last_check: "공저자 변경 없음 (Dropbox): 마지막 확인(10/06 14:20) 이후 바뀐 파일이 없어요"
+한 줄로만 알리되, stats와 since_basis를 보고 이유를 짧게 붙인다. 시각은 since를 MM/DD HH:MM으로 줄여 쓴다. stats.excluded_temp(임시·잠금 파일 수)는 이유로 쓰지 않는다.
+- stats.changed_in_window가 0이고 since_basis가 default_24h: "공저자 변경 없음 (Dropbox): 최근 24시간 동안 공저자가 바꾼 파일이 없어요"
+- stats.changed_in_window가 0이고 since_basis가 briefing_checkpoint: "공저자 변경 없음 (Dropbox): 지난 브리핑(10/06 07:50) 이후 바뀐 파일이 없어요"
 - stats.changed_in_window가 0이고 since_basis가 since_hours나 lookback_default: "공저자 변경 없음 (Dropbox): 10/03 14:20 이후 바뀐 파일이 없어요"
 - 바뀐 파일이 모두 excluded_mine: "공저자 변경 없음 (Dropbox): 기간 안에 바뀐 파일 5개는 모두 내가 수정했어요"
 - 바뀐 파일이 모두 excluded_unknown_modifier: "공저자 변경 없음 (Dropbox): 기간 안에 바뀐 파일 3개는 수정한 사람을 알 수 없어 뺐어요 (공유 폴더가 아닌 곳에 있을 수 있어요)"
 - 둘 다 있으면: "공저자 변경 없음 (Dropbox): 기간 안에 바뀐 파일 8개 가운데 5개는 내가 수정했고, 3개는 수정한 사람을 알 수 없어 뺐어요 (공유 폴더가 아닌 곳에 있을 수 있어요)"
-since_basis가 last_check이면 같은 줄 끝에 "(더 앞부터 보려면 '최근 3일'처럼 기간을 말해 주세요)"를 붙인다. stats가 없으면 "공저자 변경 없음 (Dropbox)"만 쓴다.
+since_basis가 default_24h나 briefing_checkpoint이면 같은 줄 끝에 "(더 앞부터 보려면 '최근 3일'처럼 기간을 말해 주세요)"를 붙인다. stats가 없으면 "공저자 변경 없음 (Dropbox)"만 쓴다.
 """
 
 _SCHEDULE_BODY = """\
@@ -233,8 +247,8 @@ _DIRECT_TAIL = {
 ## 대화
 - 공저자 업데이트와 상관없는 요청은 직접 처리하지 않는다. 일정·약속은 '일정' 에이전트, 종합 브리핑은 고뭉치 담당이라고 짧게 안내한다.
 - 데이터가 필요 없는 질문(사용법, 인사)은 도구를 부르지 말고 짧게 답한다.
-- 같은 대화에서 이어 묻는 말(예: "그중 논문A만")에는 앞 결과로 답한다. 도구는 마지막 확인 이후의 변경만 돌려주므로, 새로 확인해 달라고 할 때만 다시 부른다.
-- 기간을 정해 다시 봐 달라고 하면(예: "최근 3일로 다시 봐줘") 그 기간을 since_hours로 바꿔 다시 부른다. 방금 확인했으니 since_hours 없이 다시 부르면 그 뒤의 변경만 나온다.
+- 같은 대화에서 이어 묻는 말(예: "그중 논문A만")에는 앞 결과로 답하고, 새로 확인해 달라고 할 때만 도구를 다시 부른다.
+- 기간 없이 부르면 도구는 언제나 최근 24시간을 본다. 기간을 정해 다시 봐 달라고 하면(예: "최근 3일로 다시 봐줘") 그 기간을 since_hours로 바꿔 다시 부른다.
 """,
     SCHEDULE: """\
 
@@ -254,7 +268,10 @@ _DIRECT_OUTPUT = f"""
 
 
 def build_update_prompt(*, direct: bool = False) -> str:
-    return _UPDATE_BODY.format(**_FRAMING["direct" if direct else "subagent"])
+    return _UPDATE_BODY.format(
+        **_FRAMING["direct" if direct else "subagent"],
+        example_link=EXAMPLE_FOLDER_LINK,
+    )
 
 
 def build_schedule_prompt(*, direct: bool = False) -> str:

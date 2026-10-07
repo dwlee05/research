@@ -7,7 +7,7 @@ from typing import Iterable
 from claude_agent_sdk import McpSdkServerConfig, SdkMcpTool, create_sdk_mcp_server
 
 from .calendar_tool import get_schedule
-from .dropbox_tool import check_dropbox_updates
+from .dropbox_tool import check_dropbox_updates, make_check_dropbox_updates
 
 SERVER_NAME = "mungchi"
 SERVER_VERSION = "0.1.0"
@@ -29,15 +29,24 @@ SCHEDULE_TOOLS = [CALENDAR_TOOL]
 DATA_TOOLS = UPDATE_TOOLS + SCHEDULE_TOOLS
 
 
-def tools_named(names: Iterable[str]) -> list[SdkMcpTool]:
-    """The SDK tool objects whose fully qualified names are in ``names``."""
+def data_tools(*, briefing: bool = False) -> list[SdkMcpTool]:
+    """Every data tool for one run, the Dropbox tool built for that run's mode.
+
+    ``briefing=True`` only for briefing runs (see ``make_check_dropbox_updates``).
+    A fresh Dropbox tool object per call keeps the mode bound to one run.
+    """
+    return [make_check_dropbox_updates(briefing=briefing), get_schedule]
+
+
+def tools_named(names: Iterable[str], *, briefing: bool = False) -> list[SdkMcpTool]:
+    """The SDK tool objects (built for one run, see ``data_tools``) whose fully qualified names are in ``names``."""
     wanted = set(names)
-    return [t for t in ALL_TOOLS if mcp_tool_name(t.name) in wanted]
+    return [t for t in data_tools(briefing=briefing) if mcp_tool_name(t.name) in wanted]
 
 
 def build_server(tools: Iterable[SdkMcpTool] | None = None) -> McpSdkServerConfig:
-    """The ``mungchi`` server with ``tools`` (default: every data tool)."""
-    selected = ALL_TOOLS if tools is None else list(tools)
+    """The ``mungchi`` server with ``tools`` (default: every data tool, ad-hoc mode)."""
+    selected = data_tools() if tools is None else list(tools)
     return create_sdk_mcp_server(name=SERVER_NAME, version=SERVER_VERSION, tools=selected)
 
 
@@ -50,6 +59,7 @@ __all__ = [
     "SERVER_NAME",
     "UPDATE_TOOLS",
     "build_server",
+    "data_tools",
     "mcp_tool_name",
     "tools_named",
 ]
