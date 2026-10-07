@@ -1,5 +1,6 @@
-"""Persisted state: "last checked" timestamps per source (``.mungchi_state.json``)
-and the Slack thread -> Agent SDK session map (``.mungchi_slack_threads.json``)."""
+"""Persisted state: "last checked" timestamps per source and calendar events
+waiting for the user's confirmation (``.mungchi_state.json``), and the Slack
+thread -> Agent SDK session map (``.mungchi_slack_threads.json``)."""
 
 from __future__ import annotations
 
@@ -18,6 +19,10 @@ from .personas import MUNGCHI, PERSONAS
 _LOCK = threading.Lock()
 
 MAX_SLACK_THREADS = 200
+# Calendar events proposed from a pasted note wait this long for "네" / "아니요".
+PROPOSAL_TTL = timedelta(hours=24)
+MAX_PENDING_PROPOSALS = 50
+_PENDING_KEY = "pending_events"
 # Session ids are UUIDs; anything else in the file is ignored rather than
 # passed to the CLI as ``--resume``.
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
@@ -63,7 +68,8 @@ class StateStore:
     ``{"last_checked": {"<source>": "<iso8601>"},
     "credit_alert": {"renewal_date": "<renewal_date>", "alerted_at": "<iso8601>"},
     "last_brief_date": "<YYYY-MM-DD>",
-    "running_version": "<abc1234>", "running_since": "<iso8601>"}``.
+    "running_version": "<abc1234>", "running_since": "<iso8601>",
+    "pending_events": {"<conversation key>": {..., "created_at": "<iso8601>", "expires_at": "<iso8601>"}}}``.
     Every write keeps the other keys as they are.
     """
 
@@ -129,6 +135,73 @@ class StateStore:
             stamps[source] = ensure_aware(when).astimezone(timezone.utc).isoformat()
             data["last_checked"] = stamps
             _write_json(self.path, data)
+
+    # -- calendar events waiting for "네" / "아니요" (one proposal per conversation key)
+
+    @staticmethod
+    def _live_proposals(data: dict[str, Any], now: datetime) -> dict[str, dict[str, Any]]:
+        """Unexpired, well-formed pending proposals, oldest first."""
+        raw = data.get(_PENDING_KEY)
+        if not isinstance(raw, dict):
+            return {}
+        now = ensure_aware(now)
+        live: dict[str, dict[str, Any]] = {}
+        for key, proposal in raw.items():
+            if not (isinstance(key, str) and isinstance(proposal, dict)):
+                continue
+            expires = _parse_iso(proposal.get("expires_at"))
+            if expires is None or expires <= now or not isinstance(proposal.get("events"), list):
+                continue
+            live[key] = proposal
+        return live
+
+    def pending_proposal(self, key: str, now: datetime) -> dict[str, Any] | None:
+        """The proposal waiting under ``key``, or None (none, or expired)."""
+        return self._live_proposals(self.load(), now).get(key) if key else None
+
+    def save_pending_proposal(
+        self, key: str, proposal: dict[str, Any], now: datetime, ttl: timedelta = PROPOSAL_TTL
+    ) -> dict[str, Any]:
+        """Store ``proposal`` under ``key``, replacing the one there; expired ones are dropped."""
+        now = ensure_aware(now).astimezone(timezone.utc)
+        stored = {**proposal, "created_at": now.isoformat(), "expires_at": (now + ttl).isoformat()}
+        with _LOCK:
+            data = self.load()
+            live = self._live_proposals(data, now)
+            live.pop(key, None)  # re-insert as the newest
+            live[key] = stored
+            while len(live) > MAX_PENDING_PROPOSALS:
+                del live[next(iter(live))]
+            data[_PENDING_KEY] = live
+            _write_json(self.path, data)
+        return stored
+
+    def take_pending_proposal(self, key: str, now: datetime) -> dict[str, Any] | None:
+        """Remove and return the proposal under ``key`` in one step (None if there is none or it expired).
+
+        Two confirmations of one proposal can never both get it.
+        """
+        with _LOCK:
+            data = self.load()
+            raw = data.get(_PENDING_KEY)
+            if not isinstance(raw, dict) or key not in raw:
+                return None
+            proposal = self._live_proposals(data, now).get(key)
+            data[_PENDING_KEY] = {k: v for k, v in self._live_proposals(data, now).items() if k != key}
+            _write_json(self.path, data)
+        return proposal
+
+    def clear_pending_proposal(self, key: str) -> bool:
+        """Drop the proposal under ``key`` (expired or not). True if there was one."""
+        with _LOCK:
+            data = self.load()
+            raw = data.get(_PENDING_KEY)
+            if not isinstance(raw, dict) or key not in raw:
+                return False
+            del raw[key]
+            data[_PENDING_KEY] = raw
+            _write_json(self.path, data)
+        return True
 
 
 class ThreadSessions:

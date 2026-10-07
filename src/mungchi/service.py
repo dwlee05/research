@@ -51,7 +51,10 @@ from .version import GitRunner, detect_repo_dir
 LABEL = "local.mungchi.bot"
 APP_NAME = "MungchiBot"
 APP_DISPLAY_NAME = "비서실 고뭉치"
-CALENDAR_USAGE_TEXT = "'일정' 에이전트가 오늘·내일 일정을 확인하려고 캘린더를 읽습니다. 일정을 바꾸지는 않습니다."
+CALENDAR_USAGE_TEXT = (
+    "'일정' 에이전트가 오늘·내일 일정을 확인하려고 캘린더를 읽습니다. "
+    "메모로 부탁한 일정은 사용자가 '네'라고 확인한 것만 추가하고, 있던 일정은 바꾸지 않습니다."
+)
 
 COMMAND = "python -m mungchi service"
 # ``pgrep -f`` / ``pkill -f`` patterns (matched against the full command line).

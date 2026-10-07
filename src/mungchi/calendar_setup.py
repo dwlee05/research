@@ -3,7 +3,8 @@
 Shows the calendar permission, asks macOS for access if it has not been
 decided yet (the system dialog appears once), then lists the calendars by
 account and the events of today and tomorrow that the '일정' agent would read
-under the current ``MACOS_CALENDARS`` filter. No Claude API call is made.
+under the current ``MACOS_CALENDARS`` filter, and the calendars events from a
+pasted note can be added to (``CALENDAR_WRITE_TARGET``). No Claude API call is made.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from . import config
 from .agents import WEEKDAYS_KO
 from .tools import calendar_tool, macos_calendar
 from .tools.calendar_tool import AdapterFactory
+from .tools.common import safe_error
 
 # The user has to notice the dialog and click, so wait longer than the tool would.
 SETUP_REQUEST_TIMEOUT_SECONDS = 180
@@ -36,6 +38,28 @@ def _event_line(event: calendar_tool.Event) -> str:
     when = "종일" if event.all_day else f"{event.start:%H:%M}–{event.end:%H:%M}"
     calendar = f" [{event.calendar}]" if event.calendar else ""
     return f"    - {when} {event.title}{calendar}"
+
+
+def write_target_lines(adapter: macos_calendar.CalendarAdapter, env: Mapping[str, str] | None = None) -> list[str]:
+    """Which calendars accept new events and which one a confirmed note goes to (Korean lines)."""
+    try:
+        writable = adapter.list_writable_calendars()
+    except Exception as exc:  # noqa: BLE001 - the rest of the setup still counts
+        return [f"[경고] 일정을 추가할 수 있는 캘린더를 확인하지 못했습니다: {safe_error(exc)}"]
+    lines = [f"일정을 추가할 수 있는 캘린더 {len(writable)}개 (메모로 일정 추가):"]
+    for calendar in writable:
+        source = f" ({calendar.get('source')})" if calendar.get("source") else ""
+        default = " [기본]" if calendar.get("is_default") else ""
+        lines.append(f"    - {calendar.get('name') or ''}{source}{default}")
+    target = config.get_calendar_write_target(env)
+    name, error = macos_calendar.resolve_write_calendar(writable, None, target)
+    if error:
+        lines.append(f"[경고] {error}")
+    elif target:
+        lines.append(f"추가할 캘린더: {name} (CALENDAR_WRITE_TARGET)")
+    else:
+        lines.append(f"추가할 캘린더: {name or '기본 캘린더'} (CALENDAR_WRITE_TARGET이 비어 있어 기본 캘린더에 넣습니다)")
+    return lines
 
 
 def run_calendar_setup(
@@ -113,6 +137,10 @@ def run_calendar_setup(
             say(_event_line(event))
         if len(day_events) > MAX_SAMPLE_EVENTS:
             say(f"    … 외 {len(day_events) - MAX_SAMPLE_EVENTS}개")
+
+    say()
+    for line in write_target_lines(adapter, env):
+        say(line)
 
     say()
     if cfg.source == config.CALENDAR_SOURCE_MACOS:

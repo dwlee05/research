@@ -54,6 +54,7 @@ from mungchi.tools import (
     CREDITS_TOOL,
     DATA_TOOLS,
     DROPBOX_TOOL,
+    PROPOSE_TOOL,
     SERVER_NAME,
     UPDATE_TOOLS,
     WEATHER_TOOL,
@@ -85,8 +86,8 @@ def test_agents_have_ascii_keys_and_own_tools_only():
     assert all(key.isascii() for key in opts.agents)
     update, schedule = opts.agents["update"], opts.agents["schedule"]
     assert isinstance(update, AgentDefinition) and isinstance(schedule, AgentDefinition)
-    assert update.tools == [DROPBOX_TOOL]
-    assert schedule.tools == [CALENDAR_TOOL, WEATHER_TOOL]
+    assert update.tools == [DROPBOX_TOOL]  # 업뎃 stays Dropbox-only under 고뭉치
+    assert schedule.tools == [CALENDAR_TOOL, WEATHER_TOOL, PROPOSE_TOOL]
     for agent in (update, schedule):
         assert agent.model == "inherit"
         assert all(t.startswith(f"mcp__{SERVER_NAME}__") for t in agent.tools)
@@ -510,29 +511,29 @@ def server_spy(monkeypatch):
     return built
 
 
-def test_direct_update_gets_only_the_dropbox_tool(server_spy):
+def test_direct_update_gets_only_the_dropbox_and_propose_tools(server_spy):
     opts = build_options(env={}, persona="update")
     assert opts.tools == []  # no built-in tools at all, not even Agent
-    assert opts.allowed_tools == [DROPBOX_TOOL]
+    assert opts.allowed_tools == [DROPBOX_TOOL, PROPOSE_TOOL]
     assert "Agent" not in opts.allowed_tools and "Agent" in opts.disallowed_tools
     assert not opts.agents
     assert set(BLOCKED_BUILTINS) <= set(opts.disallowed_tools)
     assert opts.permission_mode == "dontAsk"
     assert opts.setting_sources == []
     assert opts.env == options().env
-    assert server_spy[0] == ["check_dropbox_updates"]
+    assert server_spy[0] == ["check_dropbox_updates", "propose_calendar_events"]
     assert opts.hooks["PreToolUse"][0].hooks == [TOOL_GATES["update"]]
     assert set(opts.mcp_servers) == {SERVER_NAME}
 
 
-def test_direct_schedule_gets_only_its_calendar_and_weather_tools(server_spy):
+def test_direct_schedule_gets_only_its_calendar_weather_and_propose_tools(server_spy):
     opts = build_options(env={}, persona="schedule")
     assert opts.tools == []
-    assert opts.allowed_tools == [CALENDAR_TOOL, WEATHER_TOOL]
+    assert opts.allowed_tools == [CALENDAR_TOOL, WEATHER_TOOL, PROPOSE_TOOL]
     assert "Agent" in opts.disallowed_tools
     assert not opts.agents
     assert set(BLOCKED_BUILTINS) <= set(opts.disallowed_tools)
-    assert server_spy[-1] == ["get_schedule", "get_weather"]
+    assert server_spy[-1] == ["get_schedule", "get_weather", "propose_calendar_events"]
     assert opts.hooks["PreToolUse"][0].hooks == [TOOL_GATES["schedule"]]
 
 
@@ -546,7 +547,9 @@ def test_mungchi_options_are_unchanged_by_personas(server_spy):
     assert explicit.hooks["PreToolUse"][0].hooks == [tool_gate]
     assert TOOL_GATES["mungchi"] is tool_gate
     # 고뭉치's server keeps every data tool for its subagents and itself (built for this run).
-    assert server_spy == [["check_dropbox_updates", "get_schedule", "get_weather", "get_credits"]] * 2
+    assert server_spy == [
+        ["check_dropbox_updates", "get_schedule", "get_weather", "get_credits", "propose_calendar_events"]
+    ] * 2
 
 
 def test_unknown_persona_is_rejected():
@@ -622,7 +625,7 @@ def test_run_turn_runs_the_requested_persona(fake_sdk):
     opts = client.options
     assert opts.resume == "sess-0"
     assert opts.tools == [] and not opts.agents
-    assert opts.allowed_tools == [DROPBOX_TOOL]
+    assert opts.allowed_tools == [DROPBOX_TOOL, PROPOSE_TOOL]
     assert opts.hooks["PreToolUse"][0].hooks == [TOOL_GATES["update"]]
     assert opts.system_prompt.rstrip().endswith("## Slack 규칙")
 
@@ -643,7 +646,7 @@ def test_cli_agent_one_shot_and_chat(fake_sdk, capsys, monkeypatch):
     assert main(["--agent", "update", "누가 무슨 파일 고쳤어?"]) == 0
     [client] = fake_sdk.instances
     assert [without_now_line(p) for p in client.prompts] == ["누가 무슨 파일 고쳤어?"]
-    assert client.options.allowed_tools == [DROPBOX_TOOL] and not client.options.agents
+    assert client.options.allowed_tools == [DROPBOX_TOOL, PROPOSE_TOOL] and not client.options.agents
 
     fake_sdk.instances = []
     lines = iter(["내일 일정은?", "종료"])
@@ -651,7 +654,7 @@ def test_cli_agent_one_shot_and_chat(fake_sdk, capsys, monkeypatch):
     assert main(["--agent", "schedule"]) == 0
     [client] = fake_sdk.instances
     assert [without_now_line(p) for p in client.prompts] == ["내일 일정은?"]
-    assert client.options.allowed_tools == [CALENDAR_TOOL, WEATHER_TOOL]
+    assert client.options.allowed_tools == [CALENDAR_TOOL, WEATHER_TOOL, PROPOSE_TOOL]
     out = capsys.readouterr().out
     assert "\n'일정'입니다. 캘린더 일정과 오늘·내일 날씨를 확인해 드릴게요." in out and "일정: 수고하셨습니다!" in out
 
@@ -672,10 +675,17 @@ def test_cli_agent_argument_rules(capsys):
 
 
 def test_update_has_exactly_one_data_tool():
+    # One data tool; answering directly it can also turn a pasted note into a calendar proposal.
     assert UPDATE_TOOLS == [DROPBOX_TOOL]
-    assert PERSONA_TOOLS[UPDATE] == [DROPBOX_TOOL]
-    assert DATA_TOOLS == [DROPBOX_TOOL, CALENDAR_TOOL, WEATHER_TOOL, CREDITS_TOOL]
-    assert [t.name for t in ALL_TOOLS] == ["check_dropbox_updates", "get_schedule", "get_weather", "get_credits"]
+    assert PERSONA_TOOLS[UPDATE] == [DROPBOX_TOOL, PROPOSE_TOOL]
+    assert DATA_TOOLS == [DROPBOX_TOOL, CALENDAR_TOOL, WEATHER_TOOL, CREDITS_TOOL, PROPOSE_TOOL]
+    assert [t.name for t in ALL_TOOLS] == [
+        "check_dropbox_updates",
+        "get_schedule",
+        "get_weather",
+        "get_credits",
+        "propose_calendar_events",
+    ]
 
 
 def test_removed_tool_names_are_unknown_or_denied():
@@ -741,7 +751,7 @@ def test_old_env_with_overleaf_and_my_lines_still_works(tmp_path, monkeypatch, f
     assert main(["--agent", "update", "공저자 업데이트 확인해줘"]) == 0
     assert os.environ["OVERLEAF_GIT_TOKEN"] == "olp_not-a-real-token"  # loaded from .env, then ignored
     [client] = fake_sdk.instances
-    assert client.options.allowed_tools == [DROPBOX_TOOL]
+    assert client.options.allowed_tools == [DROPBOX_TOOL, PROPOSE_TOOL]
     assert "overleaf" not in client.options.system_prompt.lower()
     assert main(["--brief"]) == 0  # 고뭉치 as well
 
@@ -905,7 +915,7 @@ def test_build_options_binds_briefing_into_its_own_server(server_tools, monkeypa
     # Apart from the server, the options are the same: nothing else depends on the mode.
     for field in (*SAFETY_FIELDS, "system_prompt"):
         assert getattr(briefing, field) == getattr(ad_hoc, field), field
-    assert direct.allowed_tools == [DROPBOX_TOOL]
+    assert direct.allowed_tools == [DROPBOX_TOOL, PROPOSE_TOOL]
 
 
 # ---------------------------------------------------------------- 일정's get_weather tool
@@ -919,13 +929,13 @@ def _weather_decision(persona="mungchi", agent_type=None, agent_id=None):
 def test_get_weather_is_an_mcp_tool_owned_by_schedule_only():
     assert WEATHER_TOOL == "mcp__mungchi__get_weather"
     assert WEATHER_TOOL in DATA_TOOLS
-    assert PERSONA_TOOLS[SCHEDULE] == [CALENDAR_TOOL, WEATHER_TOOL]
+    assert PERSONA_TOOLS[SCHEDULE] == [CALENDAR_TOOL, WEATHER_TOOL, PROPOSE_TOOL]
     assert WEATHER_TOOL not in PERSONA_TOOLS[UPDATE]
     mungchi = options()
-    assert mungchi.agents["schedule"].tools == [CALENDAR_TOOL, WEATHER_TOOL]
+    assert mungchi.agents["schedule"].tools == [CALENDAR_TOOL, WEATHER_TOOL, PROPOSE_TOOL]
     assert WEATHER_TOOL not in mungchi.agents["update"].tools
     assert WEATHER_TOOL in mungchi.allowed_tools  # 고뭉치 itself answers simple weather questions
-    assert build_options(env={}, persona="update").allowed_tools == [DROPBOX_TOOL]
+    assert build_options(env={}, persona="update").allowed_tools == [DROPBOX_TOOL, PROPOSE_TOOL]
 
 
 def test_get_weather_gate_allows_schedule_direct_its_subagent_and_mungchi_itself():
@@ -1029,8 +1039,8 @@ def test_get_credits_belongs_to_mungchi_only():
     mungchi = options()
     assert all(CREDITS_TOOL not in agent.tools for agent in mungchi.agents.values())
     assert CREDITS_TOOL not in PERSONA_TOOLS[UPDATE] and CREDITS_TOOL not in PERSONA_TOOLS[SCHEDULE]
-    assert build_options(env={}, persona="update").allowed_tools == [DROPBOX_TOOL]
-    assert build_options(env={}, persona="schedule").allowed_tools == [CALENDAR_TOOL, WEATHER_TOOL]
+    assert build_options(env={}, persona="update").allowed_tools == [DROPBOX_TOOL, PROPOSE_TOOL]
+    assert build_options(env={}, persona="schedule").allowed_tools == [CALENDAR_TOOL, WEATHER_TOOL, PROPOSE_TOOL]
 
 
 def test_direct_personas_servers_never_get_get_credits(server_spy):
@@ -1038,9 +1048,9 @@ def test_direct_personas_servers_never_get_get_credits(server_spy):
     build_options(env={}, persona="schedule")
     build_options(env={})
     assert server_spy == [
-        ["check_dropbox_updates"],
-        ["get_schedule", "get_weather"],
-        ["check_dropbox_updates", "get_schedule", "get_weather", "get_credits"],
+        ["check_dropbox_updates", "propose_calendar_events"],
+        ["get_schedule", "get_weather", "propose_calendar_events"],
+        ["check_dropbox_updates", "get_schedule", "get_weather", "get_credits", "propose_calendar_events"],
     ]
 
 
@@ -1088,3 +1098,280 @@ def test_help_says_mungchi_checks_tokens_and_weather_itself():
     assert 'python -m mungchi "날씨랑 토큰 좀 알려줘"' in help_text
     assert "'날씨랑 토큰 좀 알려줘'처럼 짧게 물으면 LLM 호출 없이 바로 답합니다" in help_text
     assert "서비스 상태(실행 중인 코드 버전 포함)" in help_text
+
+
+# ---------------------------------------------------------------- calendar events from a pasted note
+
+from mungchi.agents import SCHEDULE_DESCRIPTION, SCHEDULE_PROMPT, UPDATE_PROMPT, build_propose_section  # noqa: E402
+from mungchi.state import StateStore, utcnow  # noqa: E402
+from mungchi.tools import event_proposals, macos_calendar  # noqa: E402
+from mungchi.tools.event_proposals import CONFIRM_QUESTION, CreationOutcome, CreationResult  # noqa: E402
+
+NOTE_EVENT = {"title": "신임교수모임 (10월)", "date": "2099-10-22", "start_time": "12:00", "notes": "발표: 김평식 교수님"}
+
+
+def _propose_decision(persona="mungchi", agent_type=None, agent_id=None):
+    out = gate_decision(PROPOSE_TOOL, {}, agent_type, agent_id, persona=persona)
+    return out.get("hookSpecificOutput", {}).get("permissionDecision")
+
+
+def test_propose_calendar_events_is_gated_per_persona():
+    assert PROPOSE_TOOL == "mcp__mungchi__propose_calendar_events"
+    # Allowed: 업뎃 directly, 일정 directly, 일정 as 고뭉치's subagent.
+    assert _propose_decision(persona="update") == "allow"
+    assert _propose_decision(persona="schedule") == "allow"
+    assert _propose_decision(agent_type=SCHEDULE, agent_id="a2") == "allow"
+    # Denied: 고뭉치 itself (it delegates to 일정), 업뎃 as a subagent (Dropbox only), anyone else.
+    assert _propose_decision() == "deny"
+    assert _propose_decision(agent_type=UPDATE, agent_id="a1") == "deny"
+    assert _propose_decision(agent_type="general-purpose", agent_id="a3") == "deny"
+    for persona in ("update", "schedule"):
+        assert _propose_decision(persona=persona, agent_id="a1") == "deny"  # never from inside a subagent
+    assert _propose_decision(persona="nobody") == "deny"
+
+    async def ask(persona, **extra):
+        out = await TOOL_GATES[persona]({"tool_name": PROPOSE_TOOL, "tool_input": {}, **extra}, "t1", None)
+        return out["hookSpecificOutput"]["permissionDecision"]
+
+    assert asyncio.run(ask("update")) == "allow" and asyncio.run(ask("schedule")) == "allow"
+    assert asyncio.run(ask("mungchi")) == "deny"
+    assert asyncio.run(ask("mungchi", agent_type="schedule", agent_id="a2")) == "allow"
+    assert asyncio.run(ask("mungchi", agent_type="update", agent_id="a1")) == "deny"
+    # The tool lists match the gates.
+    mungchi = options()
+    assert PROPOSE_TOOL not in mungchi.allowed_tools
+    assert PROPOSE_TOOL in mungchi.agents["schedule"].tools and PROPOSE_TOOL not in mungchi.agents["update"].tools
+    assert PROPOSE_TOOL in build_options(env={}, persona="update").allowed_tools
+    assert PROPOSE_TOOL in build_options(env={}, persona="schedule").allowed_tools
+
+
+def test_no_tool_can_create_calendar_events():
+    names = {t.name for t in ALL_TOOLS}
+    assert names == {"check_dropbox_updates", "get_schedule", "get_weather", "get_credits", "propose_calendar_events"}
+    [propose] = [t for t in ALL_TOOLS if t.name == "propose_calendar_events"]
+    assert "캘린더에 추가하지는 않는다" in propose.description and "네가 추가할 방법은 없다" in propose.description
+
+
+def _bound_propose_tool(tools):
+    [tool] = [t for t in tools if t.name == "propose_calendar_events"]
+    return tool
+
+
+def _call_propose(tool, monkeypatch):
+    class App:
+        def authorization_status(self):
+            return macos_calendar.GRANTED
+
+        def list_writable_calendars(self):
+            return [{"name": "연구", "source": "iCloud", "is_default": True}]
+
+        def find_similar_events(self, start, end, title):
+            return []
+
+    monkeypatch.setattr(config, "current_platform", lambda: "darwin")
+    monkeypatch.setattr(macos_calendar, "default_adapter", lambda tz: App())
+    result = asyncio.run(tool.handler({"events": [NOTE_EVENT], "source_note": "메모"}))
+    return json.loads(result["content"][0]["text"])
+
+
+@pytest.mark.parametrize("persona", ["update", "schedule", "mungchi"])
+def test_build_options_binds_the_conversation_key_into_its_own_propose_tool(server_tools, monkeypatch, persona):
+    """For 고뭉치 the tool sits on the run's shared server, where its 일정 subagent calls it."""
+    key = event_proposals.slack_conversation_key(persona, "C1", "1700000000.000100")
+    build_options(env={}, persona=persona, conversation_key=key)
+    build_options(env={}, persona=persona)  # another run in the same process, without a key
+    bound, unbound = (_bound_propose_tool(tools) for tools in server_tools)
+    assert bound is not unbound
+    payload = _call_propose(bound, monkeypatch)
+    assert payload["ok"] and payload["can_confirm"] and payload["confirm_question"] == CONFIRM_QUESTION
+    store = StateStore(config.get_state_path())
+    assert store.pending_proposal(key, utcnow())["events"][0]["title"] == "신임교수모임 (10월)"
+    store.clear_pending_proposal(key)
+    assert _call_propose(unbound, monkeypatch)["can_confirm"] is False
+    assert store.load().get("pending_events") == {}
+
+
+def test_prompts_propose_and_end_with_the_exact_question():
+    assert CONFIRM_QUESTION == "캘린더에 추가할까요? (네 / 아니요 / 고칠 내용)"
+    direct = {p: build_options(env={}, persona=p).system_prompt for p in ("update", "schedule")}
+    for prompt in (*direct.values(), SCHEDULE_PROMPT):
+        assert "## 메모로 일정 추가 (propose_calendar_events)" in prompt
+        assert f'마지막 줄은 정확히 "{CONFIRM_QUESTION}"으로 끝낸다' in prompt
+        assert '예: "신임교수모임 (10월)"' in prompt and '"발표: 김평식 교수님"' in prompt
+        assert '"오후 12시"는 12:00(정오)이다. "오전 12시"는 00:00(자정)으로 넣고' in prompt
+        assert "weekday_in_text" in prompt and "오늘이거나 오늘 뒤에 오는 가장 가까운 그 날짜" in prompt
+        assert "시작 시각이 없으면 짐작하지 않는다" in prompt and "몇 시인지 묻는다" in prompt
+        assert "일정이 추가되었다거나 등록되었다고 절대 말하지 않는다" in prompt
+        assert "can_confirm이 false면 이 질문 대신 note를 전한다" in prompt
+    for prompt in direct.values():
+        assert "사용자 메시지 맨 앞의 [지금: ...] 줄의 날짜를 기준으로" in prompt
+        assert "앞의 제안은 이미 취소된 것이다" in prompt and "다시 불러 새 미리보기와 같은 질문으로 끝낸다" in prompt
+        assert "Agent" not in prompt
+    assert "고뭉치가 맡긴 글 맨 앞의 [지금: ...] 줄의 날짜를 기준으로" in SCHEDULE_PROMPT
+    assert "고뭉치에게 그대로 보고하고" in SCHEDULE_PROMPT
+    # 업뎃 handles notes directly, but its subagent under 고뭉치 never proposes.
+    assert "아래 '메모로 일정 추가'대로 직접 처리한다" in direct["update"]
+    assert "propose_calendar_events" not in UPDATE_PROMPT
+    assert options().agents["schedule"].prompt == SCHEDULE_PROMPT
+    assert SCHEDULE_PROMPT == build_schedule_prompt() + build_propose_section()
+
+
+def test_mungchi_routes_notes_to_schedule_and_relays_the_question():
+    prompt = options().system_prompt
+    section = prompt[prompt.index("## 메모로 일정 추가") : prompt.index("## 그 밖의 요청")]
+    assert "'일정' 에이전트에게 맡긴다. 업뎃에게는 맡기지 않는다." in section
+    assert "너에게는 일정을 제안하거나 추가하는 도구가 없다" in section
+    assert "메모 원문 전체(고치거나 줄이지 말고 그대로)" in section and "[지금: ...] 줄" in section
+    assert f'답의 마지막 줄을 정확히 "{CONFIRM_QUESTION}"으로 끝낸다' in section
+    assert "일정이 추가되었다거나 등록되었다고 절대 말하지 않는다" in section
+    assert "메모 원문과 고칠 내용을 함께 '일정' 에이전트에게 다시 맡겨" in section
+    assert "propose_calendar_events" not in prompt  # not its tool
+    assert "네가 쓰는 도구는 Agent, get_credits, get_weather 세 가지뿐이다" in prompt
+    assert "메모" in SCHEDULE_DESCRIPTION and "캘린더에 추가" in SCHEDULE_DESCRIPTION
+
+
+def test_nobody_is_told_to_claim_events_were_added():
+    texts = [*_every_system_prompt().values(), *(t.description for t in ALL_TOOLS)]
+    for text in texts:
+        for claim in ("추가했어요", "등록했어요", "추가했습니다", "등록했습니다", "넣었어요"):
+            assert claim not in text
+
+
+def test_renderer_notices_proposals_also_inside_a_subagent():
+    direct = Renderer(echo=False)
+    direct.handle(AssistantMessage(content=[ToolUseBlock(id="t1", name=PROPOSE_TOOL, input={})], model="m"))
+    direct.handle(AssistantMessage(content=[TextBlock(text="• 10/22(목) ...")], model="m"))
+    assert direct.result().proposed and direct.result().text == "• 10/22(목) ..."
+    nested = Renderer(echo=False)
+    nested.handle(
+        AssistantMessage(content=[ToolUseBlock(id="t2", name=PROPOSE_TOOL, input={})], model="m", parent_tool_use_id="t0")
+    )
+    assert nested.result().proposed
+    assert not Renderer(echo=False).result().proposed
+
+
+class ProposingSDKClient(FakeSDKClient):
+    """A chat client whose agent proposes calendar events for some messages (the tool's effect, by hand)."""
+
+    store: StateStore
+    key: str
+    propose_on: set[str] = set()
+
+    async def query(self, prompt, session_id="default"):
+        await super().query(prompt, session_id)
+        typed = without_now_line(prompt)
+        if typed in self.propose_on:
+            items, _ = event_proposals.normalize_events([NOTE_EVENT], tz=ZoneInfo("Asia/Seoul"), now=NOW)
+            proposal = {"id": typed, "calendar": "연구", "events": [e.to_state() for e in items]}
+            self.store.save_pending_proposal(self.key, proposal, utcnow())
+
+
+@pytest.fixture
+def chat(monkeypatch, tmp_path):
+    """Runs the terminal chat with scripted input; returns (prompts asked, created proposals, store, client prompts)."""
+    store = StateStore(tmp_path / "state.json")
+    key = "cli:test"
+    ProposingSDKClient.store, ProposingSDKClient.key = store, key
+    FakeSDKClient.instances = []
+    monkeypatch.setattr(main_module, "ClaudeSDKClient", ProposingSDKClient)
+
+    def run(lines, propose_on, persona="schedule"):
+        ProposingSDKClient.propose_on = set(propose_on)
+        asked: list[str] = []
+        created: list[dict] = []
+        feed = iter(lines)
+
+        def fake_input(prompt=""):
+            asked.append(prompt)
+            try:
+                return next(feed)
+            except StopIteration:
+                raise EOFError from None
+
+        def create(proposal):
+            created.append(dict(proposal))
+            return CreationOutcome(
+                results=[CreationResult(summary="10/22(목) 12:00–13:00 신임교수모임 (10월)", ok=True, calendar="연구")]
+            )
+
+        monkeypatch.setattr("builtins.input", fake_input)
+        options = build_options(persona=persona, conversation_key=key)
+        code = asyncio.run(run_chat(options, persona, conversation_key=key, store=store, create=create))
+        assert code == 0
+        [client] = FakeSDKClient.instances[-1:]
+        return asked, created, store, [without_now_line(p) for p in client.prompts]
+
+    return run
+
+
+QUESTION = event_proposals.CLI_CONFIRM_PROMPT
+
+
+def test_chat_yes_creates_by_code(chat, capsys):
+    asked, created, store, prompts = chat(["메모", "네", "종료"], {"메모"})
+    assert asked == ["\n나> ", QUESTION, "\n나> "]
+    assert QUESTION == "캘린더에 추가할까요? [네/아니요] "
+    assert [p["id"] for p in created] == ["메모"] and prompts == ["메모"]  # "네" never reaches the agent
+    assert "✅ 캘린더에 추가했어요\n• 10/22(목) 12:00–13:00 신임교수모임 (10월) · 캘린더: 연구" in capsys.readouterr().out
+    assert store.pending_proposal("cli:test", utcnow()) is None
+
+
+def test_chat_no_cancels(chat, capsys):
+    asked, created, store, prompts = chat(["메모", "아니요", "종료"], {"메모"})
+    assert created == [] and prompts == ["메모"] and "취소했어요" in capsys.readouterr().out
+    assert store.pending_proposal("cli:test", utcnow()) is None
+
+
+def test_chat_other_answers_go_to_the_agent_and_the_new_proposal_is_asked_about(chat):
+    asked, created, store, prompts = chat(["메모", "시간은 1시로 바꿔줘", "", "네", "종료"], {"메모", "시간은 1시로 바꿔줘"})
+    assert prompts == ["메모", "시간은 1시로 바꿔줘"]
+    assert asked == ["\n나> ", QUESTION, QUESTION, QUESTION, "\n나> "]  # an empty answer is asked again
+    assert [p["id"] for p in created] == ["시간은 1시로 바꿔줘"]  # only the latest proposal
+
+
+def test_chat_without_a_proposal_never_asks_and_end_of_input_drops_it(chat):
+    asked, created, store, prompts = chat(["안녕", "종료"], set())
+    assert asked == ["\n나> ", "\n나> "] and created == []
+    asked, created, store, prompts = chat(["메모"], {"메모"})  # input ends at the question
+    assert asked == ["\n나> ", QUESTION] and created == []
+    assert store.pending_proposal("cli:test", utcnow()) is None
+
+
+def test_main_chat_binds_one_key_to_both_the_tool_and_the_question(monkeypatch, server_tools):
+    monkeypatch.setattr(event_proposals, "cli_conversation_key", lambda: "cli:fixed")
+    seen = {}
+
+    async def fake_run_chat(options, persona, *, conversation_key=None, **kwargs):
+        seen.update(persona=persona, key=conversation_key)
+        return 0
+
+    monkeypatch.setattr(main_module, "run_chat", fake_run_chat)
+    assert main(["--agent", "update"]) == 0
+    assert seen == {"persona": "update", "key": "cli:fixed"}
+    _call_propose(_bound_propose_tool(server_tools[-1]), monkeypatch)
+    assert StateStore(config.get_state_path()).pending_proposal("cli:fixed", utcnow()) is not None
+
+
+class OneShotProposingClient(FakeSDKClient):
+    async def receive_response(self):
+        yield AssistantMessage(
+            content=[ToolUseBlock(id="t1", name="Agent", input={"subagent_type": "schedule", "prompt": "..."})], model="m"
+        )
+        yield AssistantMessage(
+            content=[ToolUseBlock(id="t2", name=PROPOSE_TOOL, input={})], model="m", parent_tool_use_id="t1"
+        )
+        yield AssistantMessage(content=[TextBlock(text="• 10/22(목) 12:00–13:00 신임교수모임 (10월)")], model="m")
+        yield ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1, is_error=False, num_turns=2, session_id="s")
+
+
+def test_one_shot_shows_the_preview_and_points_to_chat_or_slack(monkeypatch, capsys, server_tools):
+    FakeSDKClient.instances = []
+    monkeypatch.setattr(main_module, "ClaudeSDKClient", OneShotProposingClient)
+    assert main(["이 메모 캘린더에 넣어줘: 10월 22일(목) 오후 12시 신임교수모임"]) == 0
+    out, err = capsys.readouterr()
+    assert "• 10/22(목) 12:00–13:00 신임교수모임 (10월)" in out
+    assert f"[참고] {event_proposals.ONE_SHOT_NOTE}" in err
+    assert "대화 모드" in err and "Slack" in err
+    # The one-shot run's tool has no conversation: it never stores anything to confirm.
+    payload = _call_propose(_bound_propose_tool(server_tools[-1]), monkeypatch)
+    assert payload["can_confirm"] is False and StateStore(config.get_state_path()).load().get("pending_events") is None

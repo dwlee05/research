@@ -78,11 +78,21 @@ class FakeRun:
         self.statuses = statuses
         self.delay = delay
         self.calls: list[dict] = []
+        # The conversation key each run was bound to (where a calendar proposal would wait).
+        self.keys: list[str | None] = []
         self.active = 0
         self.max_active = 0
 
     async def __call__(
-        self, prompt, *, resume=None, on_status=None, extra_system_prompt="", persona="mungchi", briefing=False
+        self,
+        prompt,
+        *,
+        resume=None,
+        on_status=None,
+        extra_system_prompt="",
+        persona="mungchi",
+        briefing=False,
+        conversation_key=None,
     ):
         self.calls.append(
             {
@@ -93,6 +103,7 @@ class FakeRun:
                 "briefing": briefing,
             }
         )
+        self.keys.append(conversation_key)
         self.active += 1
         self.max_active = max(self.max_active, self.active)
         try:
@@ -2421,3 +2432,245 @@ def test_the_default_briefing_on_request_is_the_shared_builder(tmp_path, monkeyp
     assert text.endswith("💳 *Chat KHU 크레딧*: 확인 안 함 (Chat KHU 게이트웨이를 쓰지 않아요)")
     assert run.calls[0]["briefing"] is True
     assert StateStore(config.get_state_path()).last_brief_date() is None
+
+
+# ---------------------------------------------------------------- calendar proposals: "네" / "아니요" by code
+
+from datetime import timedelta  # noqa: E402
+
+from mungchi.state import utcnow  # noqa: E402
+from mungchi.tools.event_proposals import create_proposal_events, normalize_events, slack_conversation_key  # noqa: E402
+
+ROOT = "1700000000.000200"  # the DM (or channel message) the proposal was shown under
+# Far in the future, so the real clock never makes them past; the year is shown since it is not this one.
+NOTE_EVENTS = [
+    {"title": "신임교수모임 (10월)", "date": "2099-10-22", "start_time": "12:00", "notes": "발표: 김평식 교수님"},
+    {"title": "신임교수모임 (11월)", "date": "2099-11-19", "start_time": "12:00"},
+]
+
+
+class CalendarWrites:
+    """The Calendar app adapter as far as creating events goes."""
+
+    def __init__(self, fail_titles=(), delay=0.0):
+        self.fail_titles = set(fail_titles)
+        self.delay = delay
+        self.created: list[str] = []
+
+    def authorization_status(self):
+        return "granted"
+
+    def create_event(self, title, start, end, all_day, location=None, notes=None, calendar_name=None):
+        if self.delay:
+            import time as _time
+
+            _time.sleep(self.delay)
+        self.created.append(title)
+        if title in self.fail_titles:
+            return {"ok": False, "id": None, "calendar": "", "error": "읽기 전용 캘린더예요"}
+        return {"ok": True, "id": f"EV-{len(self.created)}", "calendar": calendar_name or "연구", "error": None}
+
+
+def store_proposal(store, persona, channel, thread_ts, events=NOTE_EVENTS, now=None):
+    items, problems = normalize_events(events, tz=ZoneInfo("Asia/Seoul"), now=datetime(2099, 1, 1, tzinfo=timezone.utc))
+    assert problems == []
+    key = slack_conversation_key(persona, channel, thread_ts)
+    proposal = {"id": "p1", "calendar": "연구", "calendar_label": "연구", "events": [e.to_state() for e in items]}
+    store.save_pending_proposal(key, proposal, now or utcnow())
+    return key
+
+
+def proposal_handler(tmp_path, persona="schedule", app=None, run=None, **kwargs):
+    app = app or CalendarWrites()
+    store = StateStore(tmp_path / "state.json")
+
+    def create(proposal):
+        return create_proposal_events(
+            proposal, env={"TIMEZONE": "Asia/Seoul"}, adapter_factory=lambda tz: app, platform="darwin"
+        )
+
+    handler, client, run = make_handler(
+        tmp_path, run=run, persona=persona, proposals=store, create_events=create, **kwargs
+    )
+    return handler, client, run, app, store
+
+
+@pytest.mark.parametrize("persona", ["update", "schedule", "mungchi"])
+def test_yes_in_the_thread_creates_the_events_by_code_without_an_agent_turn(tmp_path, persona):
+    handler, client, run, app, store = proposal_handler(tmp_path, persona)
+    key = store_proposal(store, persona, DM, ROOT)
+    asyncio.run(handler.handle_event(dm("네", ts="1700000000.000300", thread_ts=ROOT), event_id="Ev1", source="dm"))
+    assert run.calls == []  # never the model
+    assert app.created == ["신임교수모임 (10월)", "신임교수모임 (11월)"]
+    [post] = client.posts
+    assert post["thread_ts"] == ROOT and post["channel"] == DM
+    assert post["text"] == (
+        "✅ 캘린더에 추가했어요\n"
+        "• 2099/10/22(목) 12:00–13:00 신임교수모임 (10월) · 캘린더: 연구\n"
+        "• 2099/11/19(목) 12:00–13:00 신임교수모임 (11월) · 캘린더: 연구"
+    )
+    assert store.pending_proposal(key, utcnow()) is None  # cleared
+    # A second "네" has nothing left to confirm: it is an ordinary message for the agent.
+    asyncio.run(handler.handle_event(dm("네", ts="1700000000.000400", thread_ts=ROOT), event_id="Ev2", source="dm"))
+    assert len(app.created) == 2 and [c["prompt"] for c in run.calls] == ["네"]
+
+
+@pytest.mark.parametrize("text", ["<@UBOT> 추가해 줘", "<@UBOT> ㅇㅇ", "<@UBOT> OK", "<@UBOT> :+1:", "<@UBOT> 넵!"])
+def test_yes_by_mention_in_a_channel_thread(tmp_path, text):
+    handler, client, run, app, store = proposal_handler(tmp_path)
+    store_proposal(store, "schedule", CHANNEL, ROOT)
+    asyncio.run(handler.handle_event(mention(text, ts="1700000000.000500", thread_ts=ROOT), event_id="Ev1", source="mention"))
+    assert run.calls == [] and len(app.created) == 2
+    assert client.posts[-1]["text"].startswith("✅ 캘린더에 추가했어요") and client.posts[-1]["thread_ts"] == ROOT
+
+
+@pytest.mark.parametrize("text", ["아니요", "취소", "no"])
+def test_no_cancels_without_creating_anything(tmp_path, text):
+    handler, client, run, app, store = proposal_handler(tmp_path)
+    key = store_proposal(store, "schedule", DM, ROOT)
+    asyncio.run(handler.handle_event(dm(text, ts="1700000000.000300", thread_ts=ROOT), event_id="Ev1", source="dm"))
+    assert [p["text"] for p in client.posts] == ["취소했어요"]
+    assert app.created == [] and run.calls == [] and store.pending_proposal(key, utcnow()) is None
+
+
+@pytest.mark.parametrize("text", ["시간은 1시로 바꿔줘", "네 근데 11월 것만", "이 날 다른 일정 있어?"])
+def test_anything_else_goes_to_the_agent_and_replaces_the_proposal(tmp_path, text):
+    handler, client, run, app, store = proposal_handler(tmp_path)
+    key = store_proposal(store, "schedule", DM, ROOT)
+    asyncio.run(handler.handle_event(dm(text, ts="1700000000.000300", thread_ts=ROOT), event_id="Ev1", source="dm"))
+    assert [c["prompt"] for c in run.calls] == [text]
+    assert run.calls[0]["resume"] is None and run.keys == [key]  # the agent may re-propose in this thread
+    assert app.created == []
+    # The old preview can no longer be confirmed: the agent re-proposes if needed.
+    assert store.pending_proposal(key, utcnow()) is None
+
+
+def test_every_agent_run_is_bound_to_its_own_thread_and_bot(tmp_path):
+    handler, _client, run, _app, _store = proposal_handler(tmp_path, "update")
+    asyncio.run(handler.handle_event(dm("메모 붙여 넣음", ts="1700000000.000700"), event_id="Ev1", source="dm"))
+    asyncio.run(handler.handle_event(mention("<@UBOT> 메모", ts="1700000000.000800"), event_id="Ev2", source="mention"))
+    assert run.keys == [
+        slack_conversation_key("update", DM, "1700000000.000700"),
+        slack_conversation_key("update", CHANNEL, "1700000000.000800"),
+    ]
+
+
+def test_a_proposal_never_leaks_to_another_thread_or_bot(tmp_path):
+    handler, client, run, app, store = proposal_handler(tmp_path, "schedule")
+    key = store_proposal(store, "schedule", DM, ROOT)
+    # Same bot, another thread.
+    asyncio.run(handler.handle_event(dm("네", ts="1700000000.000900"), event_id="Ev1", source="dm"))
+    # Another bot, same thread (its own handler, same state file).
+    update, update_client, update_run, _app, _store = proposal_handler(tmp_path, "update", app=app)
+    asyncio.run(update.handle_event(dm("네", ts="1700000000.000950", thread_ts=ROOT), event_id="Ev2", source="dm"))
+    assert app.created == []
+    assert [c["prompt"] for c in run.calls] == ["네"] and [c["prompt"] for c in update_run.calls] == ["네"]
+    assert store.pending_proposal(key, utcnow()) is not None  # still waiting in its own thread
+
+
+def test_an_expired_proposal_is_ignored(tmp_path):
+    handler, client, run, app, store = proposal_handler(tmp_path)
+    key = store_proposal(store, "schedule", DM, ROOT, now=utcnow() - timedelta(hours=25))
+    asyncio.run(handler.handle_event(dm("네", ts="1700000000.000300", thread_ts=ROOT), event_id="Ev1", source="dm"))
+    assert app.created == [] and [c["prompt"] for c in run.calls] == ["네"]
+    assert store.pending_proposal(key, utcnow()) is None
+
+
+def test_the_allow_list_comes_before_any_proposal(tmp_path):
+    handler, client, run, app, store = proposal_handler(tmp_path)
+    key = store_proposal(store, "schedule", DM, ROOT)
+    asyncio.run(handler.handle_event(dm("네", user=STRANGER, ts="1700000000.000300", thread_ts=ROOT), event_id="Ev1", source="dm"))
+    assert [p["text"] for p in client.posts] == [REFUSAL_TEXT]
+    assert app.created == [] and run.calls == [] and store.pending_proposal(key, utcnow()) is not None
+
+
+def test_partial_failures_and_items_without_a_time_are_reported_per_event(tmp_path):
+    app = CalendarWrites(fail_titles={"신임교수모임 (11월)"})
+    handler, client, run, app, store = proposal_handler(tmp_path, app=app)
+    events = [*NOTE_EVENTS, {"title": "세미나", "date": "2099-11-26", "start_time": None}]
+    store_proposal(store, "schedule", DM, ROOT, events=events)
+    asyncio.run(handler.handle_event(dm("네", ts="1700000000.000300", thread_ts=ROOT), event_id="Ev1", source="dm"))
+    assert app.created == ["신임교수모임 (10월)", "신임교수모임 (11월)"]  # never the one without a time
+    assert client.posts[-1]["text"].splitlines() == [
+        "✅ 캘린더에 추가했어요",
+        "• 2099/10/22(목) 12:00–13:00 신임교수모임 (10월) · 캘린더: 연구",
+        "❌ 2099/11/19(목) 12:00–13:00 신임교수모임 (11월) 추가 실패: 읽기 전용 캘린더예요",
+        "⏭️ 2099/11/26(목) 시간 미정 세미나: 시작 시각이 없어 추가하지 않았어요. 시각을 알려 주시면 다시 제안할게요.",
+    ]
+    assert run.calls == []
+
+
+def test_a_crash_while_creating_is_a_short_note(tmp_path, caplog):
+    handler, client, run, app, store = proposal_handler(tmp_path)
+    store_proposal(store, "schedule", DM, ROOT)
+
+    def broken(proposal):
+        raise RuntimeError(f"EventKit down {SLACK_TOKEN}")
+
+    handler.create_events = broken
+    with caplog.at_level(logging.ERROR, logger="mungchi.slack"):
+        asyncio.run(handler.handle_event(dm("네", ts="1700000000.000300", thread_ts=ROOT), event_id="Ev1", source="dm"))
+    assert client.posts[-1]["text"] == "❌ 캘린더에 추가하지 못했어요: 오류가 났어요 (RuntimeError: EventKit down ***)"
+    assert SLACK_TOKEN not in client.posts[-1]["text"] and run.calls == []
+
+
+class ProposingRun(FakeRun):
+    """Like run_turn whose agent calls propose_calendar_events: stores a proposal under the run's key, slowly."""
+
+    def __init__(self, store, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.store = store
+
+    async def __call__(self, prompt, **kwargs):
+        key = kwargs.get("conversation_key")
+        if key:
+            items, _ = normalize_events(NOTE_EVENTS[:1], tz=ZoneInfo("Asia/Seoul"), now=datetime(2099, 1, 1, tzinfo=timezone.utc))
+            self.store.save_pending_proposal(key, {"id": prompt, "calendar": None, "events": [e.to_state() for e in items]}, utcnow())
+        return await super().__call__(prompt, **kwargs)
+
+
+def test_a_yes_sent_while_the_turn_is_still_running_confirms_nothing(tmp_path):
+    store = StateStore(tmp_path / "state.json")
+    run = ProposingRun(store, statuses=(), delay=0.05)
+    handler, client, run, app, store = proposal_handler(tmp_path, run=run)
+
+    async def scenario():
+        first = asyncio.create_task(handler.handle_event(dm("메모: 10월 22일(목) 오후 12시"), event_id="Ev1", source="dm"))
+        await asyncio.sleep(0.01)  # the agent is working; the preview is not shown yet
+        await handler.handle_event(dm("네", ts="1700000000.000300", thread_ts=ROOT), event_id="Ev2", source="dm")
+        await first
+
+    asyncio.run(scenario())
+    assert app.created == []
+    assert [c["prompt"] for c in run.calls] == ["메모: 10월 22일(목) 오후 12시", "네"]
+    # After the preview is shown, "네" confirms the proposal the agent made then.
+    asyncio.run(handler.handle_event(dm("네", ts="1700000000.000400", thread_ts=ROOT), event_id="Ev3", source="dm"))
+    assert app.created == ["신임교수모임 (10월)"] and len(run.calls) == 2
+
+
+def test_two_quick_yeses_create_the_events_once(tmp_path):
+    app = CalendarWrites(delay=0.05)
+    handler, client, run, app, store = proposal_handler(tmp_path, app=app)
+    store_proposal(store, "schedule", DM, ROOT)
+
+    async def scenario():
+        await asyncio.gather(
+            handler.handle_event(dm("네", ts="1700000000.000300", thread_ts=ROOT), event_id="Ev1", source="dm"),
+            handler.handle_event(dm("응", ts="1700000000.000301", thread_ts=ROOT), event_id="Ev2", source="dm"),
+        )
+
+    asyncio.run(scenario())
+    assert app.created == ["신임교수모임 (10월)", "신임교수모임 (11월)"]
+    assert [p["text"].splitlines()[0] for p in client.posts] == ["✅ 캘린더에 추가했어요"]
+    assert run.calls == []
+
+
+def test_code_only_shortcuts_keep_the_proposal_but_a_briefing_replaces_it(tmp_path):
+    handler, client, run, app, store = proposal_handler(
+        tmp_path, "mungchi", weather_text=lambda: "🌤️ 맑음", briefing_builder=RecordingBuilder()
+    )
+    key = store_proposal(store, "mungchi", DM, ROOT)
+    asyncio.run(handler.handle_event(dm("날씨", ts="1700000000.000300", thread_ts=ROOT), event_id="Ev1", source="dm"))
+    assert store.pending_proposal(key, utcnow()) is not None
+    asyncio.run(handler.handle_event(dm("브리핑", ts="1700000000.000400", thread_ts=ROOT), event_id="Ev2", source="dm"))
+    assert store.pending_proposal(key, utcnow()) is None and app.created == []

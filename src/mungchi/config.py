@@ -382,6 +382,29 @@ def not_mac_hint(missing: list[str]) -> str:
     )
 
 
+# ---------------------------------------------------------------- adding events from a pasted note
+
+# A timed event without an end time lasts this long (minutes).
+DEFAULT_EVENT_MINUTES = 60
+MIN_EVENT_MINUTES = 5
+MAX_EVENT_MINUTES = 24 * 60
+
+
+def get_calendar_write_target(env: Mapping[str, str] | None = None) -> str:
+    """``CALENDAR_WRITE_TARGET``: the Calendar app calendar new events go to ("" = the default calendar)."""
+    return " ".join(_get(env, "CALENDAR_WRITE_TARGET").split())
+
+
+def get_default_event_minutes(env: Mapping[str, str] | None = None) -> int:
+    """``DEFAULT_EVENT_MINUTES`` (default 60); anything that is not a whole number from 5 to 1440 keeps the default."""
+    raw = _get(env, "DEFAULT_EVENT_MINUTES")
+    try:
+        minutes = int(raw) if raw else DEFAULT_EVENT_MINUTES
+    except ValueError:
+        return DEFAULT_EVENT_MINUTES
+    return minutes if MIN_EVENT_MINUTES <= minutes <= MAX_EVENT_MINUTES else DEFAULT_EVENT_MINUTES
+
+
 # ---------------------------------------------------------------- Slack
 
 # Member ids start with U (or W on Enterprise Grid); channel ids with C/G,

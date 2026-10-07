@@ -7,6 +7,11 @@ differs ("고뭉치에게 보고" vs "사용자에게 직접 답변").
 
 고뭉치's main agent calls two read-only, cheap tools itself (``get_credits``
 and ``get_weather``); Dropbox and the calendar stay delegated.
+
+A note pasted to put in the calendar is turned into a proposal
+(``propose_calendar_events``) by 업뎃 or 일정 answering directly, or by the
+일정 subagent when 고뭉치 delegates it. Nobody can create events: code does,
+after the user's "네".
 """
 
 from __future__ import annotations
@@ -18,7 +23,15 @@ from claude_agent_sdk import AgentDefinition
 
 from .personas import MUNGCHI, PERSONA_LABELS, SCHEDULE, UPDATE, josa
 from .slack_format import EXAMPLE_FOLDER_LINK, WEEKDAYS_KO
-from .tools import DATA_TOOLS, MUNGCHI_TOOLS, SCHEDULE_TOOLS, UPDATE_TOOLS
+from .tools import (
+    DATA_TOOLS,
+    MUNGCHI_TOOLS,
+    SCHEDULE_DIRECT_TOOLS,
+    SCHEDULE_TOOLS,
+    UPDATE_DIRECT_TOOLS,
+    UPDATE_TOOLS,
+)
+from .tools.event_proposals import CONFIRM_QUESTION
 
 # Korean display names of the subagents, used for prompts and CLI status lines.
 AGENT_LABELS = {UPDATE: PERSONA_LABELS[UPDATE], SCHEDULE: PERSONA_LABELS[SCHEDULE]}
@@ -29,9 +42,15 @@ SUBAGENT_TOOL = "Agent"
 SUBAGENT_TOOL_NAMES = frozenset({"Agent", "Task"})
 
 # Which persona owns which data tool, in a stable order. Enforced by the
-# PreToolUse gates below, both for subagents and for direct personas.
-PERSONA_TOOLS: dict[str, list[str]] = {UPDATE: list(UPDATE_TOOLS), SCHEDULE: list(SCHEDULE_TOOLS)}
+# PreToolUse gates below. Answering the user directly (own Slack bot,
+# ``--agent``), both may propose calendar events from a note; as 고뭉치's
+# subagents only 일정 may (업뎃 stays Dropbox-only under 고뭉치).
+PERSONA_TOOLS: dict[str, list[str]] = {UPDATE: list(UPDATE_DIRECT_TOOLS), SCHEDULE: list(SCHEDULE_DIRECT_TOOLS)}
 TOOL_OWNERS: dict[str, frozenset[str]] = {persona: frozenset(tools) for persona, tools in PERSONA_TOOLS.items()}
+SUBAGENT_TOOLS: dict[str, list[str]] = {UPDATE: list(UPDATE_TOOLS), SCHEDULE: list(SCHEDULE_TOOLS)}
+SUBAGENT_TOOL_OWNERS: dict[str, frozenset[str]] = {
+    persona: frozenset(tools) for persona, tools in SUBAGENT_TOOLS.items()
+}
 # What 고뭉치's main agent (no agent_id) may call besides the Agent tool.
 MAIN_AGENT_TOOLS: frozenset[str] = frozenset(MUNGCHI_TOOLS)
 
@@ -87,7 +106,7 @@ MUNGCHI_SYSTEM_PROMPT = """\
 
 ## 비서실 구성
 - 업뎃 (subagent_type: "update"): Dropbox 폴더(기본 20_연구-진행)에서 공저자가 바꾼 파일 목록을 확인한다. 파일 내용은 읽지 않는다.
-- '일정' 에이전트 (subagent_type: "schedule"): 이름이 '일정'인 팀원이다. 캘린더에서 일정(그날과 다음 날, 지금 / 바로 다음 일정)을 확인하고, 오늘·내일 날씨(get_weather)도 확인한다.
+- '일정' 에이전트 (subagent_type: "schedule"): 이름이 '일정'인 팀원이다. 캘린더에서 일정(그날과 다음 날, 지금 / 바로 다음 일정)을 확인하고, 오늘·내일 날씨(get_weather)도 확인한다. 사용자가 붙여 넣은 메모의 일정을 캘린더 추가 제안으로 만드는 일도 맡는다.
 - 고뭉치(너): Chat KHU 크레딧(get_credits)과 오늘·내일 날씨(get_weather)는 직접 확인한다.
 
 ## 원칙
@@ -132,6 +151,13 @@ MUNGCHI_SYSTEM_PROMPT = """\
 - 업뎃이 공저자 변경이 없다고 이유와 함께 한 줄로 보고하면 그 줄을 그대로 옮긴다.
 - 어느 기간을 봤는지는 업뎃이 적은 말(예: "최근 24시간 기준", "지난 브리핑(10/06 07:50) 이후")을 그대로 옮긴다. 왜 그 기간인지(지난 브리핑 기록이 있었는지, 어떤 실행이었는지)는 짐작해서 덧붙이지 않는다.
 
+## 메모로 일정 추가
+- 사용자가 이메일·공지 같은 메모를 붙여 넣었는데 날짜·시간이 들어 있거나, 메모의 일정을 캘린더에 추가해 달라고 하면 '일정' 에이전트에게 맡긴다. 업뎃에게는 맡기지 않는다. 너에게는 일정을 제안하거나 추가하는 도구가 없다.
+- Agent 도구의 prompt에는 [지금: ...] 줄, "이 메모의 일정을 캘린더 추가 제안으로 만들어 줘"라는 요청, 사용자가 붙여 넣은 메모 원문 전체(고치거나 줄이지 말고 그대로), 사용자가 덧붙인 요청(넣을 캘린더, 고칠 내용 등)을 모두 적는다.
+- '일정' 에이전트가 보고한 미리보기와 경고를 고치지 말고 그대로 옮긴 뒤, 답의 마지막 줄을 정확히 "{confirm}"으로 끝낸다. 보고에 이 질문 대신 확인할 수 없다는 안내(note)가 있으면 그 안내를 옮긴다.
+- 캘린더에 넣는 일은 사용자가 "네"라고 답한 뒤 프로그램이 한다. 일정이 추가되었다거나 등록되었다고 절대 말하지 않는다.
+- 사용자가 "네"·"아니요"가 아니라 고칠 내용(예: "시간은 1시로 바꿔줘")이나 질문을 보내면 앞의 제안은 이미 취소된 것이다. 질문이면 답하고, 메모 원문과 고칠 내용을 함께 '일정' 에이전트에게 다시 맡겨 새 미리보기를 받아 같은 질문으로 끝낸다. 사용자가 "네"라고 했는데 그 말이 너에게 왔다면 확인할 제안이 없는 것(시간이 지나 사라짐 등)이니 메모 원문으로 다시 맡긴다.
+
 ## 그 밖의 요청
 - 공저자 작업에 관한 질문은 업뎃에게, 일정에 관한 질문은 '일정' 에이전트에게만 맡긴다. 둘 다 필요하면 동시에 맡긴다.
 - 날씨만 묻는 질문은 위처럼 get_weather로 직접 답한다. 날씨 때문에 야외 일정이나 이동(출퇴근 등)이 달라질 수 있는지 묻는 질문(예: "내일 비 오면 일정 바꿔야 할까?")처럼 날씨와 일정이 함께 걸린 질문만 '일정' 에이전트에게 맡긴다. '일정' 에이전트도 오늘·내일 날씨만 안다.
@@ -151,7 +177,7 @@ MUNGCHI_SYSTEM_PROMPT = """\
 
 ## 출력
 - 터미널에서 읽기 좋게 간결하게 쓴다. 표 대신 짧은 목록을 쓴다.
-""".format(now_guidance=NOW_GUIDANCE, example_link=EXAMPLE_FOLDER_LINK)
+""".format(now_guidance=NOW_GUIDANCE, example_link=EXAMPLE_FOLDER_LINK, confirm=CONFIRM_QUESTION)
 
 
 # ---------------------------------------------------------------- shared prompt pieces
@@ -275,6 +301,56 @@ _SCHEDULE_BODY = """\
 날씨만 물으면 summary 한 줄로 짧게 쓴다(내일이면 tomorrow로 같은 모양의 한 줄). 일정과 함께면 위 형식에 날씨 한 줄과, 날씨 때문에 챙길 일정(야외, 이동)만 짧게 덧붙인다.
 """
 
+# ---------------------------------------------------------------- notes -> calendar proposals
+#
+# Direct 업뎃 / 일정 and the 일정 subagent. {now_from}: where the [지금: ...]
+# line is, {show}/{form}: who gets the preview, {redo}: how a correction arrives.
+
+_PROPOSE_BODY = """
+## 메모로 일정 추가 (propose_calendar_events)
+{trigger}
+1. 메모에서 일정을 하나씩 뽑는다. 메모에 없는 시각·장소·내용은 지어내지 않는다.
+   - 제목은 짧고 알아보기 쉽게 짓는다. 예: "신임교수모임 (10월)".
+   - 발표자·발표 같은 줄은 notes에 넣는다(예: "발표: 김평식 교수님"). 장소가 있으면 location에 넣는다.
+   - 본문에 연도가 없으면 {now_from} 날짜를 기준으로, 오늘이거나 오늘 뒤에 오는 가장 가까운 그 날짜로 정한다.
+   - "오후 12시"는 12:00(정오)이다. "오전 12시"는 00:00(자정)으로 넣고, 미리보기 아래에 자정이 맞는지 한 줄로 묻는다.
+   - 본문에 (목)처럼 요일이 적혀 있으면 그 한 글자를 weekday_in_text로 함께 넘긴다.
+   - 끝 시각이 없으면 end_time을 null로 둔다(프로그램이 기본 길이로 잡는다).
+   - 시작 시각이 없으면 짐작하지 않는다. start_time을 null로 두고, 미리보기 뒤에 몇 시인지 묻는다.
+2. 뽑은 일정을 모두 모아 propose_calendar_events를 한 번 부른다(events, source_note에는 메모 원문). 한 번에 10개까지다. 사용자가 넣을 캘린더를 말했으면(예: "연구 캘린더에 넣어줘") calendar에 그 이름을 넣고, 아니면 비운다.
+3. 결과의 preview를 고치지 말고 {show}, warnings가 있으면 빠짐없이 짧게 덧붙인다. {form}의 마지막 줄은 정확히 "{confirm}"으로 끝낸다. can_confirm이 false면 이 질문 대신 note를 전한다. ok가 false면 error를 그대로 전한다(errors처럼 고칠 수 있는 입력 문제면 고쳐서 다시 부른다).
+4. 캘린더에 넣는 일은 사용자가 "네"라고 답한 뒤 프로그램이 한다. 너는 넣을 수 없으니 일정이 추가되었다거나 등록되었다고 절대 말하지 않는다.
+5. {redo}
+"""
+
+_PROPOSE_FRAMING = {
+    "subagent": {
+        "trigger": "고뭉치가 사용자의 메모를 전하며 캘린더 추가 제안을 만들어 달라고 하면 이렇게 한다. 이때는 get_schedule과 get_weather를 부르지 않는다.",
+        "now_from": "고뭉치가 맡긴 글 맨 앞의 [지금: ...] 줄의",
+        "show": "고뭉치에게 그대로 보고하고",
+        "form": "보고",
+        "redo": "고뭉치가 고칠 내용과 함께 다시 맡기면 고친 전체 일정으로 propose_calendar_events를 다시 부른다(다시 부르면 앞의 제안은 사라진다).",
+    },
+    "direct": {
+        "trigger": "사용자가 이메일·공지 같은 메모를 붙여 넣었는데 날짜·시간이 들어 있거나, 메모의 일정을 캘린더에 추가해 달라고 하면 이렇게 한다.",
+        "now_from": "사용자 메시지 맨 앞의 [지금: ...] 줄의",
+        "show": "사용자에게 그대로 보여 주고",
+        "form": "답",
+        "redo": (
+            "사용자가 \"네\"·\"아니요\"가 아니라 고칠 내용(예: \"시간은 1시로 바꿔줘\")이나 질문을 보내면 앞의 제안은 이미 취소된 것이다. "
+            "질문이면 답하고, 고칠 내용을 반영한 전체 일정으로 propose_calendar_events를 다시 불러 새 미리보기와 같은 질문으로 끝낸다. "
+            "사용자가 \"네\"라고 했는데 그 말이 너에게 왔다면 확인할 제안이 없는 것(시간이 지나 사라졌거나, 고친 뒤 다시 제안하지 않음)이니 "
+            "propose_calendar_events를 다시 불러 미리보기를 다시 보여 준다."
+        ),
+    },
+}
+
+
+def build_propose_section(*, direct: bool = False) -> str:
+    """How 업뎃 / 일정 turn a pasted note into a calendar proposal (time-free, cacheable)."""
+    return _PROPOSE_BODY.format(**_PROPOSE_FRAMING["direct" if direct else "subagent"], confirm=CONFIRM_QUESTION)
+
+
 # Only in the direct version: the user talks to 업뎃 / 일정 without 고뭉치.
 _CREDITS_NOTE = (
     "- 이 시스템에서 '토큰'·'크레딧'은 Chat KHU(Mindlogic) API 크레딧을 말한다(암호화폐가 아님. "
@@ -286,7 +362,7 @@ _DIRECT_TAIL = {
     UPDATE: """\
 
 ## 대화
-- 공저자 업데이트와 상관없는 요청은 직접 처리하지 않는다. 일정·약속·날씨는 '일정' 에이전트, 종합 브리핑은 고뭉치 담당이라고 짧게 안내한다.
+- 공저자 업데이트와 상관없는 요청은 직접 처리하지 않는다. 일정·약속·날씨는 '일정' 에이전트, 종합 브리핑은 고뭉치 담당이라고 짧게 안내한다. 단, 메모를 붙여 넣고 캘린더에 넣어 달라고 하면(또는 날짜·시간이 든 메모·공지를 붙여 넣으면) 아래 '메모로 일정 추가'대로 직접 처리한다.
 """
     + _CREDITS_NOTE
     + """\
@@ -326,7 +402,8 @@ def build_schedule_prompt(*, direct: bool = False) -> str:
 
 
 UPDATE_PROMPT = build_update_prompt()
-SCHEDULE_PROMPT = build_schedule_prompt()
+# 일정 as 고뭉치's subagent also turns notes into calendar proposals; 업뎃's subagent never does.
+SCHEDULE_PROMPT = build_schedule_prompt() + build_propose_section()
 
 
 UPDATE_DESCRIPTION = (
@@ -339,7 +416,9 @@ SCHEDULE_DESCRIPTION = (
     "'일정' 에이전트. 일정·날씨 확인 담당. 캘린더에서 특정 날짜(기본 오늘)와 다음 날 일정, 지금 진행 중인 일정과 "
     "바로 다음 일정, 겹침과 빈 시간을 간결하게 보고하고, 오늘·내일 날씨(비, 기온, 미세먼지)도 확인한다. "
     "일정·약속·회의 시간 질문, 날씨 때문에 야외 일정이나 이동이 달라질지 묻는 질문과 "
-    "브리핑의 ① 오늘의 일정은 반드시 이 에이전트에게 맡긴다. 날씨만 묻는 단순한 날씨 질문은 고뭉치가 get_weather로 직접 답한다."
+    "브리핑의 ① 오늘의 일정은 반드시 이 에이전트에게 맡긴다. 사용자가 붙여 넣은 메모·공지의 일정을 캘린더에 추가해 달라는 부탁도 "
+    "이 에이전트에게 맡긴다(메모 원문을 그대로 전하면 캘린더 추가 제안과 미리보기를 만든다). "
+    "날씨만 묻는 단순한 날씨 질문은 고뭉치가 get_weather로 직접 답한다."
 )
 
 
@@ -356,7 +435,7 @@ def build_direct_prompt(persona: str) -> str:
         body = build_schedule_prompt(direct=True)
     else:
         raise ValueError(f"no direct prompt for persona {persona!r}")
-    return body + _DIRECT_TAIL[persona] + _DIRECT_OUTPUT
+    return body + _DIRECT_TAIL[persona] + build_propose_section(direct=True) + _DIRECT_OUTPUT
 
 
 def build_agents() -> dict[str, AgentDefinition]:
@@ -364,14 +443,14 @@ def build_agents() -> dict[str, AgentDefinition]:
         UPDATE: AgentDefinition(
             description=UPDATE_DESCRIPTION,
             prompt=UPDATE_PROMPT,
-            tools=list(UPDATE_TOOLS),
+            tools=list(SUBAGENT_TOOLS[UPDATE]),
             model="inherit",
             maxTurns=SUBAGENT_MAX_TURNS,
         ),
         SCHEDULE: AgentDefinition(
             description=SCHEDULE_DESCRIPTION,
             prompt=SCHEDULE_PROMPT,
-            tools=list(SCHEDULE_TOOLS),
+            tools=list(SUBAGENT_TOOLS[SCHEDULE]),
             model="inherit",
             maxTurns=SUBAGENT_MAX_TURNS,
         ),
@@ -417,10 +496,10 @@ def gate_decision(
 
     * The main agent (no ``agent_id``) may call exactly the Agent tool and its
       two read-only tools, ``get_credits`` and ``get_weather``. Dropbox, the
-      calendar and anything else are denied.
+      calendar, calendar proposals and anything else are denied.
     * Inside a subagent, data tools run only in the subagent that owns them
-      (업뎃: Dropbox; 일정: calendar and weather). ``get_credits`` belongs to
-      no subagent.
+      (업뎃: Dropbox; 일정: calendar, weather and calendar proposals).
+      ``get_credits`` belongs to no subagent; 업뎃's subagent never proposes events.
     * The Agent tool may only spawn 업뎃 or 일정.
 
     For a direct persona see ``direct_gate_decision``.
@@ -439,7 +518,7 @@ def gate_decision(
             return _decision("deny", "고뭉치는 Dropbox와 캘린더 도구를 직접 쓸 수 없습니다. 업뎃이나 '일정' 에이전트에게 맡기세요.")
         return _decision("deny", "고뭉치가 쓸 수 있는 도구는 Agent, get_credits, get_weather뿐입니다.")
     if tool_name in DATA_TOOLS:
-        owned = TOOL_OWNERS.get(agent_type or "", frozenset())
+        owned = SUBAGENT_TOOL_OWNERS.get(agent_type or "", frozenset())
         if tool_name in owned:
             return _decision("allow", f"{AGENT_LABELS[agent_type]} 전용 도구")
         return _decision("deny", "이 도구는 다른 담당자 전용입니다.")

@@ -37,7 +37,9 @@ from .agents import (
     with_now_line,
 )
 from .personas import DIRECT_PERSONAS, MUNGCHI, PERSONA_LABELS, PERSONAS, SCHEDULE, UPDATE, josa
-from .tools import DATA_TOOLS, MUNGCHI_TOOLS, SERVER_NAME, build_server, data_tools, tools_named
+from .state import StateStore, utcnow
+from .tools import DATA_TOOLS, MUNGCHI_TOOLS, PROPOSE_TOOL, SERVER_NAME, build_server, data_tools, tools_named
+from .tools import event_proposals
 from .tools.common import scrub
 
 # Built-in tools that must never be reachable (belt and braces: ``tools``
@@ -135,6 +137,8 @@ class TurnResult:
     session_id: str | None = None
     failed: bool = False
     error: str | None = None
+    # The agent (or a subagent) called propose_calendar_events in this turn.
+    proposed: bool = False
 
 
 # ---------------------------------------------------------------- error messages
@@ -218,6 +222,7 @@ def build_options(
     extra_system_prompt: str = "",
     persona: str = MUNGCHI,
     briefing: bool = False,
+    conversation_key: str | None = None,
 ) -> ClaudeAgentOptions:
     """The single place where agent options are built (CLI and Slack).
 
@@ -236,6 +241,14 @@ def build_options(
     options, so it is fixed per run, never chosen by the model, and never
     leaks into other runs of the same process.
 
+    ``conversation_key`` (``event_proposals.slack_conversation_key`` for a
+    Slack thread, ``cli_conversation_key`` for a terminal chat) is where this
+    run's calendar proposal is kept, so the user's "네" in that same thread or
+    chat can confirm it. Like ``briefing`` it is bound into this run's own
+    tool objects (also for 일정 as 고뭉치's subagent, which shares the run's
+    server), never global and never chosen by the model. ``None`` (one-shot
+    questions, briefings): a proposal is shown but cannot be confirmed.
+
     Nothing here depends on the clock: the system prompts carry no date or
     time, so they can be cached. The time is added per turn (``stamp_prompt``).
     """
@@ -251,7 +264,7 @@ def build_options(
         # tools only inside the subagent that owns them, and denies the rest.
         allowed_tools = [SUBAGENT_TOOL, *MUNGCHI_TOOLS]
         disallowed_tools = list(BLOCKED_BUILTINS)
-        server = build_server(data_tools(briefing=briefing))
+        server = build_server(data_tools(briefing=briefing, conversation_key=conversation_key))
         agents = build_agents()
     else:
         system_prompt = build_direct_prompt(persona)
@@ -261,7 +274,7 @@ def build_options(
         # the persona's PreToolUse gate denies everything else.
         allowed_tools = list(PERSONA_TOOLS[persona])
         disallowed_tools = [*BLOCKED_BUILTINS, SUBAGENT_TOOL]
-        server = build_server(tools_named(allowed_tools, briefing=briefing))
+        server = build_server(tools_named(allowed_tools, briefing=briefing, conversation_key=conversation_key))
         agents = None
     if extra_system_prompt.strip():
         system_prompt += "\n" + extra_system_prompt.strip() + "\n"
@@ -303,6 +316,8 @@ class Renderer:
         # API error texts already shown, so the closing ResultMessage does not repeat them.
         self._reported_details: list[str] = []
         self.session_id: str | None = None
+        # propose_calendar_events was called (by the agent or inside a subagent).
+        self.proposed = False
         self.status_lines: list[str] = []
         self._texts: list[str] = []
         # Index into ``_texts`` where the final answer starts: text written
@@ -347,7 +362,9 @@ class Renderer:
         return "\n\n".join(part.strip() for part in parts if part.strip())
 
     def result(self) -> TurnResult:
-        return TurnResult(text=self.answer, session_id=self.session_id, failed=self.failed, error=self.error)
+        return TurnResult(
+            text=self.answer, session_id=self.session_id, failed=self.failed, error=self.error, proposed=self.proposed
+        )
 
     def handle(self, message: Any) -> None:
         if isinstance(message, StreamEvent):
@@ -373,6 +390,8 @@ class Renderer:
             self._write(delta.get("text", ""))
 
     def _on_assistant(self, message: AssistantMessage) -> None:
+        if any(isinstance(block, ToolUseBlock) and block.name == PROPOSE_TOOL for block in message.content):
+            self.proposed = True
         if message.parent_tool_use_id:  # subagent output reaches the user via 고뭉치
             return
         if message.session_id:
@@ -453,6 +472,7 @@ async def run_turn(
     persona: str = MUNGCHI,
     clock: Clock | None = None,
     briefing: bool = False,
+    conversation_key: str | None = None,
 ) -> TurnResult:
     """Run one turn of ``persona`` in a fresh session (or ``resume`` an earlier one).
 
@@ -460,10 +480,15 @@ async def run_turn(
     ``on_status`` receives the same status lines the CLI prints, e.g.
     "→ 업뎃에게 맡기는 중...". Without ``renderer`` nothing is printed.
     The prompt is sent with the current time in front (``stamp_prompt``).
-    ``briefing=True`` only for briefing runs (see ``build_options``).
+    ``briefing=True`` only for briefing runs; ``conversation_key`` is where a
+    calendar proposal made in this turn waits for "네" (see ``build_options``).
     """
     options = build_options(
-        resume=resume, extra_system_prompt=extra_system_prompt, persona=persona, briefing=briefing
+        resume=resume,
+        extra_system_prompt=extra_system_prompt,
+        persona=persona,
+        briefing=briefing,
+        conversation_key=conversation_key,
     )
     renderer = renderer or Renderer(echo=False)
     async with ClaudeSDKClient(options=options) as client:
@@ -471,28 +496,94 @@ async def run_turn(
 
 
 async def run_once(prompt: str, persona: str = MUNGCHI) -> int:
+    # No conversation key: a calendar proposal is shown but never stored, since
+    # nobody can answer "네" to a one-shot question.
     result = await run_turn(prompt, renderer=Renderer(), persona=persona)
+    if result.proposed:
+        print(f"[참고] {event_proposals.ONE_SHOT_NOTE}", file=sys.stderr)
     return 1 if result.failed else 0
 
 
-async def run_chat(options: ClaudeAgentOptions, persona: str = MUNGCHI, *, clock: Clock | None = None) -> int:
+# What ``confirm_in_terminal`` returns when the user ended the chat at the question.
+CHAT_EXIT = object()
+Creator = Callable[[Mapping[str, Any]], "event_proposals.CreationOutcome"]
+
+
+async def confirm_in_terminal(
+    store: StateStore,
+    conversation_key: str,
+    *,
+    create: Creator | None = None,
+    now: Clock | None = None,
+) -> Any:
+    """After a chat turn: if it left a calendar proposal, ask ``캘린더에 추가할까요? [네/아니요]``.
+
+    "네" creates the events (code, never the agent) and prints the result,
+    "아니요" cancels. Anything else cancels the proposal and is returned, to be
+    sent to the agent as the next message (e.g. "시간은 1시로 바꿔줘").
+    Returns None when nothing more is to be sent, ``CHAT_EXIT`` on end of input.
+    """
+    if store.pending_proposal(conversation_key, (now or utcnow)()) is None:
+        return None
+    while True:
+        try:
+            answer = (await asyncio.to_thread(input, event_proposals.CLI_CONFIRM_PROMPT)).strip()
+        except EOFError:
+            print()
+            store.clear_pending_proposal(conversation_key)
+            return CHAT_EXIT
+        if answer:
+            break
+    kind = event_proposals.reply_kind(answer)
+    if kind is None:
+        store.clear_pending_proposal(conversation_key)  # replaced by whatever the agent does next
+        return answer
+    reply = await asyncio.to_thread(
+        event_proposals.confirm_proposal, store, conversation_key, kind, now=(now or utcnow)(), create=create
+    )
+    print(reply or event_proposals.CANCELLED_TEXT)
+    return None
+
+
+async def run_chat(
+    options: ClaudeAgentOptions,
+    persona: str = MUNGCHI,
+    *,
+    clock: Clock | None = None,
+    conversation_key: str | None = None,
+    store: StateStore | None = None,
+    create: Creator | None = None,
+) -> int:
+    """The terminal chat. With ``conversation_key`` (the one bound into ``options``),
+    a turn that proposes calendar events is followed by the yes/no question."""
     # One long-lived client keeps the whole conversation in a single session;
     # every line the user types is sent with the current time in front.
     print(CHAT_GREETINGS[persona])
+    if conversation_key and store is None:
+        store = StateStore(config.get_state_path())
+    queued: str | None = None
     async with ClaudeSDKClient(options=options) as client:
         while True:
-            try:
-                line = await asyncio.to_thread(input, "\n나> ")
-            except EOFError:
-                print()
-                break
-            prompt = line.strip()
+            if queued is not None:
+                prompt, queued = queued, None
+            else:
+                try:
+                    line = await asyncio.to_thread(input, "\n나> ")
+                except EOFError:
+                    print()
+                    break
+                prompt = line.strip()
             if not prompt:
                 continue
             if prompt.lower() in EXIT_WORDS:
                 break
             print()
             await stream_turn(client, stamp_prompt(prompt, clock), Renderer())
+            if conversation_key and store is not None:
+                follow_up = await confirm_in_terminal(store, conversation_key, create=create)
+                if follow_up is CHAT_EXIT:
+                    break
+                queued = follow_up
     print(f"{PERSONA_LABELS[persona]}: 수고하셨습니다!")
     return 0
 
@@ -606,7 +697,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--calendar-setup",
         action="store_true",
         help=(
-            "Mac 캘린더 앱 접근을 허용하고, 읽을 캘린더와 오늘·내일 일정을 확인합니다 "
+            "Mac 캘린더 앱 접근을 허용하고, 읽을 캘린더와 오늘·내일 일정, 메모로 일정을 추가할 캘린더를 확인합니다 "
             "(macOS 터미널에서 한 번 실행, Claude API는 쓰지 않음)"
         ),
     )
@@ -766,7 +857,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             return run_brief_cli()
         if args.question:
             return asyncio.run(run_once(args.question, persona))
-        return asyncio.run(run_chat(build_options(persona=persona), persona))
+        # The chat's own conversation key: a calendar proposal made in it is confirmed in it.
+        key = event_proposals.cli_conversation_key()
+        return asyncio.run(run_chat(build_options(persona=persona, conversation_key=key), persona, conversation_key=key))
     except KeyboardInterrupt:
         print(f"\n{label}: 중단했습니다.", file=sys.stderr)
         return 130

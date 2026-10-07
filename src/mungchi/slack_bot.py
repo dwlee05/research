@@ -4,7 +4,9 @@ scheduled morning briefing they send (``BRIEF_TIME``) and briefing delivery
 questions, alone or together ("날씨랑 토큰 좀 말해봐"), are answered by code,
 without an agent turn. A short briefing request to 고뭉치 ("오늘 건너뛴 브리핑
 좀 해봐", or a bare ``@고뭉치``) gets the same code-driven briefing as the
-morning one, in its thread.
+morning one, in its thread. "네" / "아니요" to a calendar proposal waiting in
+the thread (events from a pasted note) is handled by code too: the events
+are created, or the proposal dropped, without an agent turn.
 
 One process runs up to three Slack apps, one per persona: 고뭉치 (@moongchi,
 the orchestrator), 업뎃 (@update) and 일정 (@schedule), each with its own
@@ -45,6 +47,7 @@ from .slack_format import (
     to_mrkdwn,
 )
 from .state import StateStore, ThreadSessions, utcnow
+from .tools import event_proposals
 from .tools.common import safe_error, scrub
 
 log = logging.getLogger("mungchi.slack")
@@ -56,11 +59,14 @@ CreditText = Callable[[], str]
 WeatherText = Callable[[], str]
 # ``briefing.build_briefing``-like: builds today's briefing (header, weather, ① ②, credits).
 BriefingBuilder = Callable[..., Awaitable[Briefing]]
+# ``event_proposals.create_proposal_events``-like (blocking: run in a worker thread).
+EventCreator = Callable[[Mapping[str, Any]], event_proposals.CreationOutcome]
 
 REFUSAL_TEXT = "죄송하지만 이 봇은 소유자만 사용할 수 있어요."
 FRESH_SESSION_NOTE = "이 스레드의 이전 대화는 이어 갈 수 없어서, 다음 메시지부터는 새 대화로 시작해요."
 CREDIT_CRASH_TEXT = "⚠️ 크레딧을 확인하지 못했어요 ({kind}). 잠시 후 다시 시도해 주세요."
 WEATHER_CRASH_TEXT = "⚠️ 날씨를 가져오지 못했어요 ({kind}). 잠시 후 다시 시도해 주세요."
+CALENDAR_CRASH_TEXT = "❌ 캘린더에 추가하지 못했어요 ({kind}). 다시 부탁해 주세요."
 
 # Low-credit alert inside the running bots: first check shortly after start, then hourly.
 CREDIT_CHECK_FIRST_DELAY_SECONDS = 60.0
@@ -379,6 +385,8 @@ class SlackHandler:
         credit_text: CreditText | None = None,
         weather_text: WeatherText | None = None,
         briefing_builder: BriefingBuilder | None = None,
+        proposals: StateStore | None = None,
+        create_events: EventCreator | None = None,
     ):
         self.allowed_user_ids = frozenset(allowed_user_ids)
         if not self.allowed_user_ids:
@@ -401,6 +409,15 @@ class SlackHandler:
         self.weather_text = weather_text or weather.slack_weather_text
         # 고뭉치's briefing on request; None means ``build_briefing`` (looked up when used).
         self.briefing_builder = briefing_builder
+        # Calendar proposals waiting for "네" (the state file the propose tool writes),
+        # and what creates their events once confirmed (the Calendar app adapter).
+        self.proposals = proposals or StateStore(config.get_state_path())
+        self.create_events = create_events or event_proposals.create_proposal_events
+        # Threads with an agent turn running or queued: a "네" sent meanwhile came
+        # before its preview was shown, so it never confirms anything.
+        self._turns: dict[str, int] = {}
+        # Threads whose answer to a proposal is being applied right now.
+        self._confirming: set[str] = set()
         self._semaphore = semaphore or asyncio.Semaphore(max(1, max_concurrent))
         self._locks: dict[str, list[Any]] = {}
         self._seen = RecentKeys()
@@ -465,6 +482,9 @@ class SlackHandler:
         # The user's text without this bot's mention; empty means 고뭉치's briefing
         # or ``default_prompt()``.
         request = strip_mention(str(event.get("text") or ""), self.bot_user_id)
+        # "네" / "아니요" to a calendar proposal waiting in this thread: code only.
+        if await self._answer_proposal(channel, thread_ts, request):
+            return
         wanted = quick_info_request(request, weather.configured_label())
         if wanted >= {quick_info.WEATHER, quick_info.CREDITS}:
             await self._answer_weather_and_credits(channel, thread_ts)
@@ -475,6 +495,10 @@ class SlackHandler:
         if quick_info.WEATHER in wanted:
             await self._answer_weather(channel, thread_ts)
             return
+        # Anything else goes to an agent run, and replaces a calendar proposal
+        # waiting in this thread: the agent re-proposes if needed, so a later
+        # "네" can never confirm a preview the conversation has moved past.
+        self._drop_proposal(channel, thread_ts)
         if self.wants_briefing(request):
             await self._answer_briefing(channel, thread_ts)
             return
@@ -493,6 +517,65 @@ class SlackHandler:
         if self._refused.seen(f"{channel}:{thread_ts}"):
             return  # refuse once per thread
         await self._post(channel, thread_ts, REFUSAL_TEXT)
+
+    # -- calendar proposals: "네" / "아니요" (no agent turn, no LLM call)
+
+    def _conversation_key(self, channel: str, thread_ts: str) -> str:
+        return event_proposals.slack_conversation_key(self.persona, channel, thread_ts)
+
+    def _drop_proposal(self, channel: str, thread_ts: str) -> None:
+        try:
+            if self.proposals.clear_pending_proposal(self._conversation_key(channel, thread_ts)):
+                log.info("%s: 스레드 %s:%s 기다리던 캘린더 제안을 새 메시지로 대신합니다", self.texts.label, channel, thread_ts)
+        except OSError as exc:
+            log.warning("기다리던 캘린더 제안을 지우지 못했습니다: %s", safe_error(exc))
+
+    async def _answer_proposal(self, channel: str, thread_ts: str, request: str) -> bool:
+        """Apply a short yes / no to this thread's pending calendar proposal. False: not such an answer.
+
+        Only an explicit, short "네"-like reply creates the events, and only
+        in the thread (and bot) where the proposal was shown, before it
+        expires. Nothing is created for a reply sent while this thread's
+        agent turn was still running (it came before the preview). A second
+        answer while the first is being applied is dropped: answered once is enough.
+        """
+        kind = event_proposals.reply_kind(request)
+        key = self._conversation_key(channel, thread_ts)
+        if kind is None or self._turns.get(key):
+            return False
+        if key in self._confirming:
+            return True
+        try:
+            if self.proposals.pending_proposal(key, utcnow()) is None:
+                return False
+        except OSError as exc:
+            log.warning("캘린더 제안을 읽지 못했습니다: %s", safe_error(exc))
+            return False
+        log.info(
+            "%s: 스레드 %s:%s 캘린더 제안 %s (에이전트 실행 없음)",
+            self.texts.label,
+            channel,
+            thread_ts,
+            "추가" if kind == event_proposals.YES else "취소",
+        )
+        self._confirming.add(key)
+        try:
+            async with self._thread_lock(f"{self.persona}:{channel}:{thread_ts}"):
+                try:
+                    # Taken out here, on the event loop: it can never be created twice.
+                    proposal = self.proposals.take_pending_proposal(key, utcnow())
+                    if proposal is None:
+                        return True
+                    reply = await asyncio.to_thread(
+                        event_proposals.answer_text, proposal, kind, create=self.create_events
+                    )
+                except Exception as exc:  # noqa: BLE001 - reported in Slack without details
+                    _log_exception("캘린더 제안을 처리하지 못했습니다.", exc)
+                    reply = CALENDAR_CRASH_TEXT.format(kind=type(exc).__name__)
+            await self._post_shortcut(channel, thread_ts, reply)
+        finally:
+            self._confirming.discard(key)
+        return True
 
     # -- weather and credit shortcuts (no agent turn, no LLM call, no session)
     #
@@ -602,11 +685,19 @@ class SlackHandler:
                 self._locks.pop(key, None)
 
     async def _answer(self, channel: str, thread_ts: str, prompt: str) -> None:
-        placeholder = await self._post(channel, thread_ts, self.texts.placeholder)
-        # Messages in one thread run in order per bot; all bots share the cost cap.
-        async with self._thread_lock(f"{self.persona}:{channel}:{thread_ts}"):
-            async with self._semaphore:
-                await self._run_and_reply(channel, thread_ts, placeholder, prompt)
+        key = self._conversation_key(channel, thread_ts)
+        # Counted before the first await, so a "네" arriving meanwhile sees it.
+        self._turns[key] = self._turns.get(key, 0) + 1
+        try:
+            placeholder = await self._post(channel, thread_ts, self.texts.placeholder)
+            # Messages in one thread run in order per bot; all bots share the cost cap.
+            async with self._thread_lock(f"{self.persona}:{channel}:{thread_ts}"):
+                async with self._semaphore:
+                    await self._run_and_reply(channel, thread_ts, placeholder, prompt)
+        finally:
+            self._turns[key] -= 1
+            if not self._turns[key]:
+                del self._turns[key]
 
     async def _run_and_reply(self, channel: str, thread_ts: str, placeholder: str | None, prompt: str) -> None:
         persona, label = self.persona, self.texts.label
@@ -626,7 +717,13 @@ class SlackHandler:
         crash: Exception | None = None
         try:
             result = await run(
-                prompt, resume=resume, on_status=updater, extra_system_prompt=SLACK_FORMAT_PROMPT, persona=persona
+                prompt,
+                resume=resume,
+                on_status=updater,
+                extra_system_prompt=SLACK_FORMAT_PROMPT,
+                persona=persona,
+                # A calendar proposal made in this turn waits for "네" in this thread, for this bot.
+                conversation_key=self._conversation_key(channel, thread_ts),
             )
         except Exception as exc:  # noqa: BLE001 - reported in Slack without details
             crash = exc

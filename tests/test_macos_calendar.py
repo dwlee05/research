@@ -137,6 +137,10 @@ class FakeAdapter:
         self.calls.append("list")
         return [dict(c) for c in self.calendars]
 
+    def list_writable_calendars(self):
+        self.calls.append("writable")
+        return [{**c, "is_default": i == 0} for i, c in enumerate(self.calendars) if c["name"] != "생일"]
+
     def fetch_events(self, start, end, names=None):
         self.calls.append("fetch")
         self.threads.add(threading.current_thread().name)
