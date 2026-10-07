@@ -1,7 +1,8 @@
 """Slack front end: the Socket Mode bots (``python -m mungchi slack``), the
 scheduled morning briefing they send (``BRIEF_TIME``) and briefing delivery
-(``python -m mungchi --brief --slack``). Short credit and weather questions
-are answered by code, without an agent turn.
+(``python -m mungchi --brief --slack``). Short credit ("토큰") and weather
+questions, alone or together ("날씨랑 토큰 좀 말해봐"), are answered by code,
+without an agent turn.
 
 One process runs up to three Slack apps, one per persona: 고뭉치 (@moongchi,
 the orchestrator), 업뎃 (@update) and 일정 (@schedule), each with its own
@@ -29,7 +30,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Mapping, S
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 
-from . import briefing, config, credits, weather
+from . import briefing, config, credits, quick_info, version, weather
 from .briefing import BRIEF_CRASH_TEXT, build_briefing
 from .main import TurnResult, briefing_prompt, run_turn
 from .personas import MUNGCHI, PERSONA_LABELS, PERSONAS, SCHEDULE, SLACK_HANDLES, UPDATE, josa
@@ -181,6 +182,24 @@ def compose_reply(result: TurnResult, persona: str = MUNGCHI) -> str:
 def to_slack_chunks(text: str) -> list[str]:
     """Final outgoing text: secrets scrubbed, mrkdwn safety net, Slack-sized chunks."""
     return chunk_text(to_mrkdwn(scrub(text)))
+
+
+def quick_info_request(text: str, label: str | None = None) -> set[str]:
+    """What a message asks the code-only shortcuts for: a subset of ``{"weather", "credits"}``.
+
+    ``quick_info.parse_quick_info`` first (one or both, e.g. "날씨랑 토큰 좀
+    말해봐"), then the single-purpose matchers (``credits.is_credit_query``,
+    ``weather.is_weather_query``) so every phrasing they know still works.
+    Empty: the message goes to the agent. Pure.
+    """
+    wanted = quick_info.parse_quick_info(text, label)
+    if wanted:
+        return wanted
+    if credits.is_credit_query(text):
+        return {quick_info.CREDITS}
+    if weather.is_weather_query(text, label):
+        return {quick_info.WEATHER}
+    return set()
 
 
 def remember_session(
@@ -422,10 +441,14 @@ class SlackHandler:
             return
         # The user's text without this bot's mention; empty means ``default_prompt()``.
         request = strip_mention(str(event.get("text") or ""), self.bot_user_id)
-        if credits.is_credit_query(request):
+        wanted = quick_info_request(request, weather.configured_label())
+        if wanted >= {quick_info.WEATHER, quick_info.CREDITS}:
+            await self._answer_weather_and_credits(channel, thread_ts)
+            return
+        if quick_info.CREDITS in wanted:
             await self._answer_credits(channel, thread_ts)
             return
-        if weather.is_weather_query(request, weather.configured_label()):
+        if quick_info.WEATHER in wanted:
             await self._answer_weather(channel, thread_ts)
             return
         # Never the text itself: only its length and whether a shortcut word was in it.
@@ -434,7 +457,7 @@ class SlackHandler:
             self.texts.label,
             len(request),
             "예" if "날씨" in request else "아니오",
-            "예" if "크레딧" in request else "아니오",
+            "예" if "크레딧" in request or "토큰" in request else "아니오",
         )
         await self._answer(channel, thread_ts, request or self.default_prompt())
 
@@ -444,31 +467,44 @@ class SlackHandler:
             return  # refuse once per thread
         await self._post(channel, thread_ts, REFUSAL_TEXT)
 
-    # -- credit shortcut (no agent turn, no LLM call, no session)
+    # -- weather and credit shortcuts (no agent turn, no LLM call, no session)
+    #
+    # The reply goes into the thread; the thread -> session map is not touched.
+
+    async def _shortcut_text(self, fetch: Callable[[], str], crash: str, failure: str) -> str:
+        """``fetch()`` in a worker thread, or ``crash`` (with the exception's class name) when it fails or is empty."""
+        try:
+            text = await asyncio.to_thread(fetch)
+        except Exception as exc:  # noqa: BLE001 - reported in Slack without details
+            _log_exception(failure, exc)
+            return crash.format(kind=type(exc).__name__)
+        return text if (text or "").strip() else crash.format(kind="빈 응답")
+
+    async def _credit_text(self) -> str:
+        return await self._shortcut_text(self.credit_text, CREDIT_CRASH_TEXT, "크레딧을 확인하지 못했습니다.")
+
+    async def _weather_text(self) -> str:
+        return await self._shortcut_text(self.weather_text, WEATHER_CRASH_TEXT, "날씨를 가져오지 못했습니다.")
+
+    async def _post_shortcut(self, channel: str, thread_ts: str, text: str) -> None:
+        for chunk in to_slack_chunks(text):
+            await self._post(channel, thread_ts, chunk)
 
     async def _answer_credits(self, channel: str, thread_ts: str) -> None:
-        """Reply in the thread with the credit summary; the thread -> session map is not touched."""
+        """Reply with the credit summary."""
         log.info("%s: 스레드 %s:%s 크레딧 바로 답변 (에이전트 실행 없음)", self.texts.label, channel, thread_ts)
-        try:
-            text = await asyncio.to_thread(self.credit_text)
-        except Exception as exc:  # noqa: BLE001 - reported in Slack without details
-            _log_exception("크레딧을 확인하지 못했습니다.", exc)
-            text = CREDIT_CRASH_TEXT.format(kind=type(exc).__name__)
-        for chunk in to_slack_chunks(text) or [CREDIT_CRASH_TEXT.format(kind="빈 응답")]:
-            await self._post(channel, thread_ts, chunk)
-
-    # -- weather shortcut (no agent turn, no LLM call, no session)
+        await self._post_shortcut(channel, thread_ts, await self._credit_text())
 
     async def _answer_weather(self, channel: str, thread_ts: str) -> None:
-        """Reply in the thread with today's weather line; the thread -> session map is not touched."""
+        """Reply with today's weather line."""
         log.info("%s: 스레드 %s:%s 날씨 바로 답변 (에이전트 실행 없음)", self.texts.label, channel, thread_ts)
-        try:
-            text = await asyncio.to_thread(self.weather_text)
-        except Exception as exc:  # noqa: BLE001 - reported in Slack without details
-            _log_exception("날씨를 가져오지 못했습니다.", exc)
-            text = WEATHER_CRASH_TEXT.format(kind=type(exc).__name__)
-        for chunk in to_slack_chunks(text) or [WEATHER_CRASH_TEXT.format(kind="빈 응답")]:
-            await self._post(channel, thread_ts, chunk)
+        await self._post_shortcut(channel, thread_ts, await self._weather_text())
+
+    async def _answer_weather_and_credits(self, channel: str, thread_ts: str) -> None:
+        """Reply with the weather line, a blank line, then the credit summary (both fetched at once)."""
+        log.info("%s: 스레드 %s:%s 날씨·크레딧 바로 답변 (에이전트 실행 없음)", self.texts.label, channel, thread_ts)
+        weather_text, credit_text = await asyncio.gather(self._weather_text(), self._credit_text())
+        await self._post_shortcut(channel, thread_ts, f"{weather_text}\n\n{credit_text}")
 
     # -- running a turn
 
@@ -916,6 +952,29 @@ def _start_morning_brief(
         return None
 
 
+async def record_code_version(
+    code_version: Callable[[], str] | None = None,
+    store: StateStore | None = None,
+    now: datetime | None = None,
+) -> str:
+    """Print ``코드 버전: abc1234`` and write it with the start time to the state file. Never raises.
+
+    ``service status`` compares it with the repository's commit, so a bot
+    still running old code after ``git pull`` shows up there.
+    """
+    try:
+        current = await asyncio.to_thread(code_version or version.code_version)
+    except Exception as exc:  # noqa: BLE001 - a version label never stops the bots
+        log.warning("코드 버전을 확인하지 못했습니다: %s", safe_error(exc))
+        current = version.package_version()
+    print(f"코드 버전: {current}", file=sys.stderr)
+    try:
+        (store or StateStore(config.get_state_path())).mark_running(current, now or utcnow())
+    except OSError as exc:
+        log.warning("실행 중인 코드 버전을 상태 파일에 기록하지 못했습니다 (봇은 그대로 돕니다): %s", safe_error(exc))
+    return current
+
+
 async def run_bots(
     cfg: config.SlackConfig,
     *,
@@ -923,19 +982,25 @@ async def run_bots(
     wait: Callable[[], Awaitable[None]] = _wait_forever,
     credit_alert: Callable[..., Awaitable[None]] | None = None,
     brief_scheduler: Callable[..., Awaitable[None]] | None = None,
+    code_version: Callable[[], str] | None = None,
+    store: StateStore | None = None,
 ) -> int:
     """Connect every configured bot over Socket Mode and serve them in one event loop.
 
-    While they run, ``credit_alert`` (default ``credit_alert_loop``) watches the
-    Chat KHU credits and DMs the allowed users through 고뭉치's bot (or the
-    first configured bot) when they run low, and ``brief_scheduler`` (default
-    ``morning_brief_loop``, only with ``BRIEF_TIME`` and 고뭉치's bot) sends
-    the morning briefing through 고뭉치's bot.
+    First the running code's version (``code_version``, default
+    ``version.code_version``: the short git commit) is printed and written to
+    the state file (``store``). While the bots run, ``credit_alert`` (default
+    ``credit_alert_loop``) watches the Chat KHU credits and DMs the allowed
+    users through 고뭉치's bot (or the first configured bot) when they run
+    low, and ``brief_scheduler`` (default ``morning_brief_loop``, only with
+    ``BRIEF_TIME`` and 고뭉치's bot) sends the morning briefing through
+    고뭉치's bot.
     """
     if socket_factory is None:
         from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 
         socket_factory = AsyncSocketModeHandler
+    await record_code_version(code_version, store)
     bots = build_apps(cfg)
     sockets: list[Any] = []
     alert_task: asyncio.Task[None] | None = None

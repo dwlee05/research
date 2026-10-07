@@ -2,7 +2,7 @@
 
 The briefing (``--brief``, ``--brief --slack`` and the scheduled morning
 briefing), ``python -m mungchi --weather`` and the Slack shortcut ("@고뭉치
-날씨") all go through here, and so does the 일정 agent's ``get_weather`` tool
+날씨") all go through here, and so does the ``get_weather`` tool of 일정 and 고뭉치
 (``weather_payload``: today and tomorrow as compact JSON). The data comes
 from Open-Meteo (free, no key):
 
@@ -33,6 +33,7 @@ import httpx
 
 from . import config
 from .model_list import SSL_HINT
+from .quick_info import query_text
 from .tools.common import safe_error, scrub
 
 log = logging.getLogger("mungchi.weather")
@@ -108,26 +109,6 @@ WEATHER_TAIL_RE = (
     r"|확인(?: ?해 ?줘)?|보여 ?줘|궁금해)"
 )
 WEATHER_PLACES = ("서울", "여기")
-# Slack sends emoji as ":name:" (":pray:", ":+1::skin-tone-2:").
-_TRAILING_SHORTCODES_RE = re.compile(r"(?:\s*:[a-z0-9_+'.-]+:)+\s*$")
-
-
-def _is_trailing_noise(char: str) -> bool:
-    """Space, punctuation, symbols (emoji included) and the marks / joiners emoji are built with."""
-    category = unicodedata.category(char)
-    return char.isspace() or category[0] in ("P", "S") or category in ("Mn", "Me", "Cf")
-
-
-def _query_text(text: str) -> str:
-    """NFC, lower case, single spaces, trailing punctuation / emoji / ":shortcode:" removed."""
-    text = " ".join(unicodedata.normalize("NFC", text).lower().split())
-    while True:
-        before = text
-        text = _TRAILING_SHORTCODES_RE.sub("", text)
-        while text and _is_trailing_noise(text[-1]):
-            text = text[:-1]
-        if text == before:
-            return text
 
 
 @functools.lru_cache(maxsize=16)
@@ -148,7 +129,7 @@ def is_weather_query(text: str | None, label: str | None = None) -> bool:
     ``label`` is the configured ``WEATHER_LABEL`` (e.g. 부산); 서울 and 여기 are
     always accepted as the place. Pure: no LLM call, no I/O.
     """
-    normalized = _query_text(text or "")
+    normalized = query_text(text)
     return bool(normalized) and _weather_query_re(label or "").match(normalized) is not None
 
 
@@ -518,7 +499,7 @@ def slack_weather_text(
     return weather_line(env, transport=transport, slack=True)
 
 
-# ---------------------------------------------------------------- the get_weather tool (일정)
+# ---------------------------------------------------------------- the get_weather tool (일정, 고뭉치)
 
 
 def _degrees(value: float | None) -> int | None:

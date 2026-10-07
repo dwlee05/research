@@ -1975,6 +1975,182 @@ def test_default_weather_text_offline_is_the_short_note(tmp_path):
     assert [p["text"] for p in client.posts] == ["🌤️ *서울 날씨*: 가져오지 못했어요"]
 
 
+# ---------------------------------------------------------------- "토큰" and the combined weather + credit shortcut (no LLM)
+
+COMBINED_TEXT = f"{FakeWeatherText.TEXT}\n\n{FakeCredits.TEXT}"
+
+
+@pytest.mark.parametrize("persona", ["mungchi", "update", "schedule"])
+@pytest.mark.parametrize(
+    "event,source",
+    [
+        (dm("뭉치야 날씨랑 토큰 좀 말해봐"), "dm"),  # what the user actually sent
+        (mention(f"<@{BOT}> 날씨하고 크레딧"), "mention"),
+        (mention(f"<@{BOT}> 오늘 날씨랑 남은 토큰 알려줘"), "mention"),
+        (dm("토큰이랑 날씨 🙏"), "dm"),
+    ],
+)
+def test_weather_and_credits_together_are_answered_by_code(tmp_path, persona, event, source):
+    fake_weather, fake_credits = FakeWeatherText(), FakeCredits()
+    handler, client, run = make_handler(tmp_path, persona=persona, weather_text=fake_weather, credit_text=fake_credits)
+    asyncio.run(handler.handle_event(event, event_id="Ev1", source=source))
+    assert run.calls == []  # run_turn is never called: no LLM
+    assert fake_weather.calls == 1 and fake_credits.calls == 1
+    [post] = client.posts
+    # The weather line, a blank line, then the credit summary, in one threaded reply.
+    assert post["text"] == COMBINED_TEXT
+    assert post["text"].split("\n\n") == [FakeWeatherText.TEXT, FakeCredits.TEXT]
+    assert post["thread_ts"] == event["ts"] and post["channel"] == event["channel"]
+    assert client.updates == []  # no placeholder
+    assert not (tmp_path / "threads.json").exists()
+    assert handler.sessions.threads() == {}
+
+
+def test_weather_and_credits_are_fetched_concurrently(tmp_path):
+    import threading
+
+    # Each fetch waits until the other one has started: run one after the other, both would time out.
+    barrier = threading.Barrier(2, timeout=5)
+
+    def weather_text():
+        barrier.wait()
+        return FakeWeatherText.TEXT
+
+    def credit_text():
+        barrier.wait()
+        return FakeCredits.TEXT
+
+    handler, client, run = make_handler(tmp_path, weather_text=weather_text, credit_text=credit_text)
+    asyncio.run(handler.handle_event(dm("날씨랑 토큰"), event_id="Ev1", source="dm"))
+    assert [p["text"] for p in client.posts] == [COMBINED_TEXT]
+    assert run.calls == []
+
+
+@pytest.mark.parametrize("persona", ["mungchi", "update", "schedule"])
+def test_the_combined_shortcut_still_refuses_strangers(tmp_path, persona, monkeypatch):
+    monkeypatch.setattr(slack_bot.weather, "configured_label", lambda: pytest.fail("the allow-list comes first"))
+    fake_weather, fake_credits = FakeWeatherText(), FakeCredits()
+    handler, client, run = make_handler(tmp_path, persona=persona, weather_text=fake_weather, credit_text=fake_credits)
+
+    async def scenario():
+        await handler.handle_event(dm("뭉치야 날씨랑 토큰 좀 말해봐", user=STRANGER), event_id="Ev1", source="dm")
+        await handler.handle_event(mention(f"<@{BOT}> 토큰 좀 알려줘", user=STRANGER), event_id="Ev2", source="mention")
+
+    asyncio.run(scenario())
+    assert fake_weather.calls == 0 and fake_credits.calls == 0 and run.calls == []
+    assert [p["text"] for p in client.posts] == [REFUSAL_TEXT, REFUSAL_TEXT]
+
+
+def test_one_failing_half_of_the_combined_reply_is_a_short_note(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    fake_weather, fake_credits = FakeWeatherText(), FakeCredits(RuntimeError(f"boom {SLACK_TOKEN}"))
+    handler, client, run = make_handler(tmp_path, weather_text=fake_weather, credit_text=fake_credits)
+    with caplog.at_level(logging.ERROR, logger="mungchi.slack"):
+        asyncio.run(handler.handle_event(dm("날씨랑 토큰"), event_id="Ev1", source="dm"))
+    assert run.calls == []
+    assert [p["text"] for p in client.posts] == [
+        FakeWeatherText.TEXT + "\n\n" + slack_bot.CREDIT_CRASH_TEXT.format(kind="RuntimeError")
+    ]
+    assert SLACK_TOKEN not in caplog.text
+
+    client.calls.clear()
+    handler = make_handler(tmp_path, client=client, weather_text=FakeWeatherText(""), credit_text=FakeCredits())[0]
+    asyncio.run(handler.handle_event(dm("날씨랑 토큰", ts="1700000000.000300"), event_id="Ev2", source="dm"))
+    assert [p["text"] for p in client.posts] == [
+        slack_bot.WEATHER_CRASH_TEXT.format(kind="빈 응답") + "\n\n" + FakeCredits.TEXT
+    ]
+
+
+@pytest.mark.parametrize("persona", ["mungchi", "update", "schedule"])
+@pytest.mark.parametrize(
+    "text", ["토큰", "토큰 좀 알려줘", "남은 토큰", "토큰 얼마나 남았어?", "토큰 사용량", "잔여 토큰", "뭉치야 토큰"]
+)
+def test_token_means_the_credits(tmp_path, persona, text):
+    fake_weather, fake_credits = FakeWeatherText(), FakeCredits()
+    handler, client, run = make_handler(tmp_path, persona=persona, weather_text=fake_weather, credit_text=fake_credits)
+    asyncio.run(handler.handle_event(dm(text), event_id="Ev1", source="dm"))
+    assert run.calls == [] and fake_weather.calls == 0 and fake_credits.calls == 1
+    assert [p["text"] for p in client.posts] == [FakeCredits.TEXT]
+    assert handler.sessions.threads() == {}
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["토큰 아끼려면 어떻게 해?", "토큰이 뭐야?", "날씨 좋은 날 야외 미팅 잡아줘", "이번 주 Dropbox 변경이랑 날씨", "내일 비 오면 일정 바꿔야 할까?"],
+)
+def test_questions_that_need_the_agent_still_go_there(tmp_path, text):
+    fake_weather, fake_credits = FakeWeatherText(), FakeCredits()
+    handler, client, run = make_handler(tmp_path, weather_text=fake_weather, credit_text=fake_credits)
+    asyncio.run(handler.handle_event(dm(text), event_id="Ev1", source="dm"))
+    assert fake_weather.calls == 0 and fake_credits.calls == 0
+    assert [c["prompt"] for c in run.calls] == [text]
+
+
+# ---------------------------------------------------------------- running-version record on startup
+
+
+def test_run_bots_prints_and_records_the_code_version(tmp_path, monkeypatch, capsys):
+    _no_network(monkeypatch)
+    FakeSocket.instances = []
+    _patch_build_apps(monkeypatch, tmp_path)
+    store = StateStore(tmp_path / "state.json")
+    store.mark_brief_date("2026-10-07")  # other keys are kept
+
+    async def no_wait():
+        return None
+
+    cfg = config.load_slack_config(ALL_BOTS_ENV)
+    code = asyncio.run(
+        slack_bot.run_bots(
+            cfg,
+            socket_factory=FakeSocket,
+            wait=no_wait,
+            credit_alert=lambda *a: asyncio.sleep(0),
+            code_version=lambda: "abc1234",
+            store=store,
+        )
+    )
+    assert code == 0
+    assert "코드 버전: abc1234" in capsys.readouterr().err.splitlines()
+    version, since = store.running()
+    assert version == "abc1234" and since is not None and since.tzinfo is not None
+    assert store.last_brief_date() == "2026-10-07"
+
+
+def test_the_version_record_uses_git_and_never_stops_the_bots(tmp_path, monkeypatch, capsys, caplog):
+    from mungchi import version
+
+    store = StateStore(tmp_path / "state.json")
+    git_calls = []
+
+    def fake_git(args):
+        git_calls.append(list(args))
+        return "def5678\n" if "rev-parse" in args else " M src/mungchi/slack_bot.py\n"
+
+    monkeypatch.setattr(version, "run_git", fake_git)  # the default lookup, on a fake git
+    now = datetime(2026, 10, 7, 0, 30, tzinfo=timezone.utc)
+    assert asyncio.run(slack_bot.record_code_version(store=store, now=now)) == "def5678-dirty"
+    assert "코드 버전: def5678-dirty" in capsys.readouterr().err
+    assert store.running() == ("def5678-dirty", now)
+    assert [call[2:] for call in git_calls] == [
+        ["rev-parse", "--short", "HEAD"],
+        ["--no-optional-locks", "status", "--porcelain", "--untracked-files=no"],
+    ]
+    assert all(call[:2] == ["-C", str(version.detect_repo_dir())] for call in git_calls)
+
+    # A broken version lookup or an unwritable state file only logs a warning.
+    def broken():
+        raise RuntimeError("git exploded")
+
+    blocked = tmp_path / "blocked"
+    blocked.write_text("a file, not a folder", encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="mungchi.slack"):
+        assert asyncio.run(slack_bot.record_code_version(broken, StateStore(blocked / "state.json"))) == "v0.1.0"
+    assert "코드 버전: v0.1.0" in capsys.readouterr().err
+    assert "코드 버전을 확인하지 못했습니다" in caplog.text
+    assert "실행 중인 코드 버전을 상태 파일에 기록하지 못했습니다" in caplog.text
+
+
 # ---------------------------------------------------------------- the weather line in --brief --slack and the scheduled briefing
 
 

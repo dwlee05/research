@@ -3,7 +3,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from mungchi import config
+from mungchi import config, version
 
 MUNGCHI_ENV_VARS = (
     "MUNGCHI_MODEL",
@@ -59,11 +59,14 @@ def isolated_env(monkeypatch: pytest.MonkeyPatch, tmp_path):
     tests see the header, the answer and the credits only; the weather tests
     turn it on themselves. A real httpx request (one not given a
     ``MockTransport``) fails as if offline instead of reaching the internet.
+    git is never run either: the running-version lookup sees no git (the
+    package version) unless a test gives it a fake git.
     """
     for name in MUNGCHI_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("BRIEF_WEATHER", "off")
     monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _no_network)
+    monkeypatch.setattr(version, "run_git", lambda args, **kwargs: None)
     monkeypatch.setattr(config, "current_platform", lambda: "linux")
     monkeypatch.chdir(tmp_path)
     yield

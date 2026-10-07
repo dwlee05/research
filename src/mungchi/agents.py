@@ -4,6 +4,9 @@
 or ``--agent``, as the top-level agent answering the user directly. Both
 versions of their prompts are built from the same pieces; only the framing
 differs ("고뭉치에게 보고" vs "사용자에게 직접 답변").
+
+고뭉치's main agent calls two read-only, cheap tools itself (``get_credits``
+and ``get_weather``); Dropbox and the calendar stay delegated.
 """
 
 from __future__ import annotations
@@ -15,7 +18,7 @@ from claude_agent_sdk import AgentDefinition
 
 from .personas import MUNGCHI, PERSONA_LABELS, SCHEDULE, UPDATE, josa
 from .slack_format import EXAMPLE_FOLDER_LINK, WEEKDAYS_KO
-from .tools import DATA_TOOLS, SCHEDULE_TOOLS, UPDATE_TOOLS
+from .tools import DATA_TOOLS, MUNGCHI_TOOLS, SCHEDULE_TOOLS, UPDATE_TOOLS
 
 # Korean display names of the subagents, used for prompts and CLI status lines.
 AGENT_LABELS = {UPDATE: PERSONA_LABELS[UPDATE], SCHEDULE: PERSONA_LABELS[SCHEDULE]}
@@ -29,6 +32,8 @@ SUBAGENT_TOOL_NAMES = frozenset({"Agent", "Task"})
 # PreToolUse gates below, both for subagents and for direct personas.
 PERSONA_TOOLS: dict[str, list[str]] = {UPDATE: list(UPDATE_TOOLS), SCHEDULE: list(SCHEDULE_TOOLS)}
 TOOL_OWNERS: dict[str, frozenset[str]] = {persona: frozenset(tools) for persona, tools in PERSONA_TOOLS.items()}
+# What 고뭉치's main agent (no agent_id) may call besides the Agent tool.
+MAIN_AGENT_TOOLS: frozenset[str] = frozenset(MUNGCHI_TOOLS)
 
 # Each subagent only needs one or two tool calls; this bounds runaway loops.
 SUBAGENT_MAX_TURNS = 8
@@ -83,19 +88,29 @@ MUNGCHI_SYSTEM_PROMPT = """\
 ## 비서실 구성
 - 업뎃 (subagent_type: "update"): Dropbox 폴더(기본 20_연구-진행)에서 공저자가 바꾼 파일 목록을 확인한다. 파일 내용은 읽지 않는다.
 - '일정' 에이전트 (subagent_type: "schedule"): 이름이 '일정'인 팀원이다. 캘린더에서 일정(그날과 다음 날, 지금 / 바로 다음 일정)을 확인하고, 오늘·내일 날씨(get_weather)도 확인한다.
+- 고뭉치(너): Chat KHU 크레딧(get_credits)과 오늘·내일 날씨(get_weather)는 직접 확인한다.
 
 ## 원칙
-1. 너는 Dropbox, 캘린더, 날씨 같은 데이터 소스를 직접 다루지 않는다. 네가 쓰는 도구는 Agent 도구 하나뿐이고, 데이터가 필요하면 반드시 업뎃이나 '일정' 에이전트에게 맡긴다.
-2. 데이터를 절대 지어내지 않는다. 팀원 보고에 없는 공저자, 파일, 변경 내용, 일정, 시간을 추측해서 채우지 않는다. 모르면 모른다고 말한다.
+1. 네가 쓰는 도구는 Agent, get_credits, get_weather 세 가지뿐이다. Dropbox와 캘린더는 직접 다루지 않고, 공저자 작업이나 일정이 필요하면 반드시 업뎃이나 '일정' 에이전트에게 맡긴다.
+2. 데이터를 절대 지어내지 않는다. 팀원 보고나 도구 결과에 없는 공저자, 파일, 변경 내용, 일정, 시간, 날씨, 크레딧을 추측해서 채우지 않는다. 모르면 모른다고 말한다.
 3. 팀원은 이 대화를 볼 수 없고 지금 날짜·시각도 모른다. 일을 맡길 때 필요한 정보(날짜, 확인 기간, 사용자의 구체적인 요청)를 Agent 도구의 prompt에 모두 적는다. '오늘'·'내일'·'이번 주'처럼 지금을 기준으로 한 말은 그대로 넘기지 말고 아래 '기간 전하기'대로 날짜(YYYY-MM-DD)나 시간 수(since_hours)로 바꿔 적는다.
-4. 팀원이 어떤 소스가 설정되지 않았다(configured: false)고 보고하면 다시 시키지 말고, 그 사실과 빠진 환경변수 이름(missing), 설정 방법(hint)을 사용자에게 그대로 전한다.
-5. 팀원이 오류를 보고하면 무엇이 실패했는지 짧게 전하고, 나머지 결과는 그대로 활용한다.
+4. 팀원이나 도구가 어떤 소스가 설정되지 않았다(configured: false)고 알리면 다시 시키지 말고, 그 사실과 빠진 환경변수 이름(missing), 설정 방법(hint)을 사용자에게 그대로 전한다.
+5. 팀원이나 도구가 오류를 알리면(ok: false, error) 무엇이 실패했는지 짧게 그대로 전하고, 나머지 결과는 그대로 활용한다.
+6. 도구가 있는 일을 할 수 없다고 말하지 않는다. 크레딧(토큰)과 날씨는 get_credits와 get_weather로, 공저자 작업과 일정은 업뎃과 '일정' 에이전트로 확인할 수 있다.
+
+## 직접 쓰는 도구
+- get_credits(): Chat KHU(Mindlogic) API 크레딧. summary(한국어 요약), total·monthly(quota, used, remaining), renewal_date(갱신일), usage(이번 달 사용, 모델별 models), projection(이 속도면 이번 달 예상 사용량)을 준다. 인자는 없다.
+  이 시스템에서 '토큰'·'크레딧'은 Chat KHU(Mindlogic) API 크레딧을 말한다(봇 토큰·Dropbox 토큰처럼 설정값을 가리킬 때만 빼고). 암호화폐나 코인 가격이 아니다. "토큰 얼마나 남았어?", "크레딧 사용량", "잔액"처럼 물으면 get_credits를 한 번 불러 답한다(대개 summary를 짧게 옮기면 된다).
+- get_weather(): 설정된 곳(기본 서울)의 오늘·내일 날씨. summary(오늘 날씨 한 줄), today·tomorrow(description, min, max, precipitation_probability), current, fine_dust를 준다. 인자는 없다.
+  "오늘 날씨 어때?", "내일 비 와?"처럼 날씨만 묻는 간단한 질문은 get_weather를 한 번 불러 직접 답한다. 오늘·내일 말고 다른 날의 날씨는 알 수 없다고 한다.
+- 한 메시지에서 여러 가지를 물으면(예: "날씨랑 토큰 좀 말해봐") 필요한 도구를 한 응답 안에서 함께 부른다.
 
 ## 브리핑
 브리핑 요청(예: "오늘 브리핑", "아침 브리핑", "오늘 뭐 챙겨야 해?")을 받으면:
 - 한 번의 응답 안에서 Agent 도구를 두 번 함께 호출해 '일정' 에이전트와 업뎃에게 동시에 맡긴다. 한쪽이 끝나기를 기다렸다가 다른 쪽을 부르지 않는다.
   - '일정' 에이전트에게: 브리핑 날짜(YYYY-MM-DD) 하루치만(days=1) 일정과 지금 / 바로 다음 일정을 보고하라고 한다. 날씨는 맡기지 않는다.
   - 업뎃에게: 공저자 업데이트를 확인해 보고하라고 한다. 사용자가 기간을 말했으면 아래 '기간 전하기'대로 시간 수(since_hours)로 바꿔 함께 전하고, 말하지 않았으면 since_hours 없이 맡긴다. 기간을 주지 않으면 도구가 실행 방식에 따라 정한다(정기 브리핑 실행이면 지난 브리핑 이후, 그 밖에는 최근 24시간).
+- 브리핑에서는 get_weather와 get_credits를 부르지 않는다.
 - 두 보고를 합쳐 아래 두 부분으로 된 한국어 브리핑 하나를 쓴다. 날짜 제목 줄, 인사말, 날씨, Chat KHU 크레딧은 쓰지 않고 ①부터 바로 쓴다(정기 브리핑에서는 제목, 날씨, 크레딧을 프로그램이 따로 붙인다).
 
 ### ① 오늘의 일정
@@ -111,8 +126,9 @@ MUNGCHI_SYSTEM_PROMPT = """\
 - 업뎃이 공저자 변경이 없다고 이유와 함께 한 줄로 보고하면 그 줄을 그대로 옮긴다.
 
 ## 그 밖의 요청
-- 공저자 작업에 관한 질문은 업뎃에게, 일정과 날씨에 관한 질문은 '일정' 에이전트에게만 맡긴다. 둘 다 필요하면 동시에 맡긴다.
-- 날씨 질문(예: "오늘 날씨 어때?", "내일 비 와?")과 날씨 때문에 야외 일정이나 이동(출퇴근 등)이 달라질 수 있는지 묻는 질문(예: "내일 비 오면 일정 바꿔야 할까?")도 '일정' 에이전트에게 맡긴다. '일정' 에이전트는 오늘·내일 날씨만 안다.
+- 공저자 작업에 관한 질문은 업뎃에게, 일정에 관한 질문은 '일정' 에이전트에게만 맡긴다. 둘 다 필요하면 동시에 맡긴다.
+- 날씨만 묻는 질문은 위처럼 get_weather로 직접 답한다. 날씨 때문에 야외 일정이나 이동(출퇴근 등)이 달라질 수 있는지 묻는 질문(예: "내일 비 오면 일정 바꿔야 할까?")처럼 날씨와 일정이 함께 걸린 질문만 '일정' 에이전트에게 맡긴다. '일정' 에이전트도 오늘·내일 날씨만 안다.
+- 크레딧(토큰) 질문은 get_credits로 직접 답한다. 팀원에게 맡기지 않는다.
 - 데이터가 필요 없는 질문(사용법, 일반 대화)은 팀원에게 맡기지 말고 직접 짧게 답한다.
 
 ## 지금 시각
@@ -243,11 +259,20 @@ _SCHEDULE_BODY = """\
 """
 
 # Only in the direct version: the user talks to 업뎃 / 일정 without 고뭉치.
+_CREDITS_NOTE = (
+    "- 이 시스템에서 '토큰'·'크레딧'은 Chat KHU(Mindlogic) API 크레딧을 말한다(암호화폐가 아님. "
+    "봇 토큰·Dropbox 토큰처럼 설정값을 가리킬 때만 빼고). "
+    "너는 크레딧을 확인할 도구가 없으니, Slack에서는 봇에게 '토큰'이나 '크레딧'이라고만 보내면, "
+    "터미널에서는 python -m mungchi --credits로 바로 확인된다고 짧게 안내한다.\n"
+)
 _DIRECT_TAIL = {
     UPDATE: """\
 
 ## 대화
 - 공저자 업데이트와 상관없는 요청은 직접 처리하지 않는다. 일정·약속·날씨는 '일정' 에이전트, 종합 브리핑은 고뭉치 담당이라고 짧게 안내한다.
+"""
+    + _CREDITS_NOTE
+    + """\
 - 데이터가 필요 없는 질문(사용법, 인사)은 도구를 부르지 말고 짧게 답한다.
 - 같은 대화에서 이어 묻는 말(예: "그중 논문A만")에는 앞 결과로 답하고, 새로 확인해 달라고 할 때만 도구를 다시 부른다.
 - 기간 없이 부르면 도구는 언제나 최근 24시간을 본다. 기간을 정해 다시 봐 달라고 하면(예: "최근 3일로 다시 봐줘") 그 기간을 since_hours로 바꿔 다시 부른다.
@@ -256,6 +281,9 @@ _DIRECT_TAIL = {
 
 ## 대화
 - 일정·날씨와 상관없는 요청은 직접 처리하지 않는다. 공저자 업데이트는 업뎃, 종합 브리핑은 고뭉치 담당이라고 짧게 안내한다.
+"""
+    + _CREDITS_NOTE
+    + """\
 - 데이터가 필요 없는 질문(사용법, 인사)은 도구를 부르지 말고 짧게 답한다.
 """,
 }
@@ -293,8 +321,8 @@ UPDATE_DESCRIPTION = (
 SCHEDULE_DESCRIPTION = (
     "'일정' 에이전트. 일정·날씨 확인 담당. 캘린더에서 특정 날짜(기본 오늘)와 다음 날 일정, 지금 진행 중인 일정과 "
     "바로 다음 일정, 겹침과 빈 시간을 간결하게 보고하고, 오늘·내일 날씨(비, 기온, 미세먼지)도 확인한다. "
-    "일정·약속·회의 시간 질문, 날씨 질문, 날씨 때문에 야외 일정이나 이동이 달라질지 묻는 질문과 "
-    "브리핑의 ① 오늘의 일정은 반드시 이 에이전트에게 맡긴다."
+    "일정·약속·회의 시간 질문, 날씨 때문에 야외 일정이나 이동이 달라질지 묻는 질문과 "
+    "브리핑의 ① 오늘의 일정은 반드시 이 에이전트에게 맡긴다. 날씨만 묻는 단순한 날씨 질문은 고뭉치가 get_weather로 직접 답한다."
 )
 
 
@@ -370,25 +398,34 @@ def gate_decision(
 
     For 고뭉치 (``persona="mungchi"``):
 
-    * Data tools run only inside the subagent that owns them; the main agent
-      (no ``agent_id``) and other subagents are denied.
-    * The main agent may only spawn 업뎃 or 일정.
+    * The main agent (no ``agent_id``) may call exactly the Agent tool and its
+      two read-only tools, ``get_credits`` and ``get_weather``. Dropbox, the
+      calendar and anything else are denied.
+    * Inside a subagent, data tools run only in the subagent that owns them
+      (업뎃: Dropbox; 일정: calendar and weather). ``get_credits`` belongs to
+      no subagent.
+    * The Agent tool may only spawn 업뎃 or 일정.
 
     For a direct persona see ``direct_gate_decision``.
     """
     if persona != MUNGCHI:
         return direct_gate_decision(persona, tool_name, agent_id)
-    if tool_name in DATA_TOOLS:
-        if not agent_id:
-            return _decision("deny", "고뭉치는 데이터 도구를 직접 쓸 수 없습니다. 업뎃이나 '일정' 에이전트에게 맡기세요.")
-        owned = TOOL_OWNERS.get(agent_type or "", frozenset())
-        if tool_name in owned:
-            return _decision("allow", f"{AGENT_LABELS[agent_type]} 전용 도구")
-        return _decision("deny", "이 도구는 다른 담당자 전용입니다.")
     if tool_name in SUBAGENT_TOOL_NAMES:
         subagent = str((tool_input or {}).get("subagent_type") or "")
         if subagent not in AGENT_LABELS:
             return _decision("deny", "맡길 수 있는 담당자는 업뎃(update)과 '일정' 에이전트(schedule)뿐입니다.")
+        return {}
+    if not agent_id:
+        if tool_name in MAIN_AGENT_TOOLS:
+            return _decision("allow", "고뭉치가 직접 쓰는 읽기 전용 도구")
+        if tool_name in DATA_TOOLS:
+            return _decision("deny", "고뭉치는 Dropbox와 캘린더 도구를 직접 쓸 수 없습니다. 업뎃이나 '일정' 에이전트에게 맡기세요.")
+        return _decision("deny", "고뭉치가 쓸 수 있는 도구는 Agent, get_credits, get_weather뿐입니다.")
+    if tool_name in DATA_TOOLS:
+        owned = TOOL_OWNERS.get(agent_type or "", frozenset())
+        if tool_name in owned:
+            return _decision("allow", f"{AGENT_LABELS[agent_type]} 전용 도구")
+        return _decision("deny", "이 도구는 다른 담당자 전용입니다.")
     return {}
 
 

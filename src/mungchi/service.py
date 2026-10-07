@@ -41,10 +41,12 @@ from typing import Any, Callable, Mapping, Sequence, TextIO
 
 from . import config
 from . import main as main_module
+from . import version
 from .main import KoreanArgumentParser, KoreanHelpFormatter
 from .state import StateStore
 from .tools import macos_calendar
 from .tools.common import safe_error, scrub
+from .version import GitRunner, detect_repo_dir
 
 LABEL = "local.mungchi.bot"
 APP_NAME = "MungchiBot"
@@ -219,29 +221,6 @@ def launch_agent(app_path: str | Path, log_path: str | Path) -> dict[str, Any]:
 # ---------------------------------------------------------------- helpers
 
 
-def _is_project_root(path: Path) -> bool:
-    try:
-        text = (path / "pyproject.toml").read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return False
-    return re.search(r"""(?m)^\s*name\s*=\s*["']mungchi["']""", text) is not None
-
-
-def detect_repo_dir(module_file: str | Path | None = None, cwd: str | Path | None = None) -> Path:
-    """The project root (holding mungchi's ``pyproject.toml``), else the working directory.
-
-    The package's own location is tried first (an editable install lives in
-    ``<repo>/src/mungchi``), then the working directory and its parents.
-    Symlinks are kept as written so the bot runs from the same path as before.
-    """
-    module_path = Path(os.path.abspath(module_file or __file__))
-    here = Path(os.path.abspath(cwd or os.getcwd()))
-    for candidate in (*module_path.parents, here, *here.parents):
-        if _is_project_root(candidate):
-            return candidate
-    return here
-
-
 def read_env_file(path: Path) -> dict[str, str]:
     from dotenv import dotenv_values
 
@@ -296,9 +275,10 @@ def _remove(path: Path) -> None:
 class Service:
     """Install, control and inspect the background service.
 
-    Everything outside Python goes through ``runner``; ``home``, ``uid``,
-    ``platform``, the interpreter paths, ``sleep`` and ``out`` are injectable
-    so tests never touch the real system.
+    Everything outside Python goes through ``runner`` (and ``git``, for the
+    repository's commit); ``home``, ``uid``, ``platform``, the interpreter
+    paths, ``sleep`` and ``out`` are injectable so tests never touch the real
+    system.
     """
 
     def __init__(
@@ -316,8 +296,11 @@ class Service:
         repo_dir: str | Path | None = None,
         environ: Mapping[str, str] | None = None,
         stop_wait_seconds: float = STOP_WAIT_SECONDS,
+        git: GitRunner | None = None,
     ):
         self.runner = run_command if runner is None else runner
+        # Only ``status`` asks git (read-only) which commit the repository is at.
+        self.git = git
         self.home = Path(home) if home is not None else Path.home()
         self._uid = uid
         self.platform = config.current_platform() if platform is None else platform
@@ -490,6 +473,40 @@ class Service:
         last = StateStore(config.get_state_path(env, base_dir=self.repo_dir)).last_brief_date()
         lines.append(f"- 마지막 아침 브리핑 (last_brief_date): {last or '아직 없음'}")
         return lines
+
+    def running_code_lines(self, service_pids: Sequence[int], foreground_pids: Sequence[int]) -> tuple[list[str], list[str]]:
+        """``status`` lines about the code the bots run, and a closing warning when it is not the repository's.
+
+        The bots write ``running_version`` / ``running_since`` to the state
+        file when they start; the repository's commit comes from git.
+        """
+        env = self.service_env()
+        record = StateStore(config.get_state_path(env, base_dir=self.repo_dir)).running()
+        current = version.git_version(self.repo_dir, self.git)
+        tz = config.get_timezone(env)
+        repo_line = f"- 저장소 코드: {current}" if current else "- 저장소 코드: 알 수 없음 (git으로 확인하지 못했습니다)"
+
+        def started(record: tuple[str, datetime | None]) -> str:
+            _version, since = record
+            return f"{since.astimezone(tz):%Y-%m-%d %H:%M} 시작" if since else "시작 시각 모름"
+
+        if not service_pids and not foreground_pids:
+            last = f". 마지막으로 시작한 코드: {record[0]}, {started(record)}" if record else ""
+            return [f"- 실행 중인 코드: 없음 (봇이 돌고 있지 않습니다{last})", repo_line], []
+        restart = f"{COMMAND} restart" if service_pids else "터미널에서 띄운 봇을 Ctrl+C로 끄고 python -m mungchi slack 으로 다시 켜세요"
+        if record is None:
+            line = "- 실행 중인 코드: 기록 없음 (코드 버전을 기록하기 전의 예전 코드로 시작한 봇입니다)"
+            newest = f"최신({current})을" if current else "최신 코드를"
+            return [line, repo_line], [f"⚠️ 봇이 버전 기록이 없는 예전 코드로 돌고 있어요. {newest} 적용하려면: {restart}"]
+        running_version = record[0]
+        line = f"- 실행 중인 코드: {running_version} ({started(record)})"
+        if current is None or not version.is_git_version(running_version):
+            return [line + " (저장소 코드와 비교하지 못했습니다)", repo_line], []
+        if running_version == current:
+            return [line + " → 저장소 최신 코드와 같습니다", repo_line], []
+        return [line, repo_line], [
+            f"⚠️ 봇이 예전 코드({running_version})로 돌고 있어요. 최신({current})을 적용하려면: {restart}"
+        ]
 
     def log_secrets(self) -> list[str]:
         """Secret values to hide when showing logs (the bot already scrubs; this is a second net)."""
@@ -749,6 +766,9 @@ class Service:
                 f"- [경고] 터미널에서 직접 띄운 봇도 돌고 있습니다 (PID {_pids(foreground_pids)}). "
                 "Slack 이벤트가 나뉘니 그 터미널 탭에서 Ctrl+C로 끄세요."
             )
+        code_lines, code_warnings = self.running_code_lines(service_pids, foreground_pids)
+        for line in code_lines:
+            self.say(line)
         record = last_calendar_record(self.bot_log)
         if record:
             when, text = record
@@ -758,6 +778,10 @@ class Service:
             self.say(f"- 캘린더 권한 ('{APP_DISPLAY_NAME}' 앱): 아직 기록 없음 (서비스가 시작하면 로그에 남습니다)")
         for line in self.morning_brief_lines():
             self.say(line)
+        if code_warnings:
+            self.say()
+            for line in code_warnings:
+                self.say(line)
 
         self.say()
         if self.bot_log.is_file():
@@ -993,7 +1017,7 @@ ACTION_HELP = {
     "start": "서비스를 시작합니다",
     "stop": "서비스를 멈춥니다 (다음 로그인 때 다시 켜짐)",
     "restart": "서비스를 다시 시작합니다 (.env를 고친 뒤 사용)",
-    "status": "설치·실행 상태, 서비스 앱의 캘린더 권한, 아침 브리핑 시각, 최근 로그 10줄을 보여 줍니다",
+    "status": "설치·실행 상태, 실행 중인 코드 버전, 서비스 앱의 캘린더 권한, 아침 브리핑 시각, 최근 로그 10줄을 보여 줍니다",
     "logs": "봇 로그를 보여 줍니다 (-f: 계속 보기, -n N: 마지막 N줄)",
     "run": "(내부용) 서비스 앱이 실행하는 명령입니다. 직접 실행하지 마세요",
 }

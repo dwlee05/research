@@ -38,7 +38,7 @@ from .agents import (
     with_now_line,
 )
 from .personas import DIRECT_PERSONAS, MUNGCHI, PERSONA_LABELS, PERSONAS, SCHEDULE, UPDATE, josa
-from .tools import DATA_TOOLS, SERVER_NAME, build_server, data_tools, tools_named
+from .tools import DATA_TOOLS, MUNGCHI_TOOLS, SERVER_NAME, build_server, data_tools, tools_named
 from .tools.common import scrub
 
 # Built-in tools that must never be reachable (belt and braces: ``tools``
@@ -255,9 +255,11 @@ def build_options(
         system_prompt = build_system_prompt()
         # Built-in tool availability: only the subagent-invocation tool.
         builtin_tools = [SUBAGENT_TOOL]
-        # 고뭉치's only pre-approved tool. Data tools are approved per subagent
-        # by the PreToolUse hook (``tool_gate``) and denied for 고뭉치 itself.
-        allowed_tools = [SUBAGENT_TOOL]
+        # 고뭉치's pre-approved tools: Agent and its two read-only tools
+        # (get_credits, get_weather). The PreToolUse hook (``tool_gate``)
+        # allows exactly these for 고뭉치 itself, approves the other data
+        # tools only inside the subagent that owns them, and denies the rest.
+        allowed_tools = [SUBAGENT_TOOL, *MUNGCHI_TOOLS]
         disallowed_tools = list(BLOCKED_BUILTINS)
         server = build_server(data_tools(briefing=briefing))
         agents = build_agents()
@@ -520,12 +522,16 @@ class KoreanArgumentParser(argparse.ArgumentParser):
 def build_parser() -> argparse.ArgumentParser:
     parser = KoreanArgumentParser(
         prog="mungchi",
-        description="고뭉치 비서실: 업뎃(공저자 업데이트)과 '일정'(캘린더·날씨)에게 일을 맡기는 연구 비서.",
+        description=(
+            "고뭉치 비서실: 업뎃(공저자 업데이트)과 '일정'(캘린더·날씨)에게 일을 맡기는 연구 비서.\n"
+            "Chat KHU 크레딧('토큰')과 오늘·내일 날씨는 고뭉치가 직접 확인합니다(get_credits, get_weather)."
+        ),
         epilog=(
             "예시:\n"
             "  python -m mungchi                       # 대화 모드\n"
             "  python -m mungchi --brief               # 오늘 브리핑 (날씨, 일정, Dropbox 업데이트, 크레딧)\n"
             '  python -m mungchi "어제 공저자들이 뭐 고쳤어?"   # 질문 한 번\n'
+            '  python -m mungchi "날씨랑 토큰 좀 알려줘"      # 고뭉치가 날씨와 Chat KHU 크레딧을 직접 확인\n'
             "  python -m mungchi slack                 # Slack 봇 실행 (Socket Mode, BRIEF_TIME이 있으면 아침 브리핑도)\n"
             "  python -m mungchi --brief --slack       # 오늘 브리핑을 지금 바로 Slack에 올리기 (아침 브리핑 시험용)\n"
             '  python -m mungchi --agent update "누가 무슨 파일 고쳤어?"   # 업뎃에게 바로 묻기\n'
@@ -537,10 +543,11 @@ def build_parser() -> argparse.ArgumentParser:
             "  python -m mungchi --calendar-setup      # Mac 캘린더 앱 연결 (처음 한 번, 터미널에서)\n"
             "  python -m mungchi --dropbox-check --hours 72   # 업뎃이 Dropbox 변경을 못 찾을 때 원인 확인 (최근 72시간)\n"
             "  python -m mungchi service install       # (macOS) Slack 봇을 백그라운드 서비스로 설치 (로그인하면 자동 시작)\n"
-            "  python -m mungchi service status        # (macOS) 서비스 상태와 최근 로그\n"
+            "  python -m mungchi service status        # (macOS) 서비스 상태(실행 중인 코드 버전 포함)와 최근 로그\n"
             "\n"
             "질문 자리에 slack 한 단어만 쓰면 질문이 아니라 Slack 봇 실행 명령으로 처리합니다.\n"
             "Slack 봇은 고뭉치·업뎃·일정 가운데 토큰을 넣은 봇이 한 프로세스에서 함께 켜집니다.\n"
+            "Slack에서 '날씨', '토큰'(크레딧), '날씨랑 토큰 좀 알려줘'처럼 짧게 물으면 LLM 호출 없이 바로 답합니다.\n"
             "Slack 설정(SLACK_BOT_TOKEN 등)은 README의 'Slack에서 부르기'를 보세요.\n"
             "\n"
             "마찬가지로 맨 앞에 service 한 단어를 쓰면 질문이 아니라 백그라운드 서비스 명령(macOS 전용)입니다:\n"

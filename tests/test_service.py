@@ -11,6 +11,7 @@ quoting.
 from __future__ import annotations
 
 import io
+import json
 import os
 import plistlib
 import re
@@ -19,7 +20,7 @@ import signal
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -45,7 +46,9 @@ from mungchi.service import (
     service_run,
     tail_lines,
 )
+from mungchi.state import StateStore
 from mungchi.tools.macos_calendar import DENIED, GRANTED, NOT_DETERMINED, EventKitUnavailable
+from mungchi.version import run_git as real_run_git  # conftest swaps version.run_git for "no git"
 
 UID = 501
 DOMAIN = f"gui/{UID}"
@@ -164,6 +167,29 @@ class Sleeps(list):
         self.append(seconds)
 
 
+class FakeGit:
+    """Answers ``git -C <repo> rev-parse --short HEAD`` and ``status --porcelain`` like a checkout at ``head``.
+
+    ``head=None``: git is missing or the folder is not a checkout (every call fails).
+    """
+
+    def __init__(self, head=None, *, dirty=False):
+        self.head, self.dirty = head, dirty
+        self.calls: list[list[str]] = []
+
+    def __call__(self, args):
+        args = list(args)
+        self.calls.append(args)
+        assert args[0] == "-C"
+        if self.head is None:
+            return None
+        if args[2:] == ["rev-parse", "--short", "HEAD"]:
+            return self.head + "\n"
+        if args[2:] == ["--no-optional-locks", "status", "--porcelain", "--untracked-files=no"]:
+            return " M src/mungchi/slack_bot.py\n" if self.dirty else ""
+        raise AssertionError(f"unexpected git call: {args}")
+
+
 @pytest.fixture
 def paths(tmp_path):
     """A home and a repository whose paths have spaces, Korean and a quote."""
@@ -190,6 +216,7 @@ def make_service(paths, runner, **overrides):
         repo_dir=repo,
         environ={},
         stop_wait_seconds=1.0,
+        git=FakeGit(),
     )
     options.update(overrides)
     return Service(**options)
@@ -770,6 +797,166 @@ def test_status_hints_for_stopped_and_crash_looping_services(paths):
     svc.status()
     assert "launchd에는 등록되어 있지만 봇 프로세스가 없습니다" in output(svc)
     assert "~/Library/Logs/mungchi/launchd.log" in output(svc)
+
+
+# ---------------------------------------------------------------- which code the bots run (status)
+
+RESTART_WARNING = "⚠️ 봇이 예전 코드(abc1234)로 돌고 있어요. 최신(def5678)을 적용하려면: python -m mungchi service restart"
+STARTED = datetime(2026, 10, 7, 0, 12, tzinfo=timezone.utc)  # 09:12 in Seoul
+
+
+def record_running(paths, version="abc1234", when=STARTED):
+    _home, repo = paths
+    StateStore(repo / ".mungchi_state.json").mark_running(version, when)
+
+
+def test_status_warns_when_the_bot_runs_older_code_than_the_repository(paths, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # status runs from anywhere; the state file is in the repository
+    install_fully(paths)
+    record_running(paths)
+    git = FakeGit("def5678")
+    runner = FakeRunner(loaded=True, service_pids=[1234])
+    svc = make_service(paths, runner, git=git)
+    write_log(svc)
+    assert svc.status() == 0
+    text = output(svc)
+    assert "- 실행 중인 코드: abc1234 (2026-10-07 09:12 시작)" in text
+    assert "- 저장소 코드: def5678" in text
+    assert RESTART_WARNING in text.splitlines()
+    # Before the log, so the log stays the last thing shown.
+    assert text.index(RESTART_WARNING) < text.index("최근 로그")
+    assert text.split("마지막 10줄):\n", 1)[1].splitlines()[-1].startswith("  2026-10-06 10:00:00")
+    # git only reads the repository; launchctl / pgrep are unchanged.
+    assert git.calls == [
+        ["-C", str(paths[1]), "rev-parse", "--short", "HEAD"],
+        ["-C", str(paths[1]), "--no-optional-locks", "status", "--porcelain", "--untracked-files=no"],
+    ]
+    assert runner.calls == [["launchctl", "print", TARGET], PGREP_SERVICE, PGREP_SLACK]
+
+
+def test_status_says_the_bot_runs_the_repositorys_code(paths):
+    record_running(paths, "def5678")
+    svc = make_service(paths, FakeRunner(loaded=True, service_pids=[1234]), git=FakeGit("def5678"))
+    svc.status()
+    text = output(svc)
+    assert "- 실행 중인 코드: def5678 (2026-10-07 09:12 시작) → 저장소 최신 코드와 같습니다" in text
+    assert "⚠️" not in text
+
+    # Uncommitted changes count as newer code until the bot restarts with them.
+    record_running(paths, "def5678-dirty")
+    svc = make_service(paths, FakeRunner(loaded=True, service_pids=[1234]), git=FakeGit("def5678", dirty=True))
+    svc.status()
+    assert "→ 저장소 최신 코드와 같습니다" in output(svc) and "⚠️" not in output(svc)
+    svc = make_service(paths, FakeRunner(loaded=True, service_pids=[1234]), git=FakeGit("def5678", dirty=True))
+    record_running(paths, "def5678")
+    svc.status()
+    assert "⚠️ 봇이 예전 코드(def5678)로 돌고 있어요. 최신(def5678-dirty)을 적용하려면: python -m mungchi service restart" in output(svc)
+
+
+def test_status_warns_about_a_bot_started_before_versions_were_recorded(paths):
+    svc = make_service(paths, FakeRunner(loaded=True, service_pids=[1234]), git=FakeGit("def5678"))
+    svc.status()
+    text = output(svc)
+    assert "- 실행 중인 코드: 기록 없음 (코드 버전을 기록하기 전의 예전 코드로 시작한 봇입니다)" in text
+    assert "⚠️ 봇이 버전 기록이 없는 예전 코드로 돌고 있어요. 최신(def5678)을 적용하려면: python -m mungchi service restart" in text
+
+    svc = make_service(paths, FakeRunner(loaded=True, service_pids=[1234]))  # no git either
+    svc.status()
+    assert "- 저장소 코드: 알 수 없음 (git으로 확인하지 못했습니다)" in output(svc)
+    assert "⚠️ 봇이 버전 기록이 없는 예전 코드로 돌고 있어요. 최신 코드를 적용하려면: python -m mungchi service restart" in output(svc)
+
+
+def test_status_when_the_bot_is_not_running_shows_the_last_start_without_a_warning(paths):
+    install_fully(paths)
+    record_running(paths)
+    svc = make_service(paths, FakeRunner(), git=FakeGit("def5678"))
+    svc.status()
+    text = output(svc)
+    assert "- 실행 중인 코드: 없음 (봇이 돌고 있지 않습니다. 마지막으로 시작한 코드: abc1234, 2026-10-07 09:12 시작)" in text
+    assert "- 저장소 코드: def5678" in text
+    assert "⚠️" not in text
+    assert "서비스가 멈춰 있습니다. 켜려면: python -m mungchi service start" in text
+
+    _home, repo = paths
+    (repo / ".mungchi_state.json").unlink()
+    svc = make_service(paths, FakeRunner(), git=FakeGit("def5678"))
+    svc.status()
+    assert "- 실행 중인 코드: 없음 (봇이 돌고 있지 않습니다)\n" in output(svc)
+    assert "⚠️" not in output(svc)
+
+
+def test_status_points_a_terminal_bot_to_its_own_restart(paths):
+    record_running(paths)
+    svc = make_service(paths, FakeRunner(foreground_pids=[4321]), git=FakeGit("def5678"))
+    svc.status()
+    assert (
+        "⚠️ 봇이 예전 코드(abc1234)로 돌고 있어요. 최신(def5678)을 적용하려면: "
+        "터미널에서 띄운 봇을 Ctrl+C로 끄고 python -m mungchi slack 으로 다시 켜세요"
+    ) in output(svc)
+
+
+def test_status_cannot_compare_a_bot_started_without_git(paths):
+    record_running(paths, "v0.1.0")
+    svc = make_service(paths, FakeRunner(loaded=True, service_pids=[1234]), git=FakeGit("def5678"))
+    svc.status()
+    assert "- 실행 중인 코드: v0.1.0 (2026-10-07 09:12 시작) (저장소 코드와 비교하지 못했습니다)" in output(svc)
+    assert "⚠️" not in output(svc)
+
+
+def test_code_version_is_the_short_commit_with_dirty_or_the_package_version(tmp_path, monkeypatch):
+    from mungchi import version
+
+    assert version.code_version(tmp_path, git=FakeGit("abc1234")) == "abc1234"
+    assert version.code_version(tmp_path, git=FakeGit("abc1234", dirty=True)) == "abc1234-dirty"
+    assert version.code_version(tmp_path, git=FakeGit(None)) == "v0.1.0"  # no git: the package version
+    assert version.code_version(tmp_path, git=lambda args: "fatal: not a git repository\n") == "v0.1.0"
+
+    def broken(args):
+        raise RuntimeError("boom")
+
+    assert version.code_version(tmp_path, git=broken) == "v0.1.0"
+    assert version.is_git_version("abc1234") and version.is_git_version("abc1234-dirty")
+    assert not version.is_git_version("v0.1.0") and not version.is_git_version(None)
+
+    # run_git: a missing git or a hanging one is None, never an exception.
+    def missing(*args, **kwargs):
+        raise FileNotFoundError("git")
+
+    def hanging(*args, **kwargs):
+        raise subprocess.TimeoutExpired("git", kwargs.get("timeout"))
+
+    for fake_run in (missing, hanging):
+        monkeypatch.setattr(version.subprocess, "run", fake_run)
+        assert real_run_git(["rev-parse", "--short", "HEAD"]) is None
+    seen = []
+
+    def answer(returncode):
+        def run(args, **kwargs):
+            seen.append((args, kwargs["timeout"]))
+            return subprocess.CompletedProcess(args, returncode, stdout="abc1234\n", stderr="")
+
+        return run
+
+    monkeypatch.setattr(version.subprocess, "run", answer(0))
+    assert real_run_git(["-C", "/repo", "rev-parse", "--short", "HEAD"]) == "abc1234\n"
+    assert seen == [(["git", "-C", "/repo", "rev-parse", "--short", "HEAD"], version.GIT_TIMEOUT_SECONDS)]
+    monkeypatch.setattr(version.subprocess, "run", answer(128))  # e.g. "not a git repository"
+    assert real_run_git(["-C", "/repo", "rev-parse", "--short", "HEAD"]) is None
+    # The tests themselves never run git: the default lookup sees none.
+    assert version.code_version() == "v0.1.0"
+
+
+def test_state_keeps_the_running_version_next_to_the_other_keys(tmp_path):
+    store = StateStore(tmp_path / "state.json")
+    assert store.running() is None
+    store.mark_brief_date("2026-10-07")
+    store.mark_running("abc1234", STARTED)
+    assert store.running() == ("abc1234", STARTED)
+    assert store.last_brief_date() == "2026-10-07"
+    data = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert data["running_version"] == "abc1234" and data["running_since"] == "2026-10-07T00:12:00+00:00"
+    (tmp_path / "state.json").write_text('{"running_version": "", "running_since": "nope"}', encoding="utf-8")
+    assert store.running() is None
 
 
 def test_logs_prints_the_last_lines_scrubbed(paths):

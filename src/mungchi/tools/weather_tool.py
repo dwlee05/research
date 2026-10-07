@@ -1,4 +1,4 @@
-"""``get_weather``: today's and tomorrow's weather for the 일정 agent (Open-Meteo, no key).
+"""``get_weather``: today's and tomorrow's weather for 일정 and 고뭉치 (Open-Meteo, no key).
 
 The data and the Korean line come from ``mungchi.weather``, the same code as
 the briefing's weather line, ``--weather`` and the Slack shortcut.

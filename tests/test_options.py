@@ -51,6 +51,7 @@ from mungchi.slack_format import EXAMPLE_FOLDER_LINK, SLACK_FOLDER_LINE_EXAMPLE,
 from mungchi.tools import (
     ALL_TOOLS,
     CALENDAR_TOOL,
+    CREDITS_TOOL,
     DATA_TOOLS,
     DROPBOX_TOOL,
     SERVER_NAME,
@@ -92,14 +93,16 @@ def test_agents_have_ascii_keys_and_own_tools_only():
     assert DROPBOX_TOOL == "mcp__mungchi__check_dropbox_updates"
 
 
-def test_main_agent_can_only_use_the_agent_tool():
+def test_main_agent_can_use_only_the_agent_tool_and_its_two_read_only_tools():
     opts = options()
     assert opts.tools == ["Agent"]
-    assert opts.allowed_tools == ["Agent"]
+    # Agent, plus get_credits and get_weather (read-only, cheap); Dropbox and the calendar stay delegated.
+    assert opts.allowed_tools == ["Agent", CREDITS_TOOL, WEATHER_TOOL]
     for builtin in ("Bash", "Write", "Edit"):
         assert builtin in opts.disallowed_tools
         assert builtin not in opts.tools
-    assert not set(DATA_TOOLS) & set(opts.allowed_tools)
+    assert set(DATA_TOOLS) & set(opts.allowed_tools) == {CREDITS_TOOL, WEATHER_TOOL}
+    assert DROPBOX_TOOL not in opts.allowed_tools and CALENDAR_TOOL not in opts.allowed_tools
     assert opts.permission_mode == "dontAsk"
     assert opts.setting_sources == []
     assert opts.env["CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS"] == "1"
@@ -111,15 +114,19 @@ def test_data_tools_are_gated_per_subagent():
         out = gate_decision(tool, tool_input or {}, agent_type, agent_id)
         return out.get("hookSpecificOutput", {}).get("permissionDecision")
 
-    # Main thread (no agent_id) can never call data tools.
-    for tool in DATA_TOOLS:
-        assert decision(tool) == "deny"
-    # Each subagent may call only its own tools.
+    # Main thread (no agent_id): never Dropbox or the calendar; get_credits and get_weather it calls itself.
+    assert decision(DROPBOX_TOOL) == "deny"
+    assert decision(CALENDAR_TOOL) == "deny"
+    assert decision(CREDITS_TOOL) == "allow"
+    assert decision(WEATHER_TOOL) == "allow"
+    # Each subagent may call only its own tools; get_credits belongs to no subagent.
     assert decision(DROPBOX_TOOL, UPDATE, "a1") == "allow"
     assert decision(CALENDAR_TOOL, UPDATE, "a1") == "deny"
     assert decision(CALENDAR_TOOL, SCHEDULE, "a2") == "allow"
     assert decision(DROPBOX_TOOL, SCHEDULE, "a2") == "deny"
     assert decision(DROPBOX_TOOL, "general-purpose", "a3") == "deny"
+    for agent_type in (UPDATE, SCHEDULE, "general-purpose"):
+        assert decision(CREDITS_TOOL, agent_type, "a4") == "deny"
     # Only 업뎃 and 일정 can be spawned.
     assert decision("Agent", tool_input={"subagent_type": "update"}) is None
     assert decision("Agent", tool_input={"subagent_type": "general-purpose"}) == "deny"
@@ -482,13 +489,13 @@ def test_mungchi_options_are_unchanged_by_personas(server_spy):
     default, explicit = options(), build_options(env={}, persona="mungchi")
     for field in (*SAFETY_FIELDS, "system_prompt"):
         assert getattr(default, field) == getattr(explicit, field), field
-    assert explicit.tools == ["Agent"] and explicit.allowed_tools == ["Agent"]
+    assert explicit.tools == ["Agent"] and explicit.allowed_tools == ["Agent", CREDITS_TOOL, WEATHER_TOOL]
     assert explicit.disallowed_tools == BLOCKED_BUILTINS
     assert set(explicit.agents) == {"update", "schedule"}
     assert explicit.hooks["PreToolUse"][0].hooks == [tool_gate]
     assert TOOL_GATES["mungchi"] is tool_gate
-    # 고뭉치's server keeps every data tool for its subagents (built for this run).
-    assert server_spy == [["check_dropbox_updates", "get_schedule", "get_weather"]] * 2
+    # 고뭉치's server keeps every data tool for its subagents and itself (built for this run).
+    assert server_spy == [["check_dropbox_updates", "get_schedule", "get_weather", "get_credits"]] * 2
 
 
 def test_unknown_persona_is_rejected():
@@ -616,8 +623,8 @@ def test_cli_agent_argument_rules(capsys):
 def test_update_has_exactly_one_data_tool():
     assert UPDATE_TOOLS == [DROPBOX_TOOL]
     assert PERSONA_TOOLS[UPDATE] == [DROPBOX_TOOL]
-    assert DATA_TOOLS == [DROPBOX_TOOL, CALENDAR_TOOL, WEATHER_TOOL]
-    assert [t.name for t in ALL_TOOLS] == ["check_dropbox_updates", "get_schedule", "get_weather"]
+    assert DATA_TOOLS == [DROPBOX_TOOL, CALENDAR_TOOL, WEATHER_TOOL, CREDITS_TOOL]
+    assert [t.name for t in ALL_TOOLS] == ["check_dropbox_updates", "get_schedule", "get_weather", "get_credits"]
 
 
 def test_removed_tool_names_are_unknown_or_denied():
@@ -863,18 +870,18 @@ def test_get_weather_is_an_mcp_tool_owned_by_schedule_only():
     mungchi = options()
     assert mungchi.agents["schedule"].tools == [CALENDAR_TOOL, WEATHER_TOOL]
     assert WEATHER_TOOL not in mungchi.agents["update"].tools
-    assert WEATHER_TOOL not in mungchi.allowed_tools  # 고뭉치 itself: only Agent
+    assert WEATHER_TOOL in mungchi.allowed_tools  # 고뭉치 itself answers simple weather questions
     assert build_options(env={}, persona="update").allowed_tools == [DROPBOX_TOOL]
 
 
-def test_get_weather_gate_allows_only_schedule_direct_and_its_subagent():
-    # 일정 answering directly, and 일정 as 고뭉치's subagent: allowed.
+def test_get_weather_gate_allows_schedule_direct_its_subagent_and_mungchi_itself():
+    # 일정 answering directly, 일정 as 고뭉치's subagent and 고뭉치's main agent: allowed.
     assert _weather_decision(persona="schedule") == "allow"
     assert _weather_decision(agent_type=SCHEDULE, agent_id="a2") == "allow"
-    # 업뎃 directly or as a subagent, 고뭉치's main agent, anyone else: denied.
+    assert _weather_decision() == "allow"
+    # 업뎃 directly or as a subagent, anyone else: denied.
     assert _weather_decision(persona="update") == "deny"
     assert _weather_decision(agent_type=UPDATE, agent_id="a1") == "deny"
-    assert _weather_decision() == "deny"
     assert _weather_decision(agent_type="general-purpose", agent_id="a3") == "deny"
     assert _weather_decision(persona="schedule", agent_id="a1") == "deny"  # never from inside a subagent
     assert _weather_decision(persona="nobody") == "deny"
@@ -885,7 +892,7 @@ def test_get_weather_gate_allows_only_schedule_direct_and_its_subagent():
 
     assert asyncio.run(ask("schedule", WEATHER_TOOL)) == "allow"
     assert asyncio.run(ask("update", WEATHER_TOOL)) == "deny"
-    assert asyncio.run(ask("mungchi", WEATHER_TOOL)) == "deny"
+    assert asyncio.run(ask("mungchi", WEATHER_TOOL)) == "allow"
     assert asyncio.run(ask("mungchi", WEATHER_TOOL, agent_type="schedule", agent_id="a2")) == "allow"
     assert asyncio.run(ask("mungchi", WEATHER_TOOL, agent_type="update", agent_id="a1")) == "deny"
 
@@ -905,11 +912,14 @@ def test_schedule_prompts_call_get_weather_for_weather_questions():
     # 업뎃 sends weather questions to 일정, and never sees the tool.
     update = build_options(env={}, persona="update").system_prompt
     assert "일정·약속·날씨는 '일정' 에이전트" in update and "get_weather" not in update
-    # 고뭉치 routes weather to 일정 and leaves it out of the briefing (code adds the line).
-    assert "일정과 날씨에 관한 질문은 '일정' 에이전트에게만 맡긴다" in MUNGCHI_SYSTEM_PROMPT
+    # 고뭉치 answers simple weather questions itself, sends weather + schedule questions to 일정,
+    # and leaves the weather out of the briefing (code adds the line).
+    assert "날씨만 묻는 질문은 위처럼 get_weather로 직접 답한다" in MUNGCHI_SYSTEM_PROMPT
+    assert "날씨와 일정이 함께 걸린 질문만 '일정' 에이전트에게 맡긴다" in MUNGCHI_SYSTEM_PROMPT
     assert "내일 비 오면 일정 바꿔야 할까?" in MUNGCHI_SYSTEM_PROMPT
-    assert "Dropbox, 캘린더, 날씨 같은 데이터 소스를 직접 다루지 않는다" in MUNGCHI_SYSTEM_PROMPT
+    assert "Dropbox와 캘린더는 직접 다루지 않고" in MUNGCHI_SYSTEM_PROMPT
     assert "날씨는 맡기지 않는다" in MUNGCHI_SYSTEM_PROMPT
+    assert "브리핑에서는 get_weather와 get_credits를 부르지 않는다" in MUNGCHI_SYSTEM_PROMPT
     assert "날씨 질문" in SCHEDULE_DESCRIPTION and "날씨" in options().agents["schedule"].description
 
 
@@ -917,3 +927,108 @@ def test_help_says_schedule_also_does_weather():
     help_text = build_parser().format_help()
     assert "'일정'(캘린더·날씨)" in help_text
     assert '--agent schedule "내일 비 오면 일정 바꿔야 할까?"' in help_text
+
+
+# ---------------------------------------------------------------- 고뭉치's own get_credits / get_weather
+
+
+def _decision(tool, persona="mungchi", agent_type=None, agent_id=None, tool_input=None):
+    out = gate_decision(tool, tool_input or {}, agent_type, agent_id, persona=persona)
+    return out.get("hookSpecificOutput", {}).get("permissionDecision")
+
+
+def test_mungchi_main_agent_may_call_exactly_agent_get_credits_and_get_weather():
+    assert CREDITS_TOOL == "mcp__mungchi__get_credits"
+    assert _decision(CREDITS_TOOL) == "allow"
+    assert _decision(WEATHER_TOOL) == "allow"
+    for subagent in ("update", "schedule"):
+        assert _decision("Agent", tool_input={"subagent_type": subagent}) is None  # pre-approved, not denied
+    # Dropbox and the calendar stay delegated; everything else is denied outright.
+    assert _decision(DROPBOX_TOOL) == "deny"
+    assert _decision(CALENDAR_TOOL) == "deny"
+    assert _decision("Agent", tool_input={"subagent_type": "general-purpose"}) == "deny"
+    for tool in ("Bash", "Read", "Write", "WebFetch", "WebSearch", "mcp__other__tool", "mcp__mungchi__unknown", ""):
+        assert _decision(tool) == "deny"
+
+    async def ask(tool):
+        out = await tool_gate({"tool_name": tool, "tool_input": {}}, "t1", None)
+        return out["hookSpecificOutput"]["permissionDecision"]
+
+    assert asyncio.run(ask(CREDITS_TOOL)) == "allow"
+    assert asyncio.run(ask(DROPBOX_TOOL)) == "deny"
+
+
+def test_get_credits_belongs_to_mungchi_only():
+    # 업뎃: no get_credits and no get_weather, directly or as a subagent.
+    for tool in (CREDITS_TOOL, WEATHER_TOOL):
+        assert _decision(tool, persona="update") == "deny"
+        assert _decision(tool, agent_type=UPDATE, agent_id="a1") == "deny"
+    # 일정: get_weather but no get_credits, directly or as a subagent.
+    assert _decision(WEATHER_TOOL, persona="schedule") == "allow"
+    assert _decision(WEATHER_TOOL, agent_type=SCHEDULE, agent_id="a2") == "allow"
+    assert _decision(CREDITS_TOOL, persona="schedule") == "deny"
+    assert _decision(CREDITS_TOOL, agent_type=SCHEDULE, agent_id="a2") == "deny"
+    assert _decision(CREDITS_TOOL, persona="nobody") == "deny"
+    # Neither the subagents nor the direct personas are given the tool at all.
+    mungchi = options()
+    assert all(CREDITS_TOOL not in agent.tools for agent in mungchi.agents.values())
+    assert CREDITS_TOOL not in PERSONA_TOOLS[UPDATE] and CREDITS_TOOL not in PERSONA_TOOLS[SCHEDULE]
+    assert build_options(env={}, persona="update").allowed_tools == [DROPBOX_TOOL]
+    assert build_options(env={}, persona="schedule").allowed_tools == [CALENDAR_TOOL, WEATHER_TOOL]
+
+
+def test_direct_personas_servers_never_get_get_credits(server_spy):
+    build_options(env={}, persona="update")
+    build_options(env={}, persona="schedule")
+    build_options(env={})
+    assert server_spy == [
+        ["check_dropbox_updates"],
+        ["get_schedule", "get_weather"],
+        ["check_dropbox_updates", "get_schedule", "get_weather", "get_credits"],
+    ]
+
+
+def test_mungchi_prompt_says_token_means_chat_khu_credits_and_to_use_its_tools():
+    prompt = options().system_prompt
+    assert "'토큰'·'크레딧'은 Chat KHU(Mindlogic) API 크레딧을 말한다" in prompt
+    assert "암호화폐나 코인 가격이 아니다" in prompt
+    assert "get_credits를 한 번 불러 답한다" in prompt
+    assert "네가 쓰는 도구는 Agent, get_credits, get_weather 세 가지뿐이다" in prompt
+    assert "도구가 있는 일을 할 수 없다고 말하지 않는다" in prompt
+    assert "오류를 알리면(ok: false, error) 무엇이 실패했는지 짧게 그대로 전하고" in prompt
+    assert "날씨랑 토큰 좀 말해봐" in prompt and "한 응답 안에서 함께 부른다" in prompt
+    # 일정's description no longer claims every weather question.
+    assert "단순한 날씨 질문은 고뭉치가 get_weather로 직접 답한다" in options().agents["schedule"].description
+
+
+def test_direct_prompts_explain_token_without_offering_a_tool():
+    for persona in ("update", "schedule"):
+        prompt = build_options(env={}, persona=persona).system_prompt
+        assert "'토큰'·'크레딧'은 Chat KHU(Mindlogic) API 크레딧을 말한다(암호화폐가 아님." in prompt
+        assert "python -m mungchi --credits" in prompt
+        assert "get_credits" not in prompt and "Agent" not in prompt
+
+
+def test_renderer_answer_starts_after_mungchis_own_tool_calls():
+    renderer = Renderer(echo=False)
+    renderer.handle(
+        AssistantMessage(
+            content=[
+                TextBlock(text="확인해 볼게요."),
+                ToolUseBlock(id="t1", name=CREDITS_TOOL, input={}),
+                ToolUseBlock(id="t2", name=WEATHER_TOOL, input={}),
+            ],
+            model="m",
+        )
+    )
+    renderer.handle(AssistantMessage(content=[TextBlock(text="남은 크레딧은 9,050.5예요.")], model="m"))
+    assert renderer.result().text == "남은 크레딧은 9,050.5예요."
+    assert renderer.status_lines == []  # no "→ ...에게 맡기는 중" for its own tools
+
+
+def test_help_says_mungchi_checks_tokens_and_weather_itself():
+    help_text = build_parser().format_help()
+    assert "Chat KHU 크레딧('토큰')과 오늘·내일 날씨는 고뭉치가 직접 확인합니다(get_credits, get_weather)" in help_text
+    assert 'python -m mungchi "날씨랑 토큰 좀 알려줘"' in help_text
+    assert "'날씨랑 토큰 좀 알려줘'처럼 짧게 물으면 LLM 호출 없이 바로 답합니다" in help_text
+    assert "서비스 상태(실행 중인 코드 버전 포함)" in help_text

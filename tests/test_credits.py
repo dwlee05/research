@@ -416,6 +416,19 @@ def test_slack_text_is_the_mrkdwn_summary_or_a_warning():
         "Credit?",
         "CREDITS 알려줘",
         "  크레딧  ",
+        # The user calls the credits "토큰".
+        "토큰",
+        "토큰?",
+        "남은 토큰",
+        "토큰 얼마",
+        "토큰 얼마나 남았어",
+        "토큰 얼마나 남았어?",
+        "토큰 사용량",
+        "토큰 확인",
+        "잔여 토큰",
+        "잔여토큰 알려줘",
+        "토큰 🙏",
+        "토큰 :pray:",
     ],
 )
 def test_short_credit_questions_match(text):
@@ -441,10 +454,144 @@ def test_decomposed_hangul_is_normalized_before_matching():
         "오늘 일정 알려줘",
         "credits please explain how billing works",
         "<@U123> 크레딧",
+        "토큰 아끼려면 어떻게 해?",
+        "토큰이 뭐야?",
+        "토큰 가격 알려줘",
+        "날씨랑 토큰",  # both at once: the combined shortcut (quick_info), not this one
+        None,
     ],
 )
 def test_longer_questions_do_not_match(text):
     assert not is_credit_query(text)
+
+
+# ---------------------------------------------------------------- 고뭉치's get_credits tool
+
+
+def use_transport(monkeypatch, transport):
+    """Make the tool's own ``httpx.Client`` talk to ``transport`` (the tool takes no transport argument)."""
+    real_client = httpx.Client
+    monkeypatch.setattr(credits.httpx, "Client", lambda **kw: real_client(transport=transport, timeout=kw.get("timeout")))
+
+
+def call_get_credits() -> dict:
+    import asyncio
+
+    from mungchi.tools.credits_tool import get_credits
+
+    result = asyncio.run(get_credits.handler({}))
+    [content] = result["content"]
+    assert content["type"] == "text"
+    return json.loads(content["text"])
+
+
+def test_get_credits_tool_returns_compact_json_with_the_summary(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", GATEWAY)
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", TOKEN)
+    monkeypatch.setattr(credits, "datetime", _Pinned)
+    transport, requests = routes()
+    use_transport(monkeypatch, transport)
+    data = call_get_credits()
+    assert data == {
+        "configured": True,
+        "ok": True,
+        "summary": EXPECTED_SUMMARY,  # the same Korean text as --credits
+        "total": {"quota": 10000.0, "used": 949.5, "remaining": 9050.5, "remaining_percent": 90.5},
+        "monthly": {"quota": 10000.0, "used": 949.5, "remaining": 9050.5},
+        "renewal_date": "2026-11-01",
+        "usage": {
+            "start": "2026-10-01",
+            "end": "2026-10-07",
+            "calls": 94,
+            "credits": 893.9,
+            "models": [
+                {"model": "claude-sonnet-5", "calls": 71, "credits": 536.7},
+                {"model": "claude-opus-5-5", "calls": 23, "credits": 357.2},
+            ],
+            "other_models": 0,
+        },
+        "projection": {"credits": 4200, "percent_of_quota": 42},
+    }
+    # Only the two read-only credit endpoints; the key only in headers, never in the result.
+    assert [r.url.path for r in requests] == ["/v1/gateway/credits/", "/v1/gateway/usage/"]
+    assert TOKEN not in json.dumps(data, ensure_ascii=False)
+
+
+def test_get_credits_tool_shows_other_sources_and_a_missing_usage_part(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", GATEWAY)
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", TOKEN)
+    balance = {**CREDITS_JSON, "purchased": {"quota": 500, "used": 100, "remaining": 400}}
+    transport, _ = routes(credits_response=httpx.Response(200, json=balance), usage_response=httpx.Response(500, text="oops"))
+    use_transport(monkeypatch, transport)
+    data = call_get_credits()
+    assert data["ok"] is True and data["purchased"] == {"quota": 500.0, "used": 100.0, "remaining": 400.0}
+    assert "org_granted" not in data and "usage" not in data
+    assert data["usage_error"] == "HTTP 500"
+    assert "(사용 내역은 받지 못했습니다: HTTP 500)" in data["summary"]
+
+
+@pytest.mark.parametrize(
+    "env,expected",
+    [
+        (
+            {"ANTHROPIC_API_KEY": API_KEY},
+            {"configured": False, "ok": False, "error": UNSUPPORTED_TEXT, "hint": credits.UNSUPPORTED_HINT},
+        ),
+        (
+            {"ANTHROPIC_BASE_URL": GATEWAY},
+            {
+                "configured": False,
+                "ok": False,
+                "missing": ["ANTHROPIC_AUTH_TOKEN"],
+                "error": credits.NO_KEY_TEXT,
+                "hint": credits.KEY_HINT,
+            },
+        ),
+    ],
+)
+def test_get_credits_tool_without_a_gateway_or_key_says_what_to_set(monkeypatch, env, expected):
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(credits.httpx, "Client", lambda **kw: pytest.fail("no request without a gateway and key"))
+    data = call_get_credits()
+    assert data == expected
+    assert API_KEY not in json.dumps(data, ensure_ascii=False)
+
+
+@pytest.mark.parametrize(
+    "response,first_line",
+    [
+        (httpx.Response(401, json={"detail": TOKEN}), "크레딧을 확인하지 못했습니다 (HTTP 401)."),
+        (httpx.Response(200, text="<html>login</html>"), "크레딧을 확인하지 못했습니다 (HTTP 200이지만 JSON 응답이 아님)."),
+    ],
+)
+def test_get_credits_tool_failure_is_a_short_korean_error(monkeypatch, response, first_line):
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", GATEWAY)
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", TOKEN)
+    transport, requests = routes(credits_response=response)
+    use_transport(monkeypatch, transport)
+    data = call_get_credits()
+    assert set(data) == {"configured", "ok", "error"}
+    assert data["configured"] is True and data["ok"] is False
+    assert data["error"].splitlines()[0] == first_line
+    assert TOKEN not in data["error"]
+    assert [r.url.path for r in requests] == ["/v1/gateway/credits/"]  # no usage request after a failed balance
+
+
+def test_get_credits_tool_offline_and_crashing_never_raise(monkeypatch):
+    from mungchi.tools import credits_tool
+
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", GATEWAY)
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", TOKEN)
+    # conftest: a real request fails like a dropped connection.
+    data = call_get_credits()
+    assert data["ok"] is False and data["error"].startswith("크레딧을 확인하지 못했습니다 (연결 실패: ConnectError")
+
+    def crash():
+        raise RuntimeError(f"boom {TOKEN}")
+
+    monkeypatch.setattr(credits_tool, "run_credits", crash)
+    assert call_get_credits() == {"configured": True, "ok": False, "error": "RuntimeError: boom ***"}
 
 
 # ---------------------------------------------------------------- --credits

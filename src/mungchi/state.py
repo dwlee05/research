@@ -62,7 +62,8 @@ class StateStore:
 
     ``{"last_checked": {"<source>": "<iso8601>"},
     "credit_alert": {"renewal_date": "<renewal_date>", "alerted_at": "<iso8601>"},
-    "last_brief_date": "<YYYY-MM-DD>"}``.
+    "last_brief_date": "<YYYY-MM-DD>",
+    "running_version": "<abc1234>", "running_since": "<iso8601>"}``.
     Every write keeps the other keys as they are.
     """
 
@@ -101,6 +102,22 @@ class StateStore:
         with _LOCK:
             data = self.load()
             data["last_brief_date"] = day
+            _write_json(self.path, data)
+
+    def running(self) -> tuple[str, datetime | None] | None:
+        """``(code version, start time)`` the Slack bots last started with, if recorded."""
+        data = self.load()
+        version = data.get("running_version")
+        if not isinstance(version, str) or not version.strip():
+            return None
+        return version.strip(), _parse_iso(data.get("running_since"))
+
+    def mark_running(self, version: str, when: datetime) -> None:
+        """Record which code the Slack bots started with (``service status`` compares it with the repository)."""
+        with _LOCK:
+            data = self.load()
+            data["running_version"] = version
+            data["running_since"] = ensure_aware(when).astimezone(timezone.utc).isoformat()
             _write_json(self.path, data)
 
     def mark_checked(self, source: str, when: datetime) -> None:

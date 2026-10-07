@@ -1,6 +1,7 @@
 """Chat KHU (Mindlogic gateway) credits, without any LLM call.
 
-``python -m mungchi --credits``, the Slack shortcut ("@고뭉치 크레딧") and the
+``python -m mungchi --credits``, the Slack shortcut ("@고뭉치 크레딧", "토큰"),
+고뭉치's ``get_credits`` tool (``credit_payload``: compact JSON) and the
 running bots' low-credit alert all go through here. Only two read-only
 gateway endpoints are called, ``GET {root}/credits/`` and ``GET {root}/usage/``;
 no model is used, so checking costs nothing. The key travels only in request
@@ -17,7 +18,6 @@ from __future__ import annotations
 import calendar
 import re
 import sys
-import unicodedata
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, tzinfo
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
@@ -28,6 +28,7 @@ import httpx
 
 from . import config
 from .model_list import SSL_HINT
+from .quick_info import query_text
 from .tools.common import safe_error, scrub
 
 TIMEOUT_SECONDS = 15.0
@@ -59,19 +60,23 @@ STATUS_HINTS = {401: KEY_HINT, 403: KEY_HINT, 404: ADDRESS_HINT}
 USAGE_MISSING_TEXT = "(사용 내역은 받지 못했습니다: {reason})"
 
 # A short message that only asks for the credits ("크레딧", "남은 크레딧 얼마나 남았어?",
-# "credits"), matched after the bot's mention is removed. Longer questions
-# ("크레딧 아끼려면 어떻게 해?") do not match and go to the agent as before.
+# "credits"), matched after the bot's mention is removed and the text is
+# normalized like the weather question (``quick_info.query_text``: NFC, lower
+# case, single spaces, trailing punctuation and emoji removed). The user calls
+# the credits "토큰", so "남은 토큰", "토큰 얼마나 남았어", "토큰 사용량" match too.
+# Longer questions ("크레딧 아끼려면 어떻게 해?", "토큰이 뭐야?") do not match
+# and go to the agent as before.
+#
+#   [남은 | 잔여] (크레딧 | 토큰 | 잔액 | 사용량 | credit(s)) [사용량 | 잔액] [확인(해 줘) | 알려 줘 | 얼마(나) (남았어) | 보여 줘]
 CREDIT_QUERY_RE = re.compile(
-    r"^(남은\s*)?(크레딧|잔액|잔여\s*크레딧|사용량|credits?)"
-    r"(\s*(확인(\s*해\s*줘)?|알려\s*줘|얼마(나|야)?(\s*남았(어|나|니|지))?|보여\s*줘))?"
-    r"\s*[?？!.]*$",
-    re.IGNORECASE,
+    r"^(?:(?:남은|잔여) ?)?(?:크레딧|토큰|잔액|사용량|credits?)(?: ?(?:사용량|잔액))?"
+    r"(?: ?(?:확인(?: ?해 ?줘)?|알려 ?줘|얼마(?:나|야)?(?: ?남았(?:어|나|니|지))?|보여 ?줘))?$"
 )
 
 
 def is_credit_query(text: str | None) -> bool:
-    """True when ``text`` (mention already removed) is just a short credit question."""
-    normalized = unicodedata.normalize("NFC", text or "").strip()
+    """True when ``text`` (mention already removed) is just a short credit question. Pure."""
+    normalized = query_text(text)
     return bool(normalized) and CREDIT_QUERY_RE.match(normalized) is not None
 
 
@@ -549,6 +554,110 @@ def slack_credit_text(
 ) -> str:
     """What the Slack shortcut posts: the summary in mrkdwn, or a short Korean error."""
     return summary_text(fetch_report(env, transport=transport), env=env, now=now, slack=True)
+
+
+# ---------------------------------------------------------------- the get_credits tool (고뭉치)
+
+
+def _amount(value: float | None) -> float | None:
+    """One decimal place, like the summary (9050.51 -> 9050.5); None stays None."""
+    return float(Decimal(repr(float(value))).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)) if value is not None else None
+
+
+def _bucket_payload(bucket: Bucket) -> dict[str, float | None]:
+    return {"quota": _amount(bucket.quota), "used": _amount(bucket.used), "remaining": _amount(bucket.remaining)}
+
+
+def report_payload(
+    report: CreditReport,
+    *,
+    env: Mapping[str, str] | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Compact JSON for 고뭉치's get_credits tool: the same data as the summary.
+
+    ``summary`` is the Korean summary (``--credits``' text); ``total`` and
+    ``monthly`` (quota / used / remaining), ``renewal_date`` (local
+    YYYY-MM-DD), ``usage`` (this cycle, with the top models) and
+    ``projection`` (credits expected by the end of the cycle at the current
+    rate, None until a full day has passed). On failure: ``ok: false`` with
+    the short Korean ``error`` (``configured: false`` when the gateway has no
+    credit endpoints).
+    """
+    if not report.ok or report.balance is None:
+        payload: dict[str, Any] = {
+            "configured": report.supported,
+            "ok": False,
+            "error": report.error or READ_ERROR_TEXT.format(kind="응답 없음"),
+        }
+        if not report.supported:
+            payload["hint"] = UNSUPPORTED_HINT
+        return payload
+    tz = config.get_timezone(env)
+    now = now or datetime.now(tz)
+    balance, usage = report.balance, report.usage
+    total = _bucket_payload(balance.total)
+    left = remaining_percent(balance)
+    total["remaining_percent"] = _amount(left)
+    payload = {
+        "configured": True,
+        "ok": True,
+        "summary": format_summary(balance, usage, now=now, tz=tz, usage_error=report.usage_error),
+        "total": total,
+        "monthly": _bucket_payload(balance.monthly),
+        "renewal_date": f"{_local(balance.renewal, tz):%Y-%m-%d}" if balance.renewal is not None else None,
+    }
+    for name, bucket in (("purchased", balance.purchased), ("org_granted", balance.org_granted)):
+        if bucket.granted:
+            payload[name] = _bucket_payload(bucket)
+    if usage is not None:
+        ranked = sorted(
+            usage.rows,
+            key=lambda row: (row.credits is None, -(row.credits or 0.0), -(row.calls or 0), row.key),
+        )
+        payload["usage"] = {
+            "start": usage.start.isoformat() if usage.start else None,
+            "end": usage.end.isoformat() if usage.end else None,
+            "calls": usage.calls,
+            "credits": _amount(usage.credits),
+            "models": [
+                {"model": row.key, "calls": row.calls, "credits": _amount(row.credits)}
+                for row in ranked[:MAX_MODEL_ROWS]
+            ],
+            "other_models": max(0, len(ranked) - MAX_MODEL_ROWS),
+        }
+    if report.usage_error:
+        payload["usage_error"] = report.usage_error
+    expected = projection(balance, usage, now, tz)
+    payload["projection"] = (
+        {
+            "credits": approx(expected[0]),
+            "percent_of_quota": round(expected[1]) if expected[1] is not None else None,
+        }
+        if expected is not None
+        else None
+    )
+    return payload
+
+
+def credit_payload(
+    env: Mapping[str, str] | None = None,
+    *,
+    transport: httpx.BaseTransport | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """What the get_credits tool returns (``report_payload``). Never raises, never contains the key. Blocking."""
+    if gateway_root(env) is None:
+        return {"configured": False, "ok": False, "error": UNSUPPORTED_TEXT, "hint": UNSUPPORTED_HINT}
+    if not credentials(env)[0]:
+        return {
+            "configured": False,
+            "ok": False,
+            "missing": ["ANTHROPIC_AUTH_TOKEN"],
+            "error": NO_KEY_TEXT,
+            "hint": KEY_HINT,
+        }
+    return report_payload(fetch_report(env, transport=transport), env=env, now=now)
 
 
 # ---------------------------------------------------------------- low-credit alert (pure parts)
