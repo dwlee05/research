@@ -1,8 +1,9 @@
 """Today's briefing, built the same way for every way it is delivered.
 
-``python -m mungchi --brief`` (terminal), ``--brief --slack`` and the
-scheduled morning briefing of the running Slack bots (``BRIEF_TIME``) all go
-through ``build_briefing``, so they share one structure:
+``python -m mungchi --brief`` (terminal), ``--brief --slack``, the
+scheduled morning briefing of the running Slack bots (``BRIEF_TIME``) and a
+short briefing request to 고뭉치 in Slack ("오늘 건너뛴 브리핑 좀 해봐", or a
+bare ``@고뭉치``) all go through ``build_briefing``, so they share one structure:
 
     ☀️ 오늘의 브리핑 (10/08 목)
     🌤️ 서울 날씨: 대체로 맑음 · ...           ← added by code (Open-Meteo), no LLM; BRIEF_WEATHER=off drops it
@@ -10,10 +11,15 @@ through ``build_briefing``, so they share one structure:
     💳 Chat KHU 크레딧: ...                 ← appended by code, no LLM
 
 The weather and the credits are fetched in worker threads while the agent
-runs; the model never sees them. The agent run is a briefing run
-(``briefing=True``): its Dropbox check looks at the time since the last
-briefing and moves that checkpoint. If the run fails, the header, the
-weather line, a short Korean failure line and the credits still go out.
+runs; the model never sees them, and the run's user prompt
+(``briefing_prompt``) tells it they are appended by code, so it neither
+fetches nor writes them. (A briefing asked for in the middle of a
+conversation is an ordinary turn: there 고뭉치 fetches and writes all four
+parts itself.) The agent run is a briefing run (``briefing=True``): its
+Dropbox check looks at the time since the last briefing and moves that
+checkpoint. ``last_brief_date`` (the scheduler's "already sent today") is
+never touched here. If the run fails, the header, the weather line, a short
+Korean failure line and the credits still go out.
 
 ``brief_due`` is the pure "is the morning briefing due now?" check used by
 the scheduler in ``slack_bot``.
@@ -29,7 +35,8 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Mapping, TextIO
 
 from . import config, credits, weather
-from .main import TurnResult, briefing_prompt, run_turn
+from .agents import korean_date
+from .main import TurnResult, run_turn
 from .personas import MUNGCHI
 from .slack_format import SLACK_FORMAT_PROMPT, brief_header
 from .tools.common import safe_error, scrub
@@ -37,6 +44,16 @@ from .tools.common import safe_error, scrub
 RunTurn = Callable[..., Awaitable[TurnResult]]
 CreditFetch = Callable[[], credits.CreditReport]
 WeatherFetch = Callable[[], weather.WeatherReport]
+
+# The user prompt of the briefing run. The weather and the credits are put
+# around the answer by code, so the model is told to leave them out (its
+# system prompt otherwise asks for all four parts in a briefing).
+BRIEFING_PROMPT = (
+    "업뎃과 '일정' 에이전트에게 일을 맡겨서 오늘({today}) 브리핑을 해줘. "
+    "일정은 오늘 하루만(days=1), 공저자 업데이트는 기간 없이 맡겨. "
+    "이 브리핑의 제목, 날씨, Chat KHU 크레딧은 프로그램이 따로 붙이니 get_weather와 get_credits는 부르지 말고, "
+    "날씨와 크레딧 없이 ① 오늘의 일정과 ② Dropbox 업데이트만 써."
+)
 
 BRIEF_CRASH_TEXT = "⚠️ 오늘 브리핑을 만들지 못했어요 ({kind}). 실행 로그를 확인해 주세요."
 BRIEF_FAILED_TEXT = "⚠️ 고뭉치가 브리핑을 끝내지 못했어요."
@@ -93,6 +110,13 @@ def brief_due(schedule: config.BriefSchedule, now: datetime, last_brief_date: st
 
 
 # ---------------------------------------------------------------- what
+
+
+def briefing_prompt(now: datetime | None = None, env: Mapping[str, str] | None = None) -> str:
+    """The briefing run's user prompt for ``now``'s date (in ``TIMEZONE``): ① and ② only, the rest is code."""
+    tz = config.get_timezone(env)
+    now = (now or datetime.now(tz)).astimezone(tz)
+    return BRIEFING_PROMPT.format(today=korean_date(now))
 
 
 @dataclass

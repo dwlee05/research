@@ -13,6 +13,12 @@ place words, a few particles and request tails), with or without spaces. Any
 other word ("내일", "아끼려면", "Dropbox", ...) means the message needs the
 agent, so the result is empty.
 
+``is_briefing_request`` reads a short request for today's briefing the same
+way (keyword 브리핑, its own closed filler list):
+
+    오늘 건너뛴 브리핑 좀 해봐    -> True
+    브리핑 형식 바꿔줘            -> False ("형식", "바꿔" are not filler)
+
 ``query_text`` is the normalization shared with ``weather.is_weather_query``
 and ``credits.is_credit_query``. Everything here is pure: no LLM call, no I/O.
 """
@@ -111,7 +117,11 @@ def parse_quick_info(text: str | None, label: str | None = None) -> set[str]:
     compact = query_text(text).replace(" ", "")
     if not compact:
         return set()
-    vocabulary = _vocabulary(label or "")
+    return set(_keywords(compact, _vocabulary(label or "")) or ())
+
+
+def _keywords(compact: str, vocabulary: tuple[tuple[str, str | None], ...]) -> frozenset[str] | None:
+    """The keyword kinds in ``compact`` when it splits completely into ``vocabulary`` words, else None."""
     # found[i]: the keywords of the ways compact[:i] splits into known words, None when it cannot.
     found: list[frozenset[str] | None] = [None] * (len(compact) + 1)
     found[0] = frozenset()
@@ -124,4 +134,57 @@ def parse_quick_info(text: str | None, label: str | None = None) -> set[str]:
                 end = start + len(word)
                 kinds = before | {kind} if kind else before
                 found[end] = kinds if found[end] is None else found[end] | kinds
-    return set(found[-1] or ())
+    return found[-1]
+
+
+# ---------------------------------------------------------------- a short briefing request
+
+BRIEFING = "briefing"
+BRIEFING_KEYWORD = "브리핑"
+# Filler around 브리핑, deliberately a small closed list of its own.
+BRIEFING_TIME_WORDS = ("오늘", "오늘의", "아침", "지금", "다시", "한번", "한 번")
+BRIEFING_MISSED_WORDS = ("건너뛴", "못 받은", "놓친", "빠진")
+BRIEFING_PARTICLES = ("좀", "을", "를", "도")
+BRIEFING_REQUEST_TAILS = (
+    "해줘",
+    "해 줘",
+    "해봐",
+    "해 봐",
+    "해주세요",
+    "해줄래",
+    "보여줘",
+    "줘",
+    "부탁해",
+    "부탁",
+    "받을래",
+    "받아볼래",
+)
+BRIEFING_FILLER = (
+    *VOCATIVES,
+    *BRIEFING_TIME_WORDS,
+    *BRIEFING_MISSED_WORDS,
+    *BRIEFING_PARTICLES,
+    *BRIEFING_REQUEST_TAILS,
+)
+
+
+@functools.lru_cache(maxsize=1)
+def _briefing_vocabulary() -> tuple[tuple[str, str | None], ...]:
+    words: dict[str, str | None] = {_word(word): None for word in BRIEFING_FILLER}
+    words[_word(BRIEFING_KEYWORD)] = BRIEFING
+    return tuple(sorted(words.items(), key=lambda item: (-len(item[0]), item[0])))
+
+
+def is_briefing_request(text: str | None) -> bool:
+    """True when a short message (mention already removed) only asks for today's briefing.
+
+    "오늘 건너뛴 브리핑 좀 해봐", "브리핑", "뭉치야 아침 브리핑 보여줘": the
+    message holds 브리핑 and otherwise only filler from the closed lists
+    above, in any order and with or without spaces, normalized like
+    ``parse_quick_info``. Any other word ("형식", "날씨", "어제", a particle
+    such as "에") means it needs the agent: False. Filler alone is False. Pure.
+    """
+    compact = query_text(text).replace(" ", "")
+    if not compact:
+        return False
+    return BRIEFING in (_keywords(compact, _briefing_vocabulary()) or ())

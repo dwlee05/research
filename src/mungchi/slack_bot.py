@@ -2,7 +2,9 @@
 scheduled morning briefing they send (``BRIEF_TIME``) and briefing delivery
 (``python -m mungchi --brief --slack``). Short credit ("토큰") and weather
 questions, alone or together ("날씨랑 토큰 좀 말해봐"), are answered by code,
-without an agent turn.
+without an agent turn. A short briefing request to 고뭉치 ("오늘 건너뛴 브리핑
+좀 해봐", or a bare ``@고뭉치``) gets the same code-driven briefing as the
+morning one, in its thread.
 
 One process runs up to three Slack apps, one per persona: 고뭉치 (@moongchi,
 the orchestrator), 업뎃 (@update) and 일정 (@schedule), each with its own
@@ -31,8 +33,8 @@ from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 
 from . import briefing, config, credits, quick_info, version, weather
-from .briefing import BRIEF_CRASH_TEXT, build_briefing
-from .main import TurnResult, briefing_prompt, run_turn
+from .briefing import BRIEF_CRASH_TEXT, Briefing, build_briefing
+from .main import TurnResult, run_turn
 from .personas import MUNGCHI, PERSONA_LABELS, PERSONAS, SCHEDULE, SLACK_HANDLES, UPDATE, josa
 from .slack_format import (
     PLACEHOLDER_TEXT,
@@ -52,6 +54,8 @@ RunTurn = Callable[..., Awaitable[TurnResult]]
 CreditText = Callable[[], str]
 # Returns the Slack text for the weather shortcut (blocking: run in a worker thread).
 WeatherText = Callable[[], str]
+# ``briefing.build_briefing``-like: builds today's briefing (header, weather, ① ②, credits).
+BriefingBuilder = Callable[..., Awaitable[Briefing]]
 
 REFUSAL_TEXT = "죄송하지만 이 봇은 소유자만 사용할 수 있어요."
 FRESH_SESSION_NOTE = "이 스레드의 이전 대화는 이어 갈 수 없어서, 다음 메시지부터는 새 대화로 시작해요."
@@ -72,7 +76,8 @@ NO_MUNGCHI_BRIEF_WARNING = (
     "아침 브리핑은 고뭉치 봇이 보냅니다."
 )
 
-# What a bare mention (no text) asks for. 고뭉치's default is today's briefing.
+# What a bare mention (no text) asks 업뎃 and 일정 for. 고뭉치's is today's
+# briefing, built by code like the morning one (``SlackHandler.wants_briefing``).
 EMPTY_MENTION_PROMPTS = {
     UPDATE: "공저자 업데이트 확인해줘",
     SCHEDULE: "오늘과 내일 일정 알려줘",
@@ -234,6 +239,14 @@ def _log_exception(message: str, exc: BaseException) -> None:
     log.error("%s\n%s", message, scrub(details))
 
 
+def _log_briefing_problems(result: Briefing) -> None:
+    """Log (scrubbed) why a briefing is incomplete; nothing when it is fine."""
+    if result.crash is not None:
+        _log_exception("브리핑을 만들지 못했습니다.", result.crash)
+    elif result.failed:
+        log.warning("브리핑이 완전하지 않습니다: %s", scrub((result.result.error if result.result else "") or ""))
+
+
 class ScrubFilter(logging.Filter):
     """Removes secrets from every log record (message, args and traceback)."""
 
@@ -365,6 +378,7 @@ class SlackHandler:
         status_interval: float = STATUS_INTERVAL_SECONDS,
         credit_text: CreditText | None = None,
         weather_text: WeatherText | None = None,
+        briefing_builder: BriefingBuilder | None = None,
     ):
         self.allowed_user_ids = frozenset(allowed_user_ids)
         if not self.allowed_user_ids:
@@ -385,6 +399,8 @@ class SlackHandler:
         self.credit_text = credit_text or credits.slack_credit_text
         # The weather shortcut: Open-Meteo only, never an agent turn.
         self.weather_text = weather_text or weather.slack_weather_text
+        # 고뭉치's briefing on request; None means ``build_briefing`` (looked up when used).
+        self.briefing_builder = briefing_builder
         self._semaphore = semaphore or asyncio.Semaphore(max(1, max_concurrent))
         self._locks: dict[str, list[Any]] = {}
         self._seen = RecentKeys()
@@ -414,9 +430,16 @@ class SlackHandler:
     def is_allowed(self, user: str | None) -> bool:
         return bool(user) and user in self.allowed_user_ids
 
+    def wants_briefing(self, request: str) -> bool:
+        """고뭉치 only: a bare mention / empty DM, or a short briefing request ("오늘 건너뛴 브리핑 좀 해봐").
+
+        업뎃 and 일정 treat "브리핑" like any other message. Pure.
+        """
+        return self.persona == MUNGCHI and (not request.strip() or quick_info.is_briefing_request(request))
+
     def default_prompt(self) -> str:
-        """What a bare mention asks for: today's briefing for 고뭉치, a fixed request otherwise."""
-        return EMPTY_MENTION_PROMPTS.get(self.persona) or briefing_prompt()
+        """What a bare mention asks 업뎃 / 일정 for (고뭉치's is the briefing, see ``wants_briefing``)."""
+        return EMPTY_MENTION_PROMPTS.get(self.persona, "")
 
     # -- entry point
 
@@ -439,7 +462,8 @@ class SlackHandler:
         if not self.is_allowed(user):
             await self._refuse(channel, thread_ts, user)
             return
-        # The user's text without this bot's mention; empty means ``default_prompt()``.
+        # The user's text without this bot's mention; empty means 고뭉치's briefing
+        # or ``default_prompt()``.
         request = strip_mention(str(event.get("text") or ""), self.bot_user_id)
         wanted = quick_info_request(request, weather.configured_label())
         if wanted >= {quick_info.WEATHER, quick_info.CREDITS}:
@@ -450,6 +474,9 @@ class SlackHandler:
             return
         if quick_info.WEATHER in wanted:
             await self._answer_weather(channel, thread_ts)
+            return
+        if self.wants_briefing(request):
+            await self._answer_briefing(channel, thread_ts)
             return
         # Never the text itself: only its length and whether a shortcut word was in it.
         log.debug(
@@ -505,6 +532,60 @@ class SlackHandler:
         log.info("%s: 스레드 %s:%s 날씨·크레딧 바로 답변 (에이전트 실행 없음)", self.texts.label, channel, thread_ts)
         weather_text, credit_text = await asyncio.gather(self._weather_text(), self._credit_text())
         await self._post_shortcut(channel, thread_ts, f"{weather_text}\n\n{credit_text}")
+
+    # -- 고뭉치's briefing on request (the morning briefing's builder, in this thread)
+
+    async def _answer_briefing(self, channel: str, thread_ts: str) -> None:
+        """Today's full briefing in this thread, built like the morning one (``briefing.build_briefing``).
+
+        Header, weather line, 고뭉치's ① 오늘의 일정 and ② Dropbox 업데이트,
+        then the credits; the weather and the credits are added by code. The
+        agent run is a briefing run, so the Dropbox checkpoint moves and the
+        next briefing shows what changed after this one. ``last_brief_date``
+        is never written: a briefing on request never stops the next
+        scheduled one. The thread is mapped to the briefing's session, so a
+        reply in it continues the conversation.
+        """
+        log.info(
+            "%s: 스레드 %s:%s 브리핑 요청: 아침 브리핑과 같은 브리핑을 만듭니다 (아침 브리핑 기록은 그대로 둡니다)",
+            self.texts.label,
+            channel,
+            thread_ts,
+        )
+        placeholder = await self._post(channel, thread_ts, self.texts.placeholder)
+        async with self._thread_lock(f"{self.persona}:{channel}:{thread_ts}"):
+            async with self._semaphore:
+                updater = (
+                    StatusUpdater(
+                        self.client, channel, placeholder, interval=self.status_interval, placeholder=self.texts.placeholder
+                    )
+                    if placeholder
+                    else None
+                )
+                result: Briefing | None = None
+                crash: Exception | None = None
+                try:
+                    result = await (self.briefing_builder or build_briefing)(
+                        run=self.run or run_turn,
+                        slack=True,
+                        on_status=updater,
+                        run_timeout=BRIEF_RUN_TIMEOUT_SECONDS,
+                    )
+                except Exception as exc:  # noqa: BLE001 - reported in Slack without details
+                    crash = exc
+                finally:
+                    if updater is not None:
+                        await updater.close()
+                if result is None:
+                    _log_exception("브리핑을 만들지 못했습니다.", crash or RuntimeError("no result"))
+                    reply = BRIEF_CRASH_TEXT.format(kind=briefing.crash_kind(crash) if crash else "결과 없음")
+                    await self._finish(channel, thread_ts, placeholder, [reply])
+                    return
+                _log_briefing_problems(result)
+                if result.session_id:
+                    remember_session(self.sessions, channel, thread_ts, result.session_id, persona=self.persona)
+                await self._finish(channel, thread_ts, placeholder, to_slack_chunks(result.text) or [to_mrkdwn(result.header)])
+        log.info("%s: 스레드 %s:%s 브리핑 완료", self.texts.label, channel, thread_ts)
 
     # -- running a turn
 
@@ -1122,10 +1203,7 @@ async def post_briefing(
         weather_fetch=weather_fetch,
         run_timeout=run_timeout,
     )
-    if result.crash is not None:
-        _log_exception("브리핑을 만들지 못했습니다.", result.crash)
-    elif result.failed:
-        log.warning("브리핑이 완전하지 않습니다: %s", scrub((result.result.error if result.result else "") or ""))
+    _log_briefing_problems(result)
     chunks = to_slack_chunks(result.text) or [to_mrkdwn(result.header)]
     delivered = 0
     for destination in destinations:

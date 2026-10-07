@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from mungchi import config, slack_bot
+from mungchi.briefing import DUE, brief_due, briefing_prompt
 from mungchi.main import TurnResult, main
 from mungchi.slack_bot import (
     CRASH_TEXT,
@@ -228,13 +229,14 @@ def test_dm_is_answered_in_thread(tmp_path):
 
 
 def test_empty_mention_means_briefing(tmp_path):
-    handler, _, run = make_handler(tmp_path)
+    handler, client, run = make_handler(tmp_path)
     asyncio.run(handler.handle_event(mention(f"<@{BOT}>"), event_id="Ev1", source="mention"))
-    prompt = run.calls[0]["prompt"]
-    assert prompt.startswith("업뎃과 '일정' 에이전트에게 일을 맡겨서 오늘(")
-    assert "브리핑" in prompt
-    # Asked for in Slack, it is still an ad-hoc run: only --brief moves the checkpoint.
-    assert run.calls[0]["briefing"] is False
+    [call] = run.calls
+    assert call["prompt"].startswith("업뎃과 '일정' 에이전트에게 일을 맡겨서 오늘(")
+    # The code-driven briefing, like the morning one: a briefing run that adds weather and credits by code.
+    assert call["briefing"] is True and "프로그램이 따로 붙이니" in call["prompt"]
+    assert client.updates[-1]["text"].startswith("☀️ *오늘의 브리핑 (")
+    assert "💳 *Chat KHU 크레딧*" in client.updates[-1]["text"]
 
 
 # ---------------------------------------------------------------- authorization
@@ -2176,7 +2178,9 @@ def test_post_briefing_puts_the_weather_right_under_the_header(tmp_path):
     assert code == 0
     [post] = client.posts
     assert post["text"].startswith(f"☀️ *오늘의 브리핑 (10/08 목)*\n{SLACK_WEATHER_LINE}\n\n*① 오늘의 일정*\n• 일정 없음\n\n💳 ")
-    assert "날씨" not in run.calls[0]["prompt"] and "날씨" not in run.calls[0]["extra_system_prompt"]
+    # The weather never goes through the model: the prompt only says code adds it.
+    assert "대체로 맑음" not in run.calls[0]["prompt"] and "미세먼지" not in run.calls[0]["prompt"]
+    assert "날씨" not in run.calls[0]["extra_system_prompt"]
 
 
 def test_brief_slack_cli_adds_the_weather_by_default(tmp_path, monkeypatch, capsys):
@@ -2254,3 +2258,166 @@ def test_scheduled_briefing_with_brief_weather_off_has_no_weather_line(tmp_path)
     )
     assert code == "sent" and fetched == []
     assert client.posts[0]["text"].startswith("☀️ *오늘의 브리핑 (10/08 목)*\n\n*① 오늘의 일정*")
+
+
+# ---------------------------------------------------------------- 고뭉치's briefing on request (the morning briefing's builder)
+
+BRIEF_ANSWER = (
+    "*① 오늘의 일정*\n• 15:00–16:00 랩 미팅\n\n"
+    "*② Dropbox 업데이트*\n• 공저자 변경 없음 (Dropbox): 지난 브리핑(10/07 07:00) 이후 바뀐 파일이 없어요"
+)
+REQUEST_TIME = at(8, 13, 5)  # 10/08 13:05: the 07:00 briefing was skipped (bot started after 12:00)
+
+
+class RecordingBuilder:
+    """``build_briefing`` with a fixed clock, weather and credits; records how the handler called it."""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    async def __call__(self, **kwargs):
+        self.calls.append(dict(kwargs))
+        return await slack_bot.build_briefing(
+            **kwargs, now=REQUEST_TIME, env={}, credit_fetch=lambda: low_report(9050.5), weather_fetch=_sunny
+        )
+
+
+@pytest.mark.parametrize(
+    "event,source",
+    [
+        (dm("오늘 건너뛴 브리핑 좀 해봐"), "dm"),  # what the user actually sent
+        (mention(f"<@{BOT}> 브리핑 해줘"), "mention"),
+        (mention(f"<@{BOT}> 뭉치야 아침 브리핑 보여줘"), "mention"),
+        (mention(f"<@{BOT}>"), "mention"),  # a bare mention
+        (dm(""), "dm"),  # an empty DM
+    ],
+)
+def test_a_briefing_request_gets_the_full_code_driven_briefing(tmp_path, event, source):
+    builder = RecordingBuilder()
+    run = FakeRun(TurnResult(text=BRIEF_ANSWER, session_id=SESSION_1))
+    handler, client, run = make_handler(tmp_path, run=run, briefing_builder=builder)
+    store = StateStore(config.get_state_path())
+    store.mark_brief_date("2026-10-07")  # yesterday's morning briefing; today's was skipped
+
+    asyncio.run(handler.handle_event(event, event_id="Ev1", source=source))
+
+    # The morning briefing's builder, in Slack format, bounded like the morning run.
+    [built] = builder.calls
+    assert built["slack"] is True and built["run_timeout"] == slack_bot.BRIEF_RUN_TIMEOUT_SECONDS
+    # One agent run in briefing mode (the Dropbox checkpoint moves), told that code adds weather and credits.
+    [call] = run.calls
+    assert call["briefing"] is True and call["persona"] == "mungchi" and call["resume"] is None
+    assert call["extra_system_prompt"] == SLACK_FORMAT_PROMPT
+    assert call["prompt"] == briefing_prompt(REQUEST_TIME)
+    # The usual placeholder in the thread, progress lines, then the briefing in its place.
+    thread = event["ts"]
+    placeholder = client.posts[0]
+    assert placeholder["text"] == PLACEHOLDER_TEXT
+    assert placeholder["channel"] == event["channel"] and placeholder["thread_ts"] == thread
+    assert any("→ 업뎃에게 맡기는 중..." in update["text"] for update in client.updates[:-1])
+    assert len(client.posts) == 1 and client.updates[-1]["ts"] == placeholder["_ts"]
+    text = client.updates[-1]["text"]
+    # Header, weather line, ① ②, credits: each exactly once.
+    assert text.startswith(f"☀️ *오늘의 브리핑 (10/08 목)*\n{SLACK_WEATHER_LINE}\n\n{BRIEF_ANSWER}\n\n💳 *Chat KHU 크레딧*: 9,050.5 남음")
+    assert text.count("서울 날씨") == 1 and text.count("💳") == 1 and text.count("오늘의 브리핑") == 1
+    # last_brief_date is not written: the next scheduled briefing still goes out.
+    assert store.last_brief_date() == "2026-10-07"
+    assert brief_due(MORNING, at(9, 7, 0), store.last_brief_date()) == DUE
+    # The thread is mapped to the briefing's session, like --brief --slack.
+    assert handler.sessions.get(event["channel"], thread, persona="mungchi") == SESSION_1
+
+
+def test_a_reply_in_the_briefing_thread_continues_the_briefing_session(tmp_path):
+    run = FakeRun(TurnResult(text=BRIEF_ANSWER, session_id=SESSION_1), TurnResult(text="랩 미팅은 3층이에요.", session_id=SESSION_1))
+    handler, client, run = make_handler(tmp_path, run=run, briefing_builder=RecordingBuilder())
+    root = "1700000000.000200"
+
+    async def scenario():
+        await handler.handle_event(dm("브리핑", ts=root), event_id="Ev1", source="dm")
+        await handler.handle_event(dm("랩 미팅 어디서 해?", ts="1700000000.000300", thread_ts=root), event_id="Ev2", source="dm")
+
+    asyncio.run(scenario())
+    # The follow-up is an ordinary turn (no briefing mode) that resumes the briefing's session.
+    assert [(c["briefing"], c["resume"]) for c in run.calls] == [(True, None), (False, SESSION_1)]
+    assert run.calls[1]["prompt"] == "랩 미팅 어디서 해?"
+    assert {p["thread_ts"] for p in client.posts} == {root}
+
+
+def test_briefing_requests_from_strangers_are_refused(tmp_path):
+    builder = RecordingBuilder()
+    handler, client, run = make_handler(tmp_path, briefing_builder=builder)
+
+    async def scenario():
+        await handler.handle_event(dm("오늘 건너뛴 브리핑 좀 해봐", user=STRANGER), event_id="Ev1", source="dm")
+        await handler.handle_event(mention(f"<@{BOT}>", user=STRANGER), event_id="Ev2", source="mention")
+        await handler.handle_event(mention(f"<@{BOT}> 브리핑", user=STRANGER, ts="1.000001"), event_id="Ev3", source="mention")
+
+    asyncio.run(scenario())
+    assert builder.calls == [] and run.calls == []
+    assert [p["text"] for p in client.posts] == [REFUSAL_TEXT] * 3
+    assert client.updates == [] and handler.sessions.threads() == {}
+
+
+@pytest.mark.parametrize("text", ["브리핑 형식 바꿔줘", "브리핑에 날씨 빼줘", "어제 브리핑에서 말한 파일 뭐였지?"])
+def test_other_messages_about_briefings_go_to_the_agent(tmp_path, text):
+    builder = RecordingBuilder()
+    handler, client, run = make_handler(tmp_path, briefing_builder=builder)
+    asyncio.run(handler.handle_event(dm(text), event_id="Ev1", source="dm"))
+    assert builder.calls == []
+    assert [(c["prompt"], c["briefing"]) for c in run.calls] == [(text, False)]
+
+
+@pytest.mark.parametrize("persona", ["update", "schedule"])
+def test_direct_bots_never_build_the_briefing(tmp_path, persona):
+    builder = RecordingBuilder()
+    handler, client, run = make_handler(tmp_path, persona=persona, briefing_builder=builder)
+
+    async def scenario():
+        await handler.handle_event(dm("브리핑"), event_id="Ev1", source="dm")
+        await handler.handle_event(dm("오늘 건너뛴 브리핑 좀 해봐", ts="1700000000.000300"), event_id="Ev2", source="dm")
+        await handler.handle_event(mention(f"<@{BOT}>"), event_id="Ev3", source="mention")
+
+    asyncio.run(scenario())
+    assert builder.calls == []
+    assert [(c["prompt"], c["persona"], c["briefing"]) for c in run.calls] == [
+        ("브리핑", persona, False),
+        ("오늘 건너뛴 브리핑 좀 해봐", persona, False),
+        (slack_bot.EMPTY_MENTION_PROMPTS[persona], persona, False),
+    ]
+
+
+def test_a_failed_briefing_on_request_still_answers_in_the_thread(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    run = FakeRun(RuntimeError(f"boom {SLACK_TOKEN}"))
+    handler, client, run = make_handler(tmp_path, run=run, briefing_builder=RecordingBuilder())
+    with caplog.at_level(logging.ERROR, logger="mungchi.slack"):
+        asyncio.run(handler.handle_event(dm("브리핑"), event_id="Ev1", source="dm"))
+    # Like the morning briefing: header, weather, a short failure line and the credits still go out.
+    head, failure, credit_part = client.updates[-1]["text"].split("\n\n")
+    assert head == f"☀️ *오늘의 브리핑 (10/08 목)*\n{SLACK_WEATHER_LINE}"
+    assert failure == "⚠️ 오늘 브리핑을 만들지 못했어요 (RuntimeError). 실행 로그를 확인해 주세요."
+    assert credit_part.startswith("💳 *Chat KHU 크레딧*: 9,050.5 남음")
+    assert handler.sessions.threads() == {}
+    assert "브리핑을 만들지 못했습니다" in caplog.text and SLACK_TOKEN not in caplog.text
+
+    async def broken(**kwargs):
+        raise OSError(f"disk {SLACK_TOKEN}")
+
+    handler.briefing_builder = broken
+    with caplog.at_level(logging.ERROR, logger="mungchi.slack"):
+        asyncio.run(handler.handle_event(dm("브리핑", ts="1700000000.000300"), event_id="Ev2", source="dm"))
+    assert client.updates[-1]["text"] == "⚠️ 오늘 브리핑을 만들지 못했어요 (OSError). 실행 로그를 확인해 주세요."
+    assert SLACK_TOKEN not in caplog.text
+
+
+def test_the_default_briefing_on_request_is_the_shared_builder(tmp_path, monkeypatch):
+    monkeypatch.delenv("BRIEF_WEATHER")  # conftest turns it off; the default is on (offline here: the short note)
+    run = FakeRun(TurnResult(text=BRIEF_ANSWER, session_id=SESSION_1), statuses=())
+    handler, client, run = make_handler(tmp_path, run=run)  # no builder given: briefing.build_briefing
+    asyncio.run(handler.handle_event(dm("오늘 건너뛴 브리핑 좀 해봐"), event_id="Ev1", source="dm"))
+    text = client.updates[-1]["text"]
+    assert text.startswith("☀️ *오늘의 브리핑 (")
+    assert f"\n🌤️ *서울 날씨*: 가져오지 못했어요\n\n{BRIEF_ANSWER}\n\n" in text
+    assert text.endswith("💳 *Chat KHU 크레딧*: 확인 안 함 (Chat KHU 게이트웨이를 쓰지 않아요)")
+    assert run.calls[0]["briefing"] is True
+    assert StateStore(config.get_state_path()).last_brief_date() is None

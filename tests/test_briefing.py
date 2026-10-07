@@ -168,11 +168,25 @@ def test_briefing_prompt_asks_for_todays_schedule_only_and_a_briefing_mode_run()
     assert result.session_id == SESSION and not result.failed
 
 
+def test_briefing_prompt_says_the_weather_and_credits_are_appended_by_code():
+    run = FakeRun()
+    asyncio.run(build_briefing(run=run, now=seoul(8, 7), credit_fetch=report, slack=True))
+    prompt = run.calls[0]["prompt"]
+    assert prompt == briefing.briefing_prompt(seoul(8, 7))
+    # 고뭉치's system prompt asks for all four parts in a briefing; this run's prompt overrides that.
+    assert "제목, 날씨, Chat KHU 크레딧은 프로그램이 따로 붙이니" in prompt
+    assert "get_weather와 get_credits는 부르지 말고" in prompt
+    assert "날씨와 크레딧 없이 ① 오늘의 일정과 ② Dropbox 업데이트만 써" in prompt
+    # Same text whatever the delivery: only the date changes.
+    assert briefing.briefing_prompt(seoul(9, 7)) == prompt.replace("2026-10-08 (목요일)", "2026-10-09 (금요일)")
+
+
 def test_credits_are_appended_by_code_after_the_answer():
     run = FakeRun()
     result = asyncio.run(build_briefing(run=run, now=seoul(8, 7), credit_fetch=report, slack=True))
     assert run.calls[0]["extra_system_prompt"] == SLACK_FORMAT_PROMPT
-    assert "크레딧" not in run.calls[0]["prompt"]  # the model is never asked about credits
+    # The model never sees the credit figures; it is only told that code appends them.
+    assert "9,050.5" not in run.calls[0]["prompt"] and "남음" not in run.calls[0]["prompt"]
     assert result.text.startswith("☀️ *오늘의 브리핑 (10/08 목)*\n\n*① 오늘의 일정*")
     head, credit_part = result.text.split("\n\n💳 ", 1)
     assert head.endswith("• 공저자 변경 없음 (Dropbox)")
@@ -302,9 +316,10 @@ def test_weather_line_sits_right_under_the_header(slack):
     head, *middle, credit_part = result.text.split("\n\n")
     assert head.splitlines() == [header, line] and middle == ANSWER.split("\n\n")
     assert credit_part.startswith("💳 ")
-    # The model is never asked about (or told) the weather.
+    # The model is never told the weather; it is only told that code adds it.
     prompt = run.calls[0]["prompt"] + run.calls[0]["extra_system_prompt"]
-    assert "날씨" not in prompt and "미세먼지" not in prompt
+    assert "대체로 맑음" not in prompt and "미세먼지" not in prompt and "강수확률" not in prompt
+    assert "날씨" not in run.calls[0]["extra_system_prompt"]
 
 
 def test_agent_failure_still_gives_header_weather_failure_line_and_credits():
@@ -408,4 +423,4 @@ def test_main_brief_adds_the_open_meteo_line_by_default(monkeypatch, capsys):
     assert first.startswith("☀️ 오늘의 브리핑 (")
     assert second == "🌧️ 서울 날씨: 비 · 최저 14° / 최고 20° · 강수확률 80% · 미세먼지 나쁨 · ☔ 우산 챙기세요"
     assert hosts == ["api.open-meteo.com", "air-quality-api.open-meteo.com"]
-    assert "날씨" not in run.calls[0]["prompt"]
+    assert "최저 14°" not in run.calls[0]["prompt"] and "우산" not in run.calls[0]["prompt"]  # never through the model

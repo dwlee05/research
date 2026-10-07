@@ -6,9 +6,11 @@ to a few tokens per file. The user opens the files themselves.
 
 Which window a check looks at is fixed per run, never by the model:
 
-* a briefing run (``--brief``, ``build_options(briefing=True)``) looks at the
-  time since the stored briefing checkpoint (``LOOKBACK_DAYS`` without one)
-  and moves the checkpoint after a successful check;
+* a briefing run (``build_options(briefing=True)``, only from
+  ``briefing.build_briefing``: ``--brief``, the morning briefing, a briefing
+  asked for in Slack) looks at the time since the stored briefing checkpoint
+  (``LOOKBACK_DAYS`` without one) and moves the checkpoint after a successful
+  check;
 * every other run (Slack questions, ``--agent update``, one-shot questions)
   looks at the last 24 hours and never touches the state file;
 * an explicit ``since_hours`` always wins and never moves the checkpoint.
@@ -391,11 +393,11 @@ TOOL_DESCRIPTION = (
     f"파일 내용·diff는 읽지 않는다. 최근 {MAX_LISTED_FILES}개를 넘는 파일은 개수(omitted)만 준다. "
     "임시·잠금 파일(~$…, .~lock.…, .DS_Store, *.tmp, *.swp 등)은 처음부터 뺀다. "
     "since_basis는 기간의 기준이다: default_24h(기간 없이 물어 최근 24시간), since_hours(지정한 시간), "
-    "briefing_checkpoint(정기 브리핑 실행: 지난 브리핑 이후), lookback_default(정기 브리핑인데 기록이 없어 "
+    "briefing_checkpoint(브리핑 실행: 지난 브리핑 이후), lookback_default(브리핑 실행인데 기록이 없어 "
     "LOOKBACK_DAYS일). 어느 기준인지는 실행 방식이 정하고, since_hours를 주면 그것이 우선한다. "
     "stats는 훑어본 파일 수(scanned), 기간 안에 바뀐 파일 수(changed_in_window, 임시 파일 제외), 그중 내가 수정해서 "
     "뺀 수(excluded_mine), 수정자 정보가 없어서(공유 폴더가 아닌 곳) 뺀 수(excluded_unknown_modifier), 기간과 "
-    "상관없이 임시·잠금 파일이라 뺀 수(excluded_temp)다. 정기 브리핑 실행만 브리핑 기준 시각을 지금으로 바꾸고, "
+    "상관없이 임시·잠금 파일이라 뺀 수(excluded_temp)다. 브리핑 실행만 브리핑 기준 시각을 지금으로 바꾸고, "
     "그 밖의 확인은 아무것도 바꾸지 않는다. 이동·이름 바꾸기·삭제는 감지하지 않는다. "
     "읽기 전용. configured=false면 설정이 없는 것이니 재시도하지 말 것."
 )
@@ -404,7 +406,7 @@ TOOL_DESCRIPTION = (
 def make_check_dropbox_updates(*, briefing: bool = False) -> SdkMcpTool[Any]:
     """A ``check_dropbox_updates`` tool whose run mode is fixed when it is built.
 
-    ``build_options(briefing=True)`` (only the ``--brief`` paths) builds a
+    ``build_options(briefing=True)`` (only ``briefing.build_briefing``) builds a
     briefing tool: it reads and moves the briefing checkpoint. Every other
     run gets an ad-hoc tool (last 24 hours, state untouched). Each run's
     options build their own tool object, so concurrent turns in one process

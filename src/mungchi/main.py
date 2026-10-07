@@ -34,7 +34,6 @@ from .agents import (
     build_agents,
     build_direct_prompt,
     build_system_prompt,
-    korean_date,
     with_now_line,
 )
 from .personas import DIRECT_PERSONAS, MUNGCHI, PERSONA_LABELS, PERSONAS, SCHEDULE, UPDATE, josa
@@ -69,10 +68,6 @@ CLI_ENV = {
     "ENABLE_TOOL_SEARCH": "false",
 }
 
-BRIEFING_PROMPT = (
-    "업뎃과 '일정' 에이전트에게 일을 맡겨서 오늘({today}) 브리핑을 해줘. "
-    "일정은 오늘 하루만(days=1), 공저자 업데이트는 기간 없이 맡겨."
-)
 EXIT_WORDS = {"exit", "quit", "종료"}
 # A positional prompt that is exactly this word starts the Slack bot.
 SLACK_COMMAND = "slack"
@@ -204,12 +199,6 @@ def describe_result_error(subtype: str | None, detail: str | None = None, status
     return describe_error(reason, detail, status=status)
 
 
-def briefing_prompt(now: datetime | None = None, env: Mapping[str, str] | None = None) -> str:
-    tz = config.get_timezone(env)
-    now = (now or datetime.now(tz)).astimezone(tz)
-    return BRIEFING_PROMPT.format(today=korean_date(now))
-
-
 def stamp_prompt(prompt: str, clock: Clock | None = None, env: Mapping[str, str] | None = None) -> str:
     """``prompt`` with the current local time in front, e.g. ``[지금: 2026-10-06(화) 14:20 KST]``.
 
@@ -240,7 +229,8 @@ def build_options(
     ``resume`` continues an earlier session by id; ``extra_system_prompt`` is
     appended to the system prompt (e.g. Slack formatting rules).
 
-    ``briefing=True`` (only the ``--brief`` paths) builds this run's Dropbox
+    ``briefing=True`` (only ``briefing.build_briefing``: ``--brief``, the morning
+    briefing, a briefing asked for in Slack) builds this run's Dropbox
     tool in briefing mode: it looks at the time since the last briefing and
     moves that checkpoint. The mode is bound to the tool objects of these
     options, so it is fixed per run, never chosen by the model, and never

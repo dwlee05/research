@@ -7,7 +7,7 @@ import unicodedata
 import pytest
 
 from mungchi import credits, weather
-from mungchi.quick_info import CREDITS, WEATHER, parse_quick_info, query_text
+from mungchi.quick_info import CREDITS, WEATHER, is_briefing_request, parse_quick_info, query_text
 from mungchi.slack_bot import quick_info_request
 
 BOTH = {WEATHER, CREDITS}
@@ -117,3 +117,73 @@ def test_credit_phrasings_outside_the_lists_still_reach_the_credit_shortcut(text
 @pytest.mark.parametrize("text", ["토큰 아끼려면 어떻게 해?", "토큰이 뭐야?", "내일 비 오면 일정 바꿔야 할까?", "오늘 일정 알려줘"])
 def test_quick_info_request_is_empty_for_agent_questions(text):
     assert quick_info_request(text, "서울") == set()
+
+
+# ---------------------------------------------------------------- a short briefing request ("오늘 건너뛴 브리핑 좀 해봐")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # The agreed examples.
+        "오늘 건너뛴 브리핑 좀 해봐",  # what the user actually sent
+        "브리핑",
+        "브리핑 해줘",
+        "오늘 브리핑 다시 해줘",
+        "뭉치야 아침 브리핑 보여줘",
+        "못 받은 브리핑 줘",
+        # Same shape: spaces optional, any order, every filler kind, trailing punctuation and emoji.
+        "오늘건너뛴브리핑좀해봐",
+        "고뭉치야 브리핑",
+        "비서실 고뭉치 오늘의 브리핑 부탁해",
+        "놓친 브리핑을 한 번 받아볼래",
+        "빠진 브리핑도 줘",
+        "지금 브리핑 한번 받을래?",
+        "브리핑 해 봐!",
+        "브리핑 부탁 🙏",
+        "아침 브리핑을 해주세요",
+        "브리핑 해줄래 :pray:",
+        "뭉치 브리핑 해 줘",
+    ],
+)
+def test_briefing_requests(text):
+    assert is_briefing_request(text)
+    assert parse_quick_info(text) == set()  # never a weather or credit shortcut
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # The agreed examples: these need the agent.
+        "브리핑 형식 바꿔줘",
+        "브리핑에 날씨 빼줘",
+        "어제 브리핑에서 말한 파일 뭐였지?",
+        # More of the same: any word outside the closed list.
+        "내일 브리핑 해줘",
+        "브리핑 몇 시에 와?",
+        "브리핑이 안 왔어",
+        "브리핑 말고 일정만 알려줘",
+        "날씨랑 브리핑",
+        "업뎃 브리핑",
+        "브리핑 왜 건너뛰었어?",
+        "브리핑? 해줘",  # "?" in the middle is not filler
+        "<@U123> 브리핑",
+        # Filler alone, or nothing at all.
+        "",
+        "   ",
+        "뭉치야",
+        "오늘 좀 해줘",
+        "건너뛴",
+        "🙏",
+        ":pray:",
+    ],
+)
+def test_other_messages_are_not_briefing_requests(text):
+    assert not is_briefing_request(text)
+    assert not is_briefing_request(None)
+
+
+def test_briefing_request_normalization_matches_the_quick_info_question():
+    assert is_briefing_request(unicodedata.normalize("NFD", "오늘 건너뛴 브리핑 좀 해봐"))
+    assert is_briefing_request("브리핑\t좀\n해줘")
+    assert is_briefing_request("BRIEFING") is False  # Korean only

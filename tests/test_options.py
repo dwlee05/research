@@ -148,10 +148,9 @@ def test_model_defaults_and_env_override():
 
 def test_system_prompt_has_the_briefing_sections_and_points_to_the_per_turn_time_line():
     prompt = options().system_prompt
-    # Schedule first, then Dropbox; the credits are appended by code, not written by the model.
+    # Schedule first, then Dropbox.
     assert prompt.index("### ① 오늘의 일정") < prompt.index("### ② Dropbox 업데이트")
     assert "하루치만(days=1)" in prompt
-    assert "Chat KHU 크레딧은 쓰지 않고" in prompt
     # The old "③ 오늘 챙길 것" section was dropped to save tokens.
     assert "③" not in prompt and "오늘 챙길 것" not in prompt
     assert NOW_GUIDANCE in prompt and "[지금: YYYY-MM-DD(요일) HH:MM 시간대]" in prompt
@@ -420,6 +419,58 @@ def test_update_prompts_turn_periods_into_since_hours_and_explain_empty_results(
     assert "최근 24시간" in description and "마지막 확인" not in description
     # 고뭉치 does not pick the mode either: without a period it leaves since_hours out.
     assert "since_hours 없이 맡긴다" in mungchi and "마지막 확인" not in mungchi
+
+
+def test_the_dropbox_window_is_explained_from_since_basis_only():
+    for prompt in (build_update_prompt(), build_update_prompt(direct=True)):
+        assert "## 기간 (since_basis로만 쓴다)" in prompt
+        assert '- default_24h → "최근 24시간 기준"' in prompt
+        assert '- briefing_checkpoint → "지난 브리핑(10/06 07:50) 이후"' in prompt
+        assert '- lookback_default → "지난 브리핑 기록이 없어 최근 24시간 기준"' in prompt
+        assert '- since_hours → "10/03 14:20 이후"' in prompt
+        assert "왜 그 기간인지(지난 브리핑 기록이 있었는지, 어떤 실행이었는지)는 짐작해서 덧붙이지 않는다." in prompt
+        # The report's first line carries that wording, not a bare "since 이후".
+        assert "Dropbox <folder> (<기간>, 파일 total_files개)" in prompt and "(since 이후," not in prompt
+        # Every no-result line names its window the same way.
+        assert "지난 브리핑 기록이 없어 최근 24시간 기준으로 봤는데, 바뀐 파일이 없어요" in prompt
+        assert "공저자 변경 없음 (Dropbox, 최근 24시간 기준): 기간 안에 바뀐 파일 5개는 모두 내가 수정했어요" in prompt
+        assert "since_basis가 default_24h, briefing_checkpoint, lookback_default이면 같은 줄 끝에" in prompt
+        assert "since_basis가 since_hours나 lookback_default" not in prompt
+    # 고뭉치 relays 업뎃's wording and never guesses why the window is what it is.
+    mungchi = options().system_prompt
+    assert '어느 기간을 봤는지는 업뎃이 적은 말(예: "최근 24시간 기준", "지난 브리핑(10/06 07:50) 이후")을 그대로 옮긴다.' in mungchi
+    assert "왜 그 기간인지(지난 브리핑 기록이 있었는지, 어떤 실행이었는지)는 짐작해서 덧붙이지 않는다." in mungchi
+    assert "어느 기간을 봤는지는 업뎃이 보고에 적는다" in mungchi
+    for prompt in (mungchi, build_update_prompt(), build_update_prompt(direct=True)):
+        assert "체크포인트" not in prompt and "정기 브리핑 실행" not in prompt
+
+
+def test_a_briefing_in_conversation_has_all_four_parts():
+    prompt = options().system_prompt
+    section = prompt[prompt.index("## 브리핑") : prompt.index("### ① 오늘의 일정")]
+    assert "대화 중에 브리핑이나 오늘 요약을 부탁받으면" in section and "건너뛴 브리핑 해줘" in section
+    assert "아래 네 부분을 이 순서로 모두 담는다. 날씨나 크레딧을 빼지 않는다." in section
+    # All four sources are asked at once: 고뭉치's own two tools and the two teammates.
+    assert "한 번의 응답 안에서 get_weather, get_credits와 Agent 도구 두 번('일정' 에이전트, 업뎃)을 함께 호출한다." in section
+    assert "🌤️ 날씨는 get_weather로 직접 확인한다." in section
+    assert "① 오늘의 일정은 '일정' 에이전트에게 맡긴다" in section
+    assert "② Dropbox 업데이트는 업뎃에게 맡긴다" in section
+    assert "💳 크레딧은 get_credits로 직접 확인한다." in section
+    # The format, in the order of the code-driven briefing: weather, ①, ②, credits.
+    lines = ["  🌤️ 날씨: get_weather의 summary 한 줄", "  ① 오늘의 일정: 아래 규칙대로", "  ② Dropbox 업데이트: 아래 규칙대로", "  💳 크레딧: get_credits의 summary를 짧게"]
+    assert "\n".join(lines) in section
+    # The blanket "never in a briefing" rule is gone; only a run whose prompt says code adds them leaves them out.
+    assert "브리핑에서는 get_weather와 get_credits를 부르지 않는다" not in prompt
+    assert "Chat KHU 크레딧은 쓰지 않고" not in prompt
+    assert "사용자 메시지가 제목, 날씨, 크레딧은 프로그램이 따로 붙인다고 하면(프로그램이 만드는 브리핑) 그 말을 따른다." in section
+    assert "그때는 get_weather와 get_credits를 부르지 않고, 날짜 제목 줄, 날씨, 크레딧 없이 ①과 ②만 쓴다." in section
+    # ... and the code-driven briefing's prompt is exactly such a message.
+    from mungchi import briefing
+
+    code_prompt = briefing.briefing_prompt(NOW)
+    assert "제목, 날씨, Chat KHU 크레딧은 프로그램이 따로 붙이니 get_weather와 get_credits는 부르지 말고" in code_prompt
+    assert "① 오늘의 일정과 ② Dropbox 업데이트만 써" in code_prompt
+    assert code_prompt not in prompt and "2026-10-05" not in prompt  # per run, never in the cached system prompt
 
 
 def test_folder_link_example_line_is_in_every_prompt_that_writes_one():
@@ -741,6 +792,9 @@ def test_system_prompts_carry_no_time_and_are_byte_identical_at_different_times(
         snapshots.append(_every_system_prompt())
     first, second = snapshots
     assert first.keys() == second.keys() and len(first) == 3 * 2 + 2 * 2 * 2
+    # The conversational briefing guidance is part of the cached, time-free prompt.
+    for key in ("mungchi", "mungchi+slack"):
+        assert "아래 네 부분을 이 순서로 모두 담는다" in first[key] and "💳 크레딧은 get_credits로 직접 확인한다" in first[key]
     for key, text in first.items():
         assert text.encode("utf-8") == second[key].encode("utf-8"), key
         assert not re.search(r"\d{4}-\d{2}-\d{2}", text), key
@@ -919,7 +973,9 @@ def test_schedule_prompts_call_get_weather_for_weather_questions():
     assert "내일 비 오면 일정 바꿔야 할까?" in MUNGCHI_SYSTEM_PROMPT
     assert "Dropbox와 캘린더는 직접 다루지 않고" in MUNGCHI_SYSTEM_PROMPT
     assert "날씨는 맡기지 않는다" in MUNGCHI_SYSTEM_PROMPT
-    assert "브리핑에서는 get_weather와 get_credits를 부르지 않는다" in MUNGCHI_SYSTEM_PROMPT
+    # In a briefing 고뭉치 fetches the weather itself (unless the run's prompt says code adds it).
+    assert "🌤️ 날씨는 get_weather로 직접 확인한다" in MUNGCHI_SYSTEM_PROMPT
+    assert "브리핑에서는 get_weather와 get_credits를 부르지 않는다" not in MUNGCHI_SYSTEM_PROMPT
     assert "날씨 질문" in SCHEDULE_DESCRIPTION and "날씨" in options().agents["schedule"].description
 
 
