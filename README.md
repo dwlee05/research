@@ -18,8 +18,8 @@
  │            ├─ get_schedule           → Mac 캘린더 앱(EventKit) 또는 ICS 캘린더 (Google·Outlook·iCloud)
  │            ├─ get_weather            → 오늘·내일 날씨와 미세먼지 (Open-Meteo, 키 없음)
  │            └─ propose_calendar_events → 붙여 넣은 메모의 일정을 캘린더 추가 '제안'으로 (카테고리를 고른 뒤 프로그램이 추가)
- ├─ Slack @update (업뎃 봇) · 터미널 --agent update     → 업뎃이 바로 답함 (Dropbox 도구, 메모·사진 → 일정 제안)
- └─ Slack @schedule (일정 봇) · 터미널 --agent schedule → '일정'이 바로 답함 (캘린더·날씨 도구, 메모·사진 → 일정 제안)
+ ├─ Slack @update (업뎃 봇) · 터미널 --agent update     → 업뎃이 바로 답함 (Dropbox 도구, 메모·사진·음성 → 일정 제안)
+ └─ Slack @schedule (일정 봇) · 터미널 --agent schedule → '일정'이 바로 답함 (캘린더·날씨 도구, 메모·사진·음성 → 일정 제안)
 ```
 
 - **고뭉치**는 브리핑을 부탁받으면 업뎃과 '일정'에게 **동시에** 일을 맡기고, 두 보고를 합쳐
@@ -45,7 +45,7 @@
   `propose_calendar_events`도 캘린더 추가 **제안**만 저장하고 캘린더는 건드리지 않습니다. 메모(또는 업뎃·일정에게 보낸 사진)의 일정은
   사용자가 미리보기를 보고 카테고리(Family, Teaching, Research, Event-Outside, Event-KHU)를 고른 뒤 **프로그램이** 추가합니다
   (에이전트는 카테고리를 추천만 하고, 일정을 추가할 수 있는 도구는 없습니다). 아래 [메모로 일정 추가하기](#메모로-일정-추가하기),
-  [사진으로 일정 등록](#사진으로-일정-등록) 참고.
+  [사진으로 일정 등록](#사진으로-일정-등록) 참고. 음성 메시지는 이 Mac에서 글로 옮긴 뒤 메모처럼 처리합니다([음성으로 일정 등록](#음성으로-일정-등록)).
 - 모델은 `MUNGCHI_MODEL`(기본 `claude-opus-5-5`)이며, 업뎃·일정은 같은 모델을 이어받습니다(`inherit`).
 - 터미널과 Slack은 같은 에이전트를 씁니다. Slack에서 부르는 방법은 아래 [Slack에서 부르기](#slack에서-부르기)를 보세요.
 
@@ -364,6 +364,10 @@ python -m mungchi --weather
 # Mac 캘린더 앱 연결 (처음 한 번, macOS 터미널에서. 위 "캘린더"의 방법 A 참고)
 python -m mungchi --calendar-setup
 
+# 음성 받아쓰기 준비 (처음 한 번, Apple Silicon Mac, 모델 약 1.6GB) / 음성 메모 속 일정 등록 (아래 "음성으로 일정 등록" 참고)
+python -m mungchi --voice-setup
+python -m mungchi --agent schedule --audio memo.m4a
+
 # 업뎃이 Dropbox 변경을 못 찾을 때 원인 확인 (Claude API 안 씀, 아래 "업뎃이 변경을 못 찾을 때" 참고)
 python -m mungchi --dropbox-check --hours 72
 
@@ -550,6 +554,108 @@ python -m mungchi service --help
 
 권한이 없으면 사진마다 "봇에 files:read 권한이 없어 사진을 받지 못했어요"라고 답합니다.
 
+## 음성으로 일정 등록
+
+Slack에서 `@일정`이나 `@고뭉치`에게 **음성 메시지**로 일정을 말하면, **이 Mac에서** 글로 옮겨(받아쓰기) 들은 내용을 먼저 보여 주고
+[메모로 일정 추가하기](#메모로-일정-추가하기)와 똑같이 미리보기와 [카테고리](#카테고리) 질문(Slack에서는 버튼)을 보여 줍니다.
+카테고리를 고르면(버튼, 번호, 이름, 추천대로 "네") 추가합니다. 음성만으로는 아무것도 추가되지 않습니다.
+메모와 사진을 받는 `@업뎃`도 음성을 들을 수 있습니다.
+
+```
+(음성 메시지) 다음 주 화요일 오후 세 시에 연구실 회의 잡아줘
+🎙️ 들은 내용: "다음 주 화요일 오후 세 시에 연구실 회의 잡아줘"
+• 10/13(화) 15:00–16:00 연구실 회의
+카테고리를 골라주세요 (추천: Research) — 1 Family · 2 Teaching · 3 Research · 4 Event-Outside · 5 Event-KHU · …
+[Family] [Teaching] [Research] [Event-Outside] [Event-KHU] [취소]
+```
+
+**보내는 법**
+
+- **DM**: 일정(또는 고뭉치) 앱의 메시지 탭에서 입력창의 **마이크 버튼**(오디오 클립 녹음, Slack 버전에 따라 `+` 메뉴 안에 있음)을
+  눌러 말하고 보냅니다. 휴대폰 **음성 메모** 앱으로 녹음한 파일(m4a 등)을 올려도 됩니다.
+- **채널**: `@일정`을 멘션하면서 음성 메시지나 음성 파일을 붙입니다. 글을 함께 쓰면(예: `@일정 Research로`) 그 말도 함께 전합니다.
+- `@고뭉치`에게 보내면 고뭉치가 받아쓴 글을 메모처럼 '일정'에게 맡깁니다. 고뭉치 스레드에서 카테고리를 고르면 됩니다.
+- **터미널**: `python -m mungchi --agent schedule --audio memo.m4a`는 들은 내용을 보여 준 뒤 대화 모드의 첫 메시지로 보냅니다
+  (덧붙일 말을 적거나 그냥 Enter). 질문과 함께 쓰면(`--audio memo.m4a "Research로"`) 질문 한 번이라 미리보기만 보여 줍니다.
+  `--agent` 없이 쓰면 고뭉치가 '일정'에게 맡깁니다.
+
+**이렇게 처리합니다**
+
+1. 스레드에 "🎙️ 음성을 글로 옮기는 중…"이 뜹니다.
+2. 받아쓰기가 끝나면 그 줄이 `🎙️ 들은 내용: "…"`으로 바뀝니다(500자가 넘으면 줄여서 보여 줌).
+3. 에이전트가 받아쓴 글로 미리보기를 만들고 카테고리를 묻습니다. 그다음은 [메모로 일정 추가하기](#메모로-일정-추가하기)와 같습니다.
+
+- 음성 인식은 **이름·숫자를 잘못 들을 수 있습니다.** 에이전트는 알아들은 대로 미리보기를 만들고, 애매한 부분(비슷하게 들리는 이름,
+  '두 시'와 '열두 시')은 짐작하지 않고 묻습니다. 틀렸으면 `시간은 2시야`처럼 고칠 내용을 답하세요.
+- 아무 말도 알아듣지 못하면(무음, 잡음) 모델을 부르지 않고 "음성에서 내용을 알아듣지 못했어요. 다시 녹음해 주세요."라고 답합니다.
+- 음성과 사진을 함께 보내면 음성만 듣습니다. 사진은 따로 보내 주세요.
+- 음성 메시지는 새 메시지라서, 그 스레드에서 기다리던 앞의 제안을 대신합니다. 받아쓰는 동안 보낸 "네"는 앞의 제안을 확인하지 않습니다.
+
+**이 Mac에서 받아쓰기 (무료, 비공개)**
+
+- 받아쓰기는 [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper)(OpenAI Whisper의 Apple Silicon용 버전)로
+  **이 Mac 안에서** 합니다. 음성은 Mac 밖으로 나가지 않고 크레딧도 들지 않습니다. Claude(Chat KHU 게이트웨이)에는 **받아쓴 글만** 갑니다
+  (게이트웨이는 음성을 받지 못합니다).
+- **Apple Silicon Mac(M1 이후)**, macOS 14 이상에서만 됩니다. 다른 컴퓨터에서 도는 봇은 그렇게 알려 주고 휴대폰 받아쓰기를 권합니다.
+- 음성은 메모리에서만 다룹니다. PyAV로 16kHz 모노로 바꿔 바로 받아쓰고, 파일로 저장하지 않습니다(ffmpeg 프로그램은 필요 없음).
+  받아쓴 글과 음성은 로그에 남기지 않습니다(로그에는 글자 수만). 단, 스레드에서 대화를 이어 가도록 Claude Code가 `~/.claude/` 아래에
+  남기는 대화 기록에는 에이전트에게 보낸 받아쓴 글이 들어갑니다(메모와 같음).
+- 받아쓰기는 한 번에 하나씩 합니다. 3분 안에 끝나지 않으면 멈추고 알려 줍니다. 봇을 켠 뒤 첫 음성은 모델을 불러오느라 조금 더 걸립니다.
+- 봇은 모델을 스스로 내려받지 않고, 받아 둔 모델을 찾을 때도 인터넷에 접속하지 않습니다. 모델이 없으면 아래 `--voice-setup`을 실행하라고 답합니다.
+
+**한 번 해 둘 설정** (저장소 폴더에서 가상환경을 켜고)
+
+1. 새 패키지를 설치합니다. Apple Silicon Mac에서만 `mlx-whisper`와 `av`(PyAV)가 함께 설치됩니다
+   (mlx-whisper가 MLX·PyTorch 등을 함께 받아 수백 MB가 듭니다).
+   ```bash
+   git pull
+   pip install -e .
+   ```
+2. 음성 인식 모델을 받고 확인합니다. 기본 모델은 Hugging Face에서 **약 1.6GB**를 한 번 받으므로 **몇 분** 걸릴 수 있습니다.
+   ```bash
+   python -m mungchi --voice-setup
+   ```
+   진행 막대와 함께 모델을 받고, 1초짜리 무음 시험 신호를 받아써서 확인한 뒤 모델 이름, 모델 위치
+   (보통 `~/.cache/huggingface/hub/models--mlx-community--whisper-large-v3-turbo/…`), 결과(`✅ 음성 받아쓰기 준비가 끝났어요.`)를 보여 줍니다.
+   봇과 **같은 사용자 계정**에서 실행하세요(모델은 사용자마다 따로 저장됩니다).
+3. 봇을 다시 시작합니다.
+   ```bash
+   python -m mungchi service restart
+   ```
+
+Slack 앱 권한은 사진과 같은 `files:read` 하나면 됩니다. 사진 기능을 이미 쓰고 있으면 그대로이고, 아니면
+[이미 만든 앱 고치기](#이미-만든-앱-고치기-버튼사진)대로 세 앱 모두 `files:read`를 주세요(고뭉치도 음성을 내려받습니다).
+
+**제한**
+
+- 한 메시지에 음성 **1개**(여러 개면 첫 번째만), 한 파일 **25MB**, 길이 **5분**(`VOICE_MAX_SECONDS`)까지. 넘으면 한 줄로 알려 주고 듣지 않습니다.
+- Slack 음성 클립과 m4a, mp3, wav, aac, ogg·opus, flac, webm 같은 오디오 파일을 듣습니다. 동영상은 듣지 않습니다.
+
+**설정** (`.env`, 고친 뒤에는 `python -m mungchi service restart`)
+
+- `WHISPER_MODEL`: 음성 인식 모델(Hugging Face 저장소 이름이나 모델 폴더). 기본 `mlx-community/whisper-large-v3-turbo`.
+  더 빠르고 작은 모델을 원하면 `mlx-community/whisper-small-mlx`(약 0.5GB, 한국어 정확도는 조금 낮음)처럼 바꾸고 `--voice-setup`을 다시 실행합니다.
+- `WHISPER_LANGUAGE`: 말하는 언어. 기본 `ko`(한국어). 비워 두면(`WHISPER_LANGUAGE=`) 언어를 스스로 알아냅니다.
+- `VOICE_MAX_SECONDS`: 들을 수 있는 가장 긴 음성(초). 기본 300(5분).
+
+**설정 없이 쓰는 방법: 휴대폰 키보드 받아쓰기**
+
+휴대폰 키보드의 **🎤 버튼**(받아쓰기)을 누르고 말하면 입력창에 글로 바뀝니다. 그 글을 그대로 `@일정`에게 보내면
+[메모로 일정 추가하기](#메모로-일정-추가하기)와 같습니다. 아무 설정도 필요 없고, 받아쓰기는 휴대폰이 합니다.
+
+**문제 해결**
+
+- "음성 받아쓰기에 필요한 mlx-whisper와 av가 설치되어 있지 않아요": 위 설정 1~3을 하세요.
+- "음성 인식 모델(…)이 아직 이 Mac에 없어요": `python -m mungchi --voice-setup`을 봇과 같은 사용자 계정에서 실행하고 `service restart`.
+  터미널에서 `HF_HOME`(Hugging Face 저장 위치)을 바꿔 썼다면 `.env`에도 같은 값을 넣어야 서비스가 모델을 찾습니다.
+- "Apple Silicon Mac(M1 이후)에서 봇을 돌릴 때만 돼요": 봇이 Intel Mac이나 Linux에서 돌고 있습니다. 휴대폰 받아쓰기를 쓰세요.
+- "음성 파일을 읽지 못했어요": m4a·mp3·wav 파일로 다시 보내 보세요.
+- "너무 오래 걸려서 멈췄어요": 더 짧게 나눠 보내거나, 작은 모델(`WHISPER_MODEL=mlx-community/whisper-small-mlx`)을 쓰세요.
+- `--voice-setup`이 모델을 받지 못하면 인터넷 연결과, 학교·회사 네트워크가 `huggingface.co`를 막지 않는지 확인하세요.
+- 들은 내용이 자주 틀리면: 조용한 곳에서 또박또박 말하고, `WHISPER_LANGUAGE=ko`인지, 작은 모델을 쓰고 있지 않은지 확인하세요.
+- 음성을 보냈는데 아무 반응이 없으면 `python -m mungchi service logs`에서 `파일 n개 (들을 음성 0개)` 같은 줄을 확인하고 알려 주세요
+  (Slack 음성 클립의 실제 파일 정보는 아직 확인하지 못했습니다).
+
 ## 아침 브리핑 (매일 자동으로 받기)
 
 Slack 봇이 켜져 있으면 고뭉치가 매일 아침 정해 둔 시각에 브리핑을 Slack으로 보내 줍니다.
@@ -685,6 +791,7 @@ Linux에서도 [systemd 서비스](#linux에서는)로 `python -m mungchi slack`
   - 예: `@일정`(멘션만 하면 "오늘과 내일 일정 알려줘"), `@일정 금요일 오후에 비는 시간 있어?`, `@일정 내일 비 오면 야외 미팅 미뤄야 할까?`
 - 업뎃·일정(고뭉치도)에게 날짜가 든 메모를 붙여 넣으면 캘린더 추가를 제안하고, 카테고리를 고르면(버튼, 번호, 이름, 추천대로 "네") 추가합니다([메모로 일정 추가하기](#메모로-일정-추가하기)).
   업뎃·일정에게는 포스터나 화면 캡처 같은 사진을 보내도 됩니다([사진으로 일정 등록](#사진으로-일정-등록)).
+  일정·고뭉치(업뎃도)에게는 음성 메시지로 일정을 말해도 됩니다([음성으로 일정 등록](#음성으로-일정-등록)).
 
 세 봇은 모두 **한 프로세스**(`python -m mungchi slack`)에서 함께 돌아가고, 토큰을 넣은 봇만 켜집니다.
 봇은 내 컴퓨터에서 **Socket Mode**로 돌기 때문에 공개 URL이나 서버가 필요 없습니다.
@@ -712,7 +819,7 @@ Linux에서도 [systemd 서비스](#linux에서는)로 `python -m mungchi slack`
    세 앱의 권한(bot scope)은 똑같이 꼭 필요한 여섯 개뿐입니다.
    - `app_mentions:read`: 채널에서 멘션 받기
    - `chat:write`: 답 올리기와 고치기
-   - `files:read`: 멘션·DM에 붙인 사진 내려받기([사진으로 일정 등록](#사진으로-일정-등록))
+   - `files:read`: 멘션·DM에 붙인 사진과 음성 메시지 내려받기([사진으로 일정 등록](#사진으로-일정-등록), [음성으로 일정 등록](#음성으로-일정-등록))
    - `im:history`, `im:read`, `im:write`: 봇과의 DM 읽고 쓰기
 
    이벤트는 `app_mention`, `message.im` 두 가지이고, App Home의 **Messages 탭**(DM 보내기)과
@@ -974,7 +1081,7 @@ loginctl enable-linger "$USER"             # 로그아웃한 뒤에도 계속 �
 터미널(`python -m mungchi ...`)에서는 되는 기능이 Slack에서 안 되면(예: 고뭉치가 "날씨나 토큰은 확인할 수 없어요"라고 답하면),
 봇이 **코드를 받기 전에 켠 예전 코드**로 돌고 있는 경우가 많습니다. 봇은 켤 때의 코드를 계속 쓰므로 코드를 받은 뒤에는 다시 켜야 합니다.
 
-1. 저장소 폴더에서 코드를 받습니다. 필요한 패키지가 늘었을 수 있으니(예: 사진 기능의 Pillow) 설치도 다시 합니다.
+1. 저장소 폴더에서 코드를 받습니다. 필요한 패키지가 늘었을 수 있으니(예: 사진 기능의 Pillow, 음성 기능의 mlx-whisper) 설치도 다시 합니다.
    ```bash
    git pull
    pip install -e .
@@ -1122,6 +1229,9 @@ export SSL_CERT_FILE="$(python -m certifi)"
   고뭉치의 `get_credits` 도구도 같은 주소만 부르고 키는 결과에 넣지 않지만, 에이전트가 쓰는 도구라 그 답에는 모델 호출이 들어갑니다.
 - 사진([사진으로 일정 등록](#사진으로-일정-등록))은 허용 목록을 확인한 뒤에만 봇 토큰으로 내려받고(`slack.com` 주소에만 토큰을 보냄),
   메모리에서 줄여 업뎃·일정에게만 보냅니다(고뭉치는 사진을 받지 않음). 봇은 사진을 파일로 저장하거나 로그에 남기지 않습니다.
+- 음성 메시지([음성으로 일정 등록](#음성으로-일정-등록))도 허용 목록을 확인한 뒤에만 내려받고, 이 Mac 안에서 mlx-whisper로 받아씁니다.
+  음성은 Mac 밖으로 보내지 않고 파일로 저장하지 않으며, 받아쓴 글과 음성은 로그에 남기지 않습니다. 에이전트에게는 받아쓴 글만 가고,
+  일정은 메모처럼 사용자가 카테고리를 고른 뒤에만 추가됩니다.
 - 날씨(`--weather`, 브리핑의 날씨 줄, Slack의 날씨 답)는 Open-Meteo만 부르고 모델은 부르지 않습니다. 키는 없고,
   보내는 것은 설정한 위도·경도와 시간대뿐입니다. Slack에서 묻더라도 허용 목록 확인이 먼저입니다.
   고뭉치와 '일정'의 날씨 도구(`get_weather`)도 Open-Meteo만 부르지만, 에이전트가 쓰는 도구라 그 답에는 모델 호출이 들어갑니다.
@@ -1161,6 +1271,9 @@ export SSL_CERT_FILE="$(python -m certifi)"
   (DM의 `file_share`, 사진이 붙은 `app_mention`, `files:read` 없이 받는 응답), Chat KHU 게이트웨이가 사진(이미지 블록)을 받는지,
   아이폰 HEIC 원본은 아직 확인하지 못했습니다. 처음 쓸 때 작은 사진으로 한 번 시험해 보세요.
 - Slack 버튼(Interactivity)은 Block Kit 형식과 Bolt의 처리 순서만 테스트했고, 실제 Slack에서 누르는 것은 확인하지 못했습니다.
+- **음성으로 일정 등록**은 가짜 받아쓰기(가짜 mlx-whisper·PyAV)와 가짜 Slack으로만 테스트했습니다. PyAV의 메모리 디코딩은 Linux에서
+  만든 m4a·webm·ogg·mp3·wav로 확인했지만, 실제 Mac에서의 mlx-whisper(모델 내려받기, 받아쓰기 속도와 한국어 정확도), Slack 음성 클립의
+  실제 파일 정보(`subtype`, mimetype, `duration_ms`)와 이벤트는 아직 확인하지 못했습니다. 처음 쓸 때 짧은 음성으로 한 번 시험해 보세요.
 - 고뭉치에게 물으면 고뭉치·업뎃·일정이 모두 모델을 호출하므로 API 비용이 듭니다. 업뎃·일정을 직접 부르면 한 에이전트만
   호출합니다. Slack 멘션·DM도 한 번마다 비용이 듭니다.
 
@@ -1178,6 +1291,8 @@ pytest -q
 `--list-models`와 크레딧 확인(`--credits`, Slack의 크레딧 답, 잔액 알림), 날씨(`--weather`, 브리핑의 날씨 줄, Slack의 날씨 답, `get_weather`)는
 가짜 httpx 전송(`MockTransport`)과 고정된 시계로 확인합니다. 가짜 전송 없이 나가는 httpx 요청은 테스트에서 연결 실패로 바뀝니다.
 사진은 메모리에서 만든 작은 Pillow 이미지와 가짜 다운로드로 확인하고, 실제 Slack 파일은 내려받지 않습니다.
+음성은 mlx-whisper와 PyAV 대신 가짜 백엔드(디코딩·받아쓰기)로 확인하므로 Linux에서도 돌고, 모델을 내려받지 않습니다
+(PyAV가 설치되어 있으면 실제 디코딩 테스트도 하나 돕니다).
 백그라운드 서비스(`service`)는 가짜 명령 실행기로 확인하므로 `osacompile`·`codesign`·`launchctl`·`pgrep`·`pkill`을 실제로
 부르지 않습니다(`run-bot.sh`만 bash와 가짜 Python으로 직접 실행해 따옴표 처리를 확인합니다).
 
@@ -1185,7 +1300,7 @@ pytest -q
 slack_manifests/       # Slack 앱 매니페스트, 봇마다 하나 (moongchi.yaml · update.yaml · schedule.yaml)
 src/mungchi/
 ├── __main__.py        # python -m mungchi
-├── main.py            # 페르소나별 ClaudeAgentOptions 구성, 한 턴 실행(run_turn, 사진은 이미지 블록으로), CLI(--agent, --image 포함), 출력 스트리밍, 오류 문구
+├── main.py            # 페르소나별 ClaudeAgentOptions 구성, 한 턴 실행(run_turn, 사진은 이미지 블록으로), CLI(--agent, --image, --audio, --voice-setup 포함), 출력 스트리밍, 오류 문구
 ├── briefing.py        # 오늘 브리핑(--brief, --brief --slack, 아침 브리핑 공통): 제목·날씨·고뭉치 답·크레딧 조립, 아침 브리핑 시각 판단
 ├── model_list.py      # --list-models: 모델 목록 확인 (GET /v1/models)
 ├── credits.py         # --credits, Slack의 크레딧 바로 답, 잔액 알림 문구: Chat KHU 크레딧·사용량 조회 (LLM 호출 없음)
@@ -1196,8 +1311,9 @@ src/mungchi/
 ├── dropbox_check.py   # --dropbox-check: 업뎃이 Dropbox 변경을 못 찾을 때 원인 확인 (읽기 전용)
 ├── service.py         # service: macOS 백그라운드 서비스 (AppleScript 앱 + LaunchAgent), 상태(실행 중인 코드 버전 포함)·로그 보기
 ├── images.py          # 사진 → 일정: Slack 메시지의 사진 고르기(5장, 20MB), 메모리에서 회전·RGB·1568px·JPEG로 줄이기, --image 파일 읽기
+├── voice.py           # 음성 → 일정: Slack 메시지의 음성 고르기(1개, 25MB, 5분), PyAV로 메모리에서 디코딩, mlx-whisper로 이 Mac에서 받아쓰기(한 번에 하나, 시간 제한), --voice-setup
 ├── personas.py        # 페르소나 키(mungchi·update·schedule), 한글 이름, Slack 핸들
-├── slack_bot.py       # Slack 봇 세 개(한 프로세스, Socket Mode), 권한 확인, 진행 표시, 크레딧·날씨 바로 답, 카테고리 답·버튼, 사진 받기, 잔액 알림, 아침 브리핑, --brief --slack
+├── slack_bot.py       # Slack 봇 세 개(한 프로세스, Socket Mode), 권한 확인, 진행 표시, 크레딧·날씨 바로 답, 카테고리 답·버튼, 사진·음성 받기, 잔액 알림, 아침 브리핑, --brief --slack
 ├── slack_format.py    # Slack용 프롬프트, 봇별 첫 답, 멘션 제거, mrkdwn 변환, 메시지 나누기
 ├── agents.py          # 고뭉치 프롬프트, 업뎃·일정 프롬프트(하위 에이전트용·직접 대화용), AgentDefinition, 도구 권한 훅
 ├── config.py          # 환경변수 읽기(봇별 Slack 토큰 포함), 설정 누락 안내 문구

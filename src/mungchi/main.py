@@ -24,7 +24,7 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
-from . import config, images as image_prep
+from . import config, images as image_prep, voice
 from .agents import (
     AGENT_LABELS,
     PERSONA_TOOLS,
@@ -609,11 +609,14 @@ async def run_chat(
     store: StateStore | None = None,
     create: Creator | None = None,
     images: Sequence[image_prep.ImageInput] | None = None,
+    transcript: str | None = None,
 ) -> int:
     """The terminal chat. With ``conversation_key`` (the one bound into ``options``),
     a turn that proposes calendar events is followed by the category (or yes/no) question.
     ``images`` (``--image``) go with the first message; an empty first line
-    sends ``images.DEFAULT_IMAGE_PROMPT`` (the events in them)."""
+    sends ``images.DEFAULT_IMAGE_PROMPT`` (the events in them). ``transcript``
+    (``--audio``) goes with the first message the same way (``voice.voice_prompt``);
+    an empty first line sends it alone."""
     # One long-lived client keeps the whole conversation in a single session;
     # every line the user types is sent with the current time in front.
     print(CHAT_GREETINGS[persona])
@@ -621,11 +624,14 @@ async def run_chat(
         store = StateStore(config.get_state_path())
     queued: str | None = None
     pending_images = list(images or [])
+    pending_transcript = transcript or None
     if pending_images:
         print(
             f"사진 {len(pending_images)}장을 첫 메시지와 함께 보냅니다. "
             f"그냥 Enter를 누르면 \"{image_prep.DEFAULT_IMAGE_PROMPT}\"로 보냅니다."
         )
+    if pending_transcript:
+        print("들은 내용을 첫 메시지와 함께 보냅니다. 덧붙일 말이 있으면 적고, 그냥 Enter를 누르면 들은 내용만 보냅니다.")
     async with ClaudeSDKClient(options=options) as client:
         while True:
             if queued is not None:
@@ -637,7 +643,11 @@ async def run_chat(
                     print()
                     break
                 prompt = line.strip()
-                if not prompt and pending_images:
+                if prompt.lower() in EXIT_WORDS:
+                    break
+                if pending_transcript:
+                    prompt, pending_transcript = voice.voice_prompt(prompt, pending_transcript), None
+                elif not prompt and pending_images:
                     prompt = image_prep.DEFAULT_IMAGE_PROMPT
             if not prompt:
                 continue
@@ -685,6 +695,8 @@ def build_parser() -> argparse.ArgumentParser:
             '  python -m mungchi --agent update "누가 무슨 파일 고쳤어?"   # 업뎃에게 바로 묻기\n'
             "  python -m mungchi --agent update --image poster.jpg   # 사진 속 일정을 캘린더에 (대화 모드, 첫 메시지에 사진)\n"
             '  python -m mungchi --agent schedule --image a.png --image b.png "11월 것만"   # 질문 한 번: 미리보기만\n'
+            "  python -m mungchi --agent schedule --audio memo.m4a   # 음성 메모 속 일정을 캘린더에 (이 Mac에서 받아쓰기, 대화 모드)\n"
+            "  python -m mungchi --voice-setup         # 음성 받아쓰기 준비 (처음 한 번, 모델 약 1.6GB 다운로드)\n"
             "  python -m mungchi --agent schedule      # '일정'과 바로 대화 (일정, 오늘·내일 날씨)\n"
             '  python -m mungchi --agent schedule "내일 비 오면 일정 바꿔야 할까?"   # 날씨가 걸린 일정 질문\n'
             "  python -m mungchi --list-models         # 쓸 수 있는 모델 ID 확인 (MUNGCHI_MODEL 고르기)\n"
@@ -749,6 +761,24 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     opts.add_argument(
+        "--audio",
+        metavar="음성파일",
+        help=(
+            f"음성 파일(m4a·mp3·wav 등, {voice.MAX_AUDIO_MB}MB·VOICE_MAX_SECONDS(기본 "
+            f"{voice.describe_seconds(config.DEFAULT_VOICE_MAX_SECONDS)})까지)을 이 Mac에서 글로 옮긴 뒤(mlx-whisper) "
+            "들은 내용을 보여 주고 그 내용으로 일정을 제안합니다. 질문과 함께 쓰면 미리보기만, 질문 없이 쓰면 "
+            "대화 모드의 첫 메시지로 보냅니다(--agent 없이 쓰면 고뭉치가 '일정'에게 맡김)"
+        ),
+    )
+    opts.add_argument(
+        "--voice-setup",
+        action="store_true",
+        help=(
+            "음성 받아쓰기(mlx-whisper, Apple Silicon Mac 전용)를 준비합니다: 음성 인식 모델(WHISPER_MODEL, 기본 약 1.6GB)을 "
+            "처음 한 번 받고, 시험 신호를 받아써서 확인한 뒤 모델 위치를 보여 줍니다 (Claude API는 쓰지 않음)"
+        ),
+    )
+    opts.add_argument(
         "--list-models",
         action="store_true",
         help=(
@@ -797,6 +827,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     opts.add_argument("-h", "--help", action="help", help="이 도움말을 보여 주고 끝냅니다")
     return parser
+
+
+def transcribe_audio_file(path: str, transcriber: voice.Transcriber | None = None) -> str | None:
+    """``--audio``: transcribe ``path`` on this Mac and print what was heard; None (after a Korean note) when nothing."""
+    print(voice.TRANSCRIBING_TEXT, file=sys.stderr)
+    try:
+        data = voice.read_audio_file(path)
+        transcript = asyncio.run((transcriber or voice.Transcriber()).transcribe(data))
+    except voice.VoiceError as exc:
+        print(f"[오류] {exc}", file=sys.stderr)
+        return None
+    except Exception as exc:  # noqa: BLE001 - a Korean line, never the audio
+        print(f"[오류] {voice.FAILED_TEXT.format(kind=type(exc).__name__)}", file=sys.stderr)
+        return None
+    if not transcript:
+        print(f"[오류] {voice.EMPTY_TRANSCRIPT_TEXT}", file=sys.stderr)
+        return None
+    print(voice.heard_text(transcript, limit=None))
+    return transcript
 
 
 def drop_empty_claude_env(environ: MutableMapping[str, str] | None = None) -> None:
@@ -900,6 +949,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if args.image and len(args.image) > image_prep.MAX_IMAGES:
         parser.error(f"--image는 {image_prep.MAX_IMAGES}장까지만 쓸 수 있습니다(받은 사진 {len(args.image)}장).")
+    if args.voice_setup and (
+        args.question
+        or args.brief
+        or args.slack
+        or args.agent
+        or args.image
+        or args.audio
+        or args.list_models
+        or args.credits
+        or args.weather
+        or args.calendar_setup
+        or args.dropbox_check
+    ):
+        parser.error("--voice-setup은 질문이나 다른 옵션과 함께 쓸 수 없습니다. 예: python -m mungchi --voice-setup")
+    if args.audio and (
+        args.brief
+        or args.slack
+        or args.image
+        or args.list_models
+        or args.credits
+        or args.weather
+        or args.calendar_setup
+        or args.dropbox_check
+        or args.question == SLACK_COMMAND
+    ):
+        parser.error(
+            "--audio는 --brief, --slack, --image, --list-models, --credits, --weather, --calendar-setup, --dropbox-check, "
+            "slack과 함께 쓸 수 없습니다."
+        )
     if args.hours is not None and not args.dropbox_check:
         parser.error("--hours는 --dropbox-check와 함께 써야 합니다. 예: python -m mungchi --dropbox-check --hours 72")
     if args.hours is not None and args.hours <= 0:
@@ -941,6 +1019,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             from .dropbox_check import run_dropbox_check
 
             return run_dropbox_check(hours=args.hours)
+        if args.voice_setup:
+            return voice.run_voice_setup()
         if start_slack_bot:
             from .slack_bot import run_bot_cli
 
@@ -962,12 +1042,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             except image_prep.ImageError as exc:
                 print(f"[오류] {exc}", file=sys.stderr)
                 return 1
+        transcript = None
+        if args.audio:
+            transcript = transcribe_audio_file(args.audio)
+            if transcript is None:
+                return 1
         if args.question:
-            return asyncio.run(run_once(args.question, persona, images=images))
+            question = voice.voice_prompt(args.question, transcript) if transcript else args.question
+            return asyncio.run(run_once(question, persona, images=images))
         # The chat's own conversation key: a calendar proposal made in it is confirmed in it.
         key = event_proposals.cli_conversation_key()
         return asyncio.run(
-            run_chat(build_options(persona=persona, conversation_key=key), persona, conversation_key=key, images=images)
+            run_chat(
+                build_options(persona=persona, conversation_key=key),
+                persona,
+                conversation_key=key,
+                images=images,
+                transcript=transcript,
+            )
         )
     except KeyboardInterrupt:
         print(f"\n{label}: 중단했습니다.", file=sys.stderr)
