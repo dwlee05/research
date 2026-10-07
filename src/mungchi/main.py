@@ -69,7 +69,10 @@ CLI_ENV = {
     "ENABLE_TOOL_SEARCH": "false",
 }
 
-BRIEFING_PROMPT = "업뎃과 '일정' 에이전트에게 일을 맡겨서 오늘({today}) 브리핑을 해줘."
+BRIEFING_PROMPT = (
+    "업뎃과 '일정' 에이전트에게 일을 맡겨서 오늘({today}) 브리핑을 해줘. "
+    "일정은 오늘 하루만(days=1), 공저자 업데이트는 기간 없이 맡겨."
+)
 EXIT_WORDS = {"exit", "quit", "종료"}
 # A positional prompt that is exactly this word starts the Slack bot.
 SLACK_COMMAND = "slack"
@@ -475,8 +478,8 @@ async def run_turn(
         return await stream_turn(client, stamp_prompt(prompt, clock), renderer, on_status)
 
 
-async def run_once(prompt: str, persona: str = MUNGCHI, *, briefing: bool = False) -> int:
-    result = await run_turn(prompt, renderer=Renderer(), persona=persona, briefing=briefing)
+async def run_once(prompt: str, persona: str = MUNGCHI) -> int:
+    result = await run_turn(prompt, renderer=Renderer(), persona=persona)
     return 1 if result.failed else 0
 
 
@@ -521,10 +524,10 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "예시:\n"
             "  python -m mungchi                       # 대화 모드\n"
-            "  python -m mungchi --brief               # 오늘 브리핑\n"
+            "  python -m mungchi --brief               # 오늘 브리핑 (일정, Dropbox 업데이트, 크레딧)\n"
             '  python -m mungchi "어제 공저자들이 뭐 고쳤어?"   # 질문 한 번\n'
-            "  python -m mungchi slack                 # Slack 봇 실행 (Socket Mode)\n"
-            "  python -m mungchi --brief --slack       # 오늘 브리핑을 Slack 채널에 올리기 (cron용)\n"
+            "  python -m mungchi slack                 # Slack 봇 실행 (Socket Mode, BRIEF_TIME이 있으면 아침 브리핑도)\n"
+            "  python -m mungchi --brief --slack       # 오늘 브리핑을 지금 바로 Slack에 올리기 (아침 브리핑 시험용)\n"
             '  python -m mungchi --agent update "누가 무슨 파일 고쳤어?"   # 업뎃에게 바로 묻기\n'
             "  python -m mungchi --agent schedule      # '일정'과 바로 대화\n"
             "  python -m mungchi --list-models         # 쓸 수 있는 모델 ID 확인 (MUNGCHI_MODEL 고르기)\n"
@@ -557,11 +560,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     opts = parser.add_argument_group("옵션")
-    opts.add_argument("--brief", action="store_true", help="오늘 브리핑을 한 번 받고 끝냅니다 (cron용)")
+    opts.add_argument(
+        "--brief",
+        action="store_true",
+        help="오늘 브리핑(오늘의 일정, Dropbox 업데이트, Chat KHU 크레딧)을 한 번 받고 끝냅니다",
+    )
     opts.add_argument(
         "--slack",
         action="store_true",
-        help="--brief와 함께 쓰면 브리핑을 터미널 대신 SLACK_BRIEF_CHANNEL 채널에 올립니다",
+        help=(
+            "--brief와 함께 쓰면 브리핑을 터미널 대신 Slack에 올립니다 "
+            "(SLACK_BRIEF_CHANNEL, 비어 있으면 SLACK_ALLOWED_USER_IDS의 사람에게 고뭉치 봇 DM)"
+        ),
     )
     opts.add_argument(
         "--agent",
@@ -725,7 +735,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return post_briefing_cli()
         if args.brief:
             # The only briefing run in the terminal: it alone moves the Dropbox checkpoint.
-            return asyncio.run(run_once(briefing_prompt(), briefing=True))
+            # Same structure as --brief --slack and the morning briefing (header, answer, credits).
+            from .briefing import run_brief_cli
+
+            return run_brief_cli()
         if args.question:
             return asyncio.run(run_once(args.question, persona))
         return asyncio.run(run_chat(build_options(persona=persona), persona))

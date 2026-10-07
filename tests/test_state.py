@@ -67,8 +67,31 @@ def test_state_path_and_lookback_are_env_overridable(tmp_path):
     env = {"MUNGCHI_STATE_FILE": str(tmp_path / "x.json"), "LOOKBACK_DAYS": "3"}
     assert config.get_state_path(env) == tmp_path / "x.json"
     assert config.get_lookback_days(env) == 3
-    assert config.get_lookback_days({"LOOKBACK_DAYS": "abc"}) == 7
+    assert config.get_lookback_days({"LOOKBACK_DAYS": "abc"}) == 1
     assert config.get_state_path({}).name == ".mungchi_state.json"
+    # Relative to another folder (``service status`` looking at the service's repository).
+    base = tmp_path / "repo"
+    assert config.get_state_path({}, base_dir=base) == base / ".mungchi_state.json"
+    assert config.get_state_path({"MUNGCHI_STATE_FILE": "state/s.json"}, base_dir=base) == base / "state" / "s.json"
+    assert config.get_state_path(env, base_dir=base) == tmp_path / "x.json"
+
+
+def test_lookback_days_defaults_to_one_day():
+    """Only the first briefing (no checkpoint) uses it; a daily briefing starts with 24 hours."""
+    assert config.DEFAULT_LOOKBACK_DAYS == 1
+    assert config.get_lookback_days({}) == 1
+    assert config.get_lookback_days({"LOOKBACK_DAYS": "0"}) == 1
+
+
+def test_last_brief_date_round_trips_and_keeps_other_keys(tmp_path):
+    store = StateStore(tmp_path / "state.json")
+    assert store.last_brief_date() is None
+    store.mark_checked("dropbox", NOW)
+    store.mark_brief_date("2026-10-08")
+    assert store.last_brief_date() == "2026-10-08"
+    assert store.last_checked("dropbox") == NOW
+    (tmp_path / "state.json").write_text('{"last_brief_date": "어제"}', encoding="utf-8")
+    assert store.last_brief_date() is None  # anything but YYYY-MM-DD is ignored
 
 
 # ---------------------------------------------------------------- Slack threads

@@ -42,6 +42,7 @@ from typing import Any, Callable, Mapping, Sequence, TextIO
 from . import config
 from . import main as main_module
 from .main import KoreanArgumentParser, KoreanHelpFormatter
+from .state import StateStore
 from .tools import macos_calendar
 from .tools.common import safe_error, scrub
 
@@ -80,8 +81,8 @@ SERVICE_PERMISSION_HINT = (
     f"'전체 접근'으로 바꾼 뒤 {COMMAND} restart 를 실행하세요."
 )
 SLEEP_TIP = (
-    "[팁] Mac이 잠자기에 들어가면 봇도 멈춥니다. 시스템 설정 → 에너지에서 "
-    "'디스플레이가 꺼져 있을 때 자동으로 잠자기 방지'를 켜 두세요."
+    "[팁] Mac이 잠자기에 들어가면 봇도 멈춥니다(놓친 아침 브리핑은 깨어난 뒤 기본 12:00 전까지 보냅니다). "
+    "시스템 설정 → 에너지에서 '디스플레이가 꺼져 있을 때 자동으로 잠자기 방지'를 켜 두세요."
 )
 
 # Settings a shell may export that the service (started by launchd) never sees.
@@ -470,6 +471,26 @@ class Service:
             )
         return pids
 
+    def service_env(self) -> Mapping[str, str]:
+        """The settings the service runs with: the repository's ``.env`` (it never sees shell exports)."""
+        env_file = self.repo_dir / ".env"
+        if env_file.is_file():
+            with contextlib.suppress(Exception):
+                return read_env_file(env_file)
+        return self.environ
+
+    def morning_brief_lines(self) -> list[str]:
+        """``status`` lines: the morning briefing schedule (BRIEF_TIME) and ``last_brief_date``."""
+        env = self.service_env()
+        schedule = config.load_brief_schedule(env)
+        line = f"- 아침 브리핑: {schedule.describe()}"
+        if schedule.enabled:
+            line += f" → {config.describe_brief_destination(config.load_slack_config(env))}"
+        lines = [line, *(f"  [경고] {warning}" for warning in schedule.warnings)]
+        last = StateStore(config.get_state_path(env, base_dir=self.repo_dir)).last_brief_date()
+        lines.append(f"- 마지막 아침 브리핑 (last_brief_date): {last or '아직 없음'}")
+        return lines
+
     def log_secrets(self) -> list[str]:
         """Secret values to hide when showing logs (the bot already scrubs; this is a second net)."""
         values = config.secret_values(self.environ)
@@ -735,6 +756,8 @@ class Service:
             self.say(f"- 캘린더 권한 ('{APP_DISPLAY_NAME}' 앱이 시작할 때 확인한 값{at}): {text}")
         else:
             self.say(f"- 캘린더 권한 ('{APP_DISPLAY_NAME}' 앱): 아직 기록 없음 (서비스가 시작하면 로그에 남습니다)")
+        for line in self.morning_brief_lines():
+            self.say(line)
 
         self.say()
         if self.bot_log.is_file():
@@ -970,7 +993,7 @@ ACTION_HELP = {
     "start": "서비스를 시작합니다",
     "stop": "서비스를 멈춥니다 (다음 로그인 때 다시 켜짐)",
     "restart": "서비스를 다시 시작합니다 (.env를 고친 뒤 사용)",
-    "status": "설치·실행 상태, 서비스 앱의 캘린더 권한, 최근 로그 10줄을 보여 줍니다",
+    "status": "설치·실행 상태, 서비스 앱의 캘린더 권한, 아침 브리핑 시각, 최근 로그 10줄을 보여 줍니다",
     "logs": "봇 로그를 보여 줍니다 (-f: 계속 보기, -n N: 마지막 N줄)",
     "run": "(내부용) 서비스 앱이 실행하는 명령입니다. 직접 실행하지 마세요",
 }

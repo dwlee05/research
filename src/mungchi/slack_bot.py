@@ -1,5 +1,6 @@
-"""Slack front end: the Socket Mode bots (``python -m mungchi slack``) and
-briefing delivery (``python -m mungchi --brief --slack``).
+"""Slack front end: the Socket Mode bots (``python -m mungchi slack``), the
+scheduled morning briefing they send (``BRIEF_TIME``) and briefing delivery
+(``python -m mungchi --brief --slack``).
 
 One process runs up to three Slack apps, one per persona: 고뭉치 (@moongchi,
 the orchestrator), 업뎃 (@update) and 일정 (@schedule), each with its own
@@ -22,19 +23,19 @@ import traceback
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Mapping
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 
-from . import config, credits
+from . import briefing, config, credits
+from .briefing import BRIEF_CRASH_TEXT, build_briefing
 from .main import TurnResult, briefing_prompt, run_turn
 from .personas import MUNGCHI, PERSONA_LABELS, PERSONAS, SCHEDULE, SLACK_HANDLES, UPDATE, josa
 from .slack_format import (
     PLACEHOLDER_TEXT,
     PLACEHOLDERS,
     SLACK_FORMAT_PROMPT,
-    brief_header,
     chunk_text,
     strip_mention,
     to_mrkdwn,
@@ -50,12 +51,21 @@ CreditText = Callable[[], str]
 
 REFUSAL_TEXT = "죄송하지만 이 봇은 소유자만 사용할 수 있어요."
 FRESH_SESSION_NOTE = "이 스레드의 이전 대화는 이어 갈 수 없어서, 다음 메시지부터는 새 대화로 시작해요."
-BRIEF_CRASH_TEXT = "⚠️ 오늘 브리핑을 만들지 못했어요 ({kind}). 실행 로그를 확인해 주세요."
 CREDIT_CRASH_TEXT = "⚠️ 크레딧을 확인하지 못했어요 ({kind}). 잠시 후 다시 시도해 주세요."
 
 # Low-credit alert inside the running bots: first check shortly after start, then hourly.
 CREDIT_CHECK_FIRST_DELAY_SECONDS = 60.0
 CREDIT_CHECK_INTERVAL_SECONDS = 3_600.0
+
+# Scheduled morning briefing: the wall clock is read again every 30 seconds
+# (never one long sleep until BRIEF_TIME: on macOS the monotonic clock stops
+# while the Mac sleeps). One briefing run may take at most 15 minutes.
+BRIEF_CHECK_INTERVAL_SECONDS = 30.0
+BRIEF_RUN_TIMEOUT_SECONDS = 15 * 60.0
+NO_MUNGCHI_BRIEF_WARNING = (
+    "고뭉치 봇(SLACK_BOT_TOKEN, SLACK_APP_TOKEN)이 켜져 있지 않아 아침 브리핑을 보내지 않습니다. "
+    "아침 브리핑은 고뭉치 봇이 보냅니다."
+)
 
 # What a bare mention (no text) asks for. 고뭉치's default is today's briefing.
 EMPTY_MENTION_PROMPTS = {
@@ -712,18 +722,182 @@ def _alert_bot(bots: list[tuple[config.SlackBotConfig, Any, SlackHandler]]) -> t
     return bot, app
 
 
+# ---------------------------------------------------------------- scheduled morning briefing
+
+
+@dataclass
+class BriefLoopState:
+    """What the morning briefing scheduler remembers between checks (in memory, per process).
+
+    ``attempted`` is the local date a briefing was started for: it is never
+    started twice in one process, even when the state file cannot be written.
+    ``skip_logged`` is the date the "too late, skipped" line was logged for.
+    """
+
+    attempted: str | None = None
+    skip_logged: str | None = None
+
+
+async def morning_brief_tick(
+    client: Any,
+    destinations: Sequence[str],
+    *,
+    schedule: config.BriefSchedule,
+    state: BriefLoopState,
+    env: Mapping[str, str] | None = None,
+    store: StateStore | None = None,
+    clock: Callable[[], datetime] | None = None,
+    run: RunTurn | None = None,
+    sessions: ThreadSessions | None = None,
+    credit_fetch: Callable[[], credits.CreditReport] | None = None,
+    semaphore: asyncio.Semaphore | None = None,
+    run_timeout: float | None = BRIEF_RUN_TIMEOUT_SECONDS,
+) -> str:
+    """One look at the clock: send today's morning briefing if it is due (``briefing.brief_due``).
+
+    Returns that outcome, or ``"sent"`` / ``"failed"`` after a briefing.
+    ``last_brief_date`` is written *before* posting, so a crash in the middle
+    never sends the same day's briefing twice after a restart. A failure is
+    logged (scrubbed) and not retried that day.
+    """
+    now = (clock or utcnow)().astimezone(schedule.timezone)
+    today = now.date().isoformat()
+    if state.attempted == today:
+        return briefing.ALREADY
+    store = store or StateStore(config.get_state_path(env))
+    status = briefing.brief_due(schedule, now, store.last_brief_date())
+    if status == briefing.MISSED and state.skip_logged != today:
+        state.skip_logged = today
+        log.info(
+            "아침 브리핑: 오늘(%s) 브리핑은 %s 보내지 못해 건너뜁니다 (Mac이 잠자고 있었거나 봇이 늦게 켜짐). 다음 브리핑: %s",
+            today,
+            schedule.catchup_text(),
+            schedule.describe(),
+        )
+    if status != briefing.DUE:
+        return status
+
+    state.attempted = today
+    try:
+        store.mark_brief_date(today)
+    except OSError as exc:
+        log.warning("아침 브리핑 날짜(last_brief_date)를 기록하지 못했습니다 (이 실행에서는 다시 보내지 않습니다): %s", safe_error(exc))
+    log.info("아침 브리핑을 보냅니다 (%s %s, %d곳).", today, f"{now:%H:%M}", len(destinations))
+    try:
+        async with semaphore if semaphore is not None else contextlib.nullcontext():
+            code = await post_briefing(
+                client,
+                list(destinations),
+                run=run,
+                sessions=sessions,
+                now=now,
+                env=env,
+                credit_fetch=credit_fetch,
+                run_timeout=run_timeout,
+            )
+    except Exception as exc:  # noqa: BLE001 - one scrubbed line, the bots keep running
+        log.error("아침 브리핑 실패 (%s): %s", today, safe_error(exc))
+        return "failed"
+    if code != 0:
+        log.warning("아침 브리핑 실패 (%s): 브리핑을 끝내지 못했거나 Slack에 올리지 못했습니다. 위 로그를 보세요.", today)
+        return "failed"
+    log.info("아침 브리핑을 보냈습니다 (%s).", today)
+    return "sent"
+
+
+async def morning_brief_loop(
+    client: Any,
+    destinations: Sequence[str],
+    *,
+    schedule: config.BriefSchedule,
+    env: Mapping[str, str] | None = None,
+    interval: float = BRIEF_CHECK_INTERVAL_SECONDS,
+    sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+    tick: Callable[..., Awaitable[str]] = morning_brief_tick,
+    **options: Any,
+) -> None:
+    """Check the wall clock now and every ``interval`` seconds; send the briefing when due.
+
+    Runs until cancelled. Anything that goes wrong is logged (scrubbed) and
+    never stops the loop or the bots.
+    """
+    state = BriefLoopState()
+    targets = list(destinations)
+    while True:
+        try:
+            await tick(client, targets, schedule=schedule, state=state, env=env, **options)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the bots keep running whatever happens here
+            log.warning("아침 브리핑 시각을 확인하지 못했습니다 (봇은 그대로 돕니다): %s", safe_error(exc))
+        await sleep(interval)
+
+
+def morning_brief_target(
+    cfg: config.SlackConfig, bots: list[tuple[config.SlackBotConfig, Any, SlackHandler]]
+) -> tuple[tuple[config.SlackBotConfig, Any, SlackHandler] | None, str]:
+    """``(고뭉치's bot, "")``, or ``(None, Korean warning)`` when the briefing cannot be sent."""
+    for bot, app, handler in bots:
+        if bot.persona == MUNGCHI:
+            problems = config.slack_brief_problems(cfg)
+            if problems:
+                return None, "아침 브리핑을 보낼 수 없어 끕니다: " + " ".join(problems)
+            return (bot, app, handler), ""
+    return None, NO_MUNGCHI_BRIEF_WARNING
+
+
+def _start_morning_brief(
+    cfg: config.SlackConfig,
+    bots: list[tuple[config.SlackBotConfig, Any, SlackHandler]],
+    scheduler: Callable[..., Awaitable[None]],
+) -> asyncio.Task[None] | None:
+    """Print the schedule line and start ``scheduler`` with 고뭉치's client; None when off. Never raises."""
+    try:
+        schedule = config.load_brief_schedule()
+        for warning in schedule.warnings:
+            log.warning("아침 브리핑 설정: %s", warning)
+        if not schedule.enabled:
+            print(f"아침 브리핑: {schedule.describe()}", file=sys.stderr)
+            return None
+        target, warning = morning_brief_target(cfg, bots)
+        if target is None:
+            log.warning("%s", warning)
+            return None
+        _bot, app, handler = target
+        print(
+            f"아침 브리핑: {schedule.describe()} → {config.describe_brief_destination(cfg)} "
+            f"(그 시각에 Mac이 잠자고 있었으면 깨어난 뒤 {schedule.catchup_text()} 보냅니다)",
+            file=sys.stderr,
+        )
+        return asyncio.create_task(
+            scheduler(
+                app.client,
+                config.brief_destinations(cfg),
+                schedule=schedule,
+                sessions=handler.sessions,
+                semaphore=handler._semaphore,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 - the bots run without the briefing
+        log.warning("아침 브리핑을 시작하지 못했습니다 (봇은 그대로 돕니다): %s", safe_error(exc))
+        return None
+
+
 async def run_bots(
     cfg: config.SlackConfig,
     *,
     socket_factory: Callable[[Any, str], Any] | None = None,
     wait: Callable[[], Awaitable[None]] = _wait_forever,
     credit_alert: Callable[..., Awaitable[None]] | None = None,
+    brief_scheduler: Callable[..., Awaitable[None]] | None = None,
 ) -> int:
     """Connect every configured bot over Socket Mode and serve them in one event loop.
 
     While they run, ``credit_alert`` (default ``credit_alert_loop``) watches the
     Chat KHU credits and DMs the allowed users through 고뭉치's bot (or the
-    first configured bot) when they run low.
+    first configured bot) when they run low, and ``brief_scheduler`` (default
+    ``morning_brief_loop``, only with ``BRIEF_TIME`` and 고뭉치's bot) sends
+    the morning briefing through 고뭉치's bot.
     """
     if socket_factory is None:
         from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
@@ -732,6 +906,7 @@ async def run_bots(
     bots = build_apps(cfg)
     sockets: list[Any] = []
     alert_task: asyncio.Task[None] | None = None
+    brief_task: asyncio.Task[None] | None = None
     try:
         for bot, app, handler in bots:
             try:
@@ -769,12 +944,14 @@ async def run_bots(
                     file=sys.stderr,
                 )
             alert_task = asyncio.create_task((credit_alert or credit_alert_loop)(alert_app.client, cfg.allowed_user_ids))
+            brief_task = _start_morning_brief(cfg, bots, brief_scheduler or morning_brief_loop)
         await wait()
     finally:
-        if alert_task is not None:
-            alert_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await alert_task
+        for task in (alert_task, brief_task):
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
         for socket in sockets:
             with contextlib.suppress(Exception):
                 await socket.close_async()
@@ -784,62 +961,81 @@ async def run_bots(
 # ---------------------------------------------------------------- briefing
 
 
+async def _post_brief_chunks(client: Any, channel: str, chunks: list[str]) -> tuple[str, str | None] | None:
+    """Post one briefing to ``channel``: the first chunk, the rest in its thread.
+
+    Returns ``(channel, ts)`` of the first message (for a DM, the DM channel
+    Slack answers with), or None when it could not be posted. Logs, never raises.
+    """
+    try:
+        first = await client.chat_postMessage(channel=channel, text=chunks[0], unfurl_links=False, unfurl_media=False)
+    except Exception as exc:  # noqa: BLE001 - the other destinations still get theirs
+        log.error("브리핑을 Slack(%s)에 올리지 못했습니다: %s", channel, describe_slack_error(exc))
+        return None
+    root_channel = str(first.get("channel") or channel)
+    root_ts = first.get("ts")
+    for chunk in chunks[1:]:
+        try:
+            await client.chat_postMessage(
+                channel=root_channel, thread_ts=root_ts, text=chunk, unfurl_links=False, unfurl_media=False
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error("브리핑의 나머지를 스레드(%s)에 올리지 못했습니다: %s", channel, describe_slack_error(exc))
+            break
+    return root_channel, root_ts
+
+
 async def post_briefing(
     client: Any,
-    channel: str,
+    channel: str | Sequence[str],
     *,
     run: RunTurn | None = None,
     sessions: ThreadSessions | None = None,
     now: datetime | None = None,
     env: Mapping[str, str] | None = None,
     on_status: Callable[[str], Any] | None = None,
+    credit_fetch: Callable[[], credits.CreditReport] | None = None,
+    run_timeout: float | None = None,
 ) -> int:
-    """Run today's briefing and post it to ``channel``.
+    """Run today's briefing once and post it to ``channel`` (a channel id, or several, e.g. one DM per user).
 
-    The first message carries the header line and the start of the briefing,
-    so it reads without opening anything; longer briefings continue as
-    replies in that message's thread. The thread is mapped to 고뭉치's
-    briefing session, so mentioning @moongchi in it continues the conversation.
+    The briefing is ``briefing.build_briefing``'s: header, 고뭉치's
+    ① 오늘의 일정 and ② Dropbox 업데이트, then the credits appended by code.
+    If the run fails, the header, a short failure line and the credits still
+    go out. The first message reads without opening anything; longer
+    briefings continue in that message's thread. Each thread is mapped to
+    고뭉치's briefing session, so replying to @moongchi there continues it.
 
     This is a briefing run (``briefing=True``): its Dropbox check looks at the
     time since the last briefing and moves that checkpoint. A later mention in
-    the thread is an ordinary turn again.
+    the thread is an ordinary turn again. Returns 0 when the briefing
+    completed and reached every destination, else 1 (details are logged).
     """
-    tz = config.get_timezone(env)
-    now = (now or datetime.now(tz)).astimezone(tz)
-    header = brief_header(now)
-    run = run or run_turn
-    try:
-        result = await run(
-            briefing_prompt(now, env),
-            on_status=on_status,
-            extra_system_prompt=SLACK_FORMAT_PROMPT,
-            persona=MUNGCHI,
-            briefing=True,
-        )
-    except Exception as exc:  # noqa: BLE001
-        _log_exception("브리핑을 만들지 못했습니다.", exc)
-        await client.chat_postMessage(
-            channel=channel,
-            text=f"{header}\n\n" + BRIEF_CRASH_TEXT.format(kind=type(exc).__name__),
-            unfurl_links=False,
-            unfurl_media=False,
-        )
-        return 1
-
-    chunks = to_slack_chunks(f"{header}\n\n{compose_reply(result)}")
-    first = await client.chat_postMessage(channel=channel, text=chunks[0], unfurl_links=False, unfurl_media=False)
-    root_channel = first.get("channel") or channel
-    root_ts = first.get("ts")
-    for chunk in chunks[1:]:
-        await client.chat_postMessage(
-            channel=root_channel, thread_ts=root_ts, text=chunk, unfurl_links=False, unfurl_media=False
-        )
-    if sessions is not None and result.session_id and root_ts:
-        remember_session(sessions, root_channel, root_ts, result.session_id, persona=MUNGCHI)
-    if result.failed:
-        print(f"[오류] 브리핑이 완전하지 않습니다: {scrub(result.error or '')}", file=sys.stderr)
-    return 1 if result.failed else 0
+    destinations = [channel] if isinstance(channel, str) else [c for c in channel if c]
+    result = await build_briefing(
+        run=run or run_turn,
+        now=now,
+        env=env,
+        slack=True,
+        on_status=on_status,
+        credit_fetch=credit_fetch,
+        run_timeout=run_timeout,
+    )
+    if result.crash is not None:
+        _log_exception("브리핑을 만들지 못했습니다.", result.crash)
+    elif result.failed:
+        log.warning("브리핑이 완전하지 않습니다: %s", scrub((result.result.error if result.result else "") or ""))
+    chunks = to_slack_chunks(result.text) or [to_mrkdwn(result.header)]
+    delivered = 0
+    for destination in destinations:
+        posted = await _post_brief_chunks(client, destination, chunks)
+        if posted is None:
+            continue
+        delivered += 1
+        root_channel, root_ts = posted
+        if sessions is not None and result.session_id and root_ts:
+            remember_session(sessions, root_channel, root_ts, result.session_id, persona=MUNGCHI)
+    return 0 if destinations and delivered == len(destinations) and not result.failed else 1
 
 
 # ---------------------------------------------------------------- CLI glue
@@ -870,17 +1066,25 @@ def run_bot_cli(env: Mapping[str, str] | None = None) -> int:
 
 
 def post_briefing_cli(env: Mapping[str, str] | None = None) -> int:
+    """``python -m mungchi --brief --slack``: send today's briefing now, where the morning briefing goes.
+
+    ``SLACK_BRIEF_CHANNEL``, else a DM to every user in ``SLACK_ALLOWED_USER_IDS``.
+    Does not touch ``last_brief_date``: a test run never stops the scheduled one.
+    """
     cfg = config.load_slack_config(env)
     problems = config.slack_brief_problems(cfg)
     if problems:
         _print_problems("브리핑을 Slack에 올릴 수 없습니다.", problems)
         return 1
     setup_logging()
+    where = config.describe_brief_destination(cfg)
 
     async def deliver() -> int:
         client = AsyncWebClient(token=cfg.bot_token)
         sessions = ThreadSessions(config.get_slack_threads_path(env))
-        return await post_briefing(client, cfg.brief_channel, sessions=sessions, env=env, on_status=_print_status)
+        return await post_briefing(
+            client, config.brief_destinations(cfg), sessions=sessions, env=env, on_status=_print_status
+        )
 
     try:
         code = asyncio.run(deliver())
@@ -888,5 +1092,10 @@ def post_briefing_cli(env: Mapping[str, str] | None = None) -> int:
         print(f"[오류] Slack에 브리핑을 올리지 못했습니다: {describe_slack_error(exc)}", file=sys.stderr)
         return 1
     if code == 0:
-        print("Slack에 오늘 브리핑을 올렸습니다.", file=sys.stderr)
+        print(f"Slack에 오늘 브리핑을 올렸습니다 ({where}).", file=sys.stderr)
+    else:
+        print(
+            f"[오류] 브리핑이 완전하지 않거나 Slack({where})에 올리지 못했습니다. 위의 오류를 확인하세요.",
+            file=sys.stderr,
+        )
     return code

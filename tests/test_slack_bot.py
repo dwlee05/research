@@ -9,6 +9,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -26,7 +27,7 @@ from mungchi.slack_bot import (
 )
 from mungchi.personas import SLACK_APP_NAMES, SLACK_HANDLES
 from mungchi.slack_format import PLACEHOLDER_TEXT, PLACEHOLDERS, SLACK_FORMAT_PROMPT
-from mungchi.state import ThreadSessions
+from mungchi.state import StateStore, ThreadSessions
 
 OWNER = "UOWNER1"
 STRANGER = "USTRANGER"
@@ -510,10 +511,23 @@ def test_slack_command_refuses_to_start_with_empty_allow_list(monkeypatch, capsy
     assert SLACK_TOKEN not in err
 
 
-def test_brief_slack_without_channel_is_a_korean_error(capsys):
+def test_brief_slack_without_token_or_destination_is_a_korean_error(capsys):
     assert main(["--brief", "--slack"]) == 1
     err = capsys.readouterr().err
-    assert "빠진 환경변수: SLACK_BOT_TOKEN, SLACK_BRIEF_CHANNEL" in err
+    assert "빠진 환경변수: SLACK_BOT_TOKEN, SLACK_BRIEF_CHANNEL(또는 SLACK_ALLOWED_USER_IDS)" in err
+    assert "브리핑을 보낼 곳이 없습니다" in err
+
+
+def test_brief_problems_accept_allowed_users_instead_of_a_channel():
+    base = {"SLACK_BOT_TOKEN": "xoxb-1-2-abc"}
+    # SLACK_BRIEF_CHANNEL is optional now: the allowed users get DMs.
+    assert config.slack_brief_problems(config.load_slack_config({**base, "SLACK_ALLOWED_USER_IDS": OWNER})) == []
+    assert config.slack_brief_problems(config.load_slack_config({**base, "SLACK_BRIEF_CHANNEL": CHANNEL})) == []
+    bad = "\n".join(config.slack_brief_problems(config.load_slack_config({**base, "SLACK_ALLOWED_USER_IDS": "@kim"})))
+    assert "@kim" in bad and "DM" in bad
+    # Invalid user ids do not matter when a channel is set.
+    with_channel = config.load_slack_config({**base, "SLACK_ALLOWED_USER_IDS": "@kim", "SLACK_BRIEF_CHANNEL": CHANNEL})
+    assert config.slack_brief_problems(with_channel) == []
 
 
 def test_slack_cli_argument_rules(capsys):
@@ -546,8 +560,10 @@ def test_post_briefing_posts_header_and_threads_overflow(tmp_path):
     assert run.calls[0]["briefing"] is True  # --brief --slack is the scheduled briefing
     first, *rest = client.posts
     assert first["channel"] == CHANNEL and "thread_ts" not in first
-    assert first["text"].startswith("☀️ *오늘의 브리핑 (2026-10-05)*\n\n*섹션 0*")
+    assert first["text"].startswith("☀️ *오늘의 브리핑 (10/05 월)*\n\n*섹션 0*")
     assert rest and all(p["thread_ts"] == first["_ts"] for p in rest)
+    # The credits come last, appended by code (no gateway configured here: a one-line note).
+    assert rest[-1]["text"].endswith("\n\n💳 *Chat KHU 크레딧*: 확인 안 함 (Chat KHU 게이트웨이를 쓰지 않아요)")
     assert all(len(p["text"]) <= 3_500 for p in client.posts)
     assert client.updates == []
     # Mentioning the bot in the briefing's thread continues the briefing session.
@@ -583,10 +599,10 @@ def test_brief_slack_cli_uses_bot_token_client(tmp_path, monkeypatch, capsys):
     assert created == [SLACK_TOKEN]
     [post] = client.posts
     assert post["channel"] == CHANNEL
-    assert post["text"].endswith("*① 공저자 업데이트*\n• 변경 없음")
+    assert "\n\n*① 공저자 업데이트*\n• 변경 없음\n\n💳 *Chat KHU 크레딧*: " in post["text"]
     err = capsys.readouterr().err
-    assert "→ 업뎃에게 맡기는 중..." in err  # progress goes to the cron log
-    assert "Slack에 오늘 브리핑을 올렸습니다." in err
+    assert "→ 업뎃에게 맡기는 중..." in err  # progress goes to stderr
+    assert "Slack에 오늘 브리핑을 올렸습니다 (채널 C0123ABCD)." in err
     assert ThreadSessions(config.get_slack_threads_path()).get(CHANNEL, post["_ts"], persona="mungchi") == SESSION_1
 
 
@@ -1422,3 +1438,347 @@ def test_run_bots_uses_the_first_configured_bot_without_moongchi(tmp_path, monke
     assert asyncio.run(slack_bot.run_bots(cfg, socket_factory=FakeSocket, wait=let_it_start, credit_alert=fake_alert)) == 0
     assert [bot.persona for bot, _a, _h in built] == ["update", "schedule"]
     assert started == [built[0][1].client]
+
+
+# ---------------------------------------------------------------- scheduled morning briefing (BRIEF_TIME)
+
+SEOUL = ZoneInfo("Asia/Seoul")
+MORNING = config.load_brief_schedule({"BRIEF_TIME": "07:00"})
+
+
+class FakeClock:
+    def __init__(self, moment: datetime):
+        self.now = moment
+
+    def __call__(self) -> datetime:
+        return self.now
+
+
+def at(day: int, hour: int, minute: int = 0) -> datetime:
+    """October 2026 in Seoul (10/08 is a Thursday)."""
+    return datetime(2026, 10, day, hour, minute, tzinfo=SEOUL)
+
+
+class DMSlackClient(FakeSlackClient):
+    """Like Slack: posting to a member id lands in the bot's DM channel with that person (D...)."""
+
+    async def chat_postMessage(self, **kwargs):
+        response = await super().chat_postMessage(**kwargs)
+        channel = kwargs["channel"]
+        return {**response, "channel": "D" + channel[1:] if channel.startswith("U") else channel}
+
+
+def tick(client, store, clock, run, *, state, destinations=(OWNER,), sessions=None, credit_fetch=None, schedule=MORNING):
+    return asyncio.run(
+        slack_bot.morning_brief_tick(
+            client,
+            list(destinations),
+            schedule=schedule,
+            state=state,
+            store=store,
+            clock=clock,
+            run=run,
+            sessions=sessions,
+            credit_fetch=credit_fetch or (lambda: low_report(remaining=9050.5)),
+        )
+    )
+
+
+def test_morning_brief_is_sent_once_and_recorded_before_posting(tmp_path):
+    store = StateStore(tmp_path / "state.json")
+    sessions = ThreadSessions(tmp_path / "threads.json")
+    client = DMSlackClient()
+    recorded_at_run: list[tuple[str | None, int]] = []
+
+    class RecordingRun(FakeRun):
+        async def __call__(self, prompt, **kwargs):
+            recorded_at_run.append((store.last_brief_date(), len(client.posts)))
+            return await super().__call__(prompt, **kwargs)
+
+    run = RecordingRun(TurnResult(text="*① 오늘의 일정*\n• 일정 없음", session_id=SESSION_1), statuses=())
+    clock = FakeClock(at(8, 6, 59))
+    state = slack_bot.BriefLoopState()
+
+    assert tick(client, store, clock, run, state=state, sessions=sessions) == "early"
+    assert client.posts == [] and run.calls == []
+
+    clock.now = at(8, 7, 0)
+    assert tick(client, store, clock, run, state=state, sessions=sessions) == "sent"
+    # last_brief_date was written before the run, and so before anything was posted.
+    assert recorded_at_run == [("2026-10-08", 0)]
+    [post] = client.posts
+    assert post["channel"] == OWNER and "thread_ts" not in post  # a DM to the allowed user
+    assert post["text"].startswith("☀️ *오늘의 브리핑 (10/08 목)*\n\n*① 오늘의 일정*\n• 일정 없음\n\n💳 *Chat KHU 크레딧*: 9,050.5 남음")
+    assert run.calls[0]["briefing"] is True and run.calls[0]["persona"] == "mungchi"
+    # Replying to 고뭉치 in the briefing's DM thread continues the briefing session.
+    assert sessions.get("DOWNER1", post["_ts"], persona="mungchi") == SESSION_1
+
+    # Later ticks the same day do nothing, in this process and after a restart (fresh state).
+    for moment in (at(8, 7, 0), at(8, 7, 30), at(8, 11, 59)):
+        clock.now = moment
+        assert tick(client, store, clock, run, state=state) == "already"
+        assert tick(client, store, clock, run, state=slack_bot.BriefLoopState()) == "already"
+    assert len(client.posts) == 1 and len(run.calls) == 1
+
+    # The next morning it goes out again.
+    clock.now = at(9, 7, 0)
+    assert tick(client, store, clock, run, state=state) == "sent"
+    assert len(client.posts) == 2 and store.last_brief_date() == "2026-10-09"
+    assert recorded_at_run[-1] == ("2026-10-09", 1)
+
+
+def test_a_crash_in_the_middle_is_not_resent_after_a_restart(tmp_path):
+    store = StateStore(tmp_path / "state.json")
+    client = FakeSlackClient()
+    killed = FakeRun(asyncio.CancelledError(), statuses=())  # e.g. the process is stopped mid-run
+    with pytest.raises(asyncio.CancelledError):
+        tick(client, store, FakeClock(at(8, 7, 5)), killed, state=slack_bot.BriefLoopState())
+    assert store.last_brief_date() == "2026-10-08"
+    # Restarted at 07:06: today's briefing counts as sent, so no duplicate.
+    run = FakeRun()
+    assert tick(client, store, FakeClock(at(8, 7, 6)), run, state=slack_bot.BriefLoopState()) == "already"
+    assert run.calls == [] and client.posts == []
+
+
+def test_a_late_start_catches_up_until_noon_then_skips_with_one_log_line(tmp_path, caplog):
+    store = StateStore(tmp_path / "state.json")
+    client, run = FakeSlackClient(), FakeRun(statuses=())
+    # The Mac slept through 07:00 and woke at 08:10: the briefing still goes out.
+    assert tick(client, store, FakeClock(at(8, 8, 10)), run, state=slack_bot.BriefLoopState()) == "sent"
+
+    other = StateStore(tmp_path / "other.json")
+    state = slack_bot.BriefLoopState()
+    with caplog.at_level(logging.INFO, logger="mungchi.slack"):
+        for moment in (at(8, 12, 30), at(8, 13, 0), at(8, 18, 0)):
+            assert tick(client, other, FakeClock(moment), run, state=state) == "missed"
+    skipped = [r for r in caplog.records if "건너뜁니다" in r.getMessage()]
+    assert len(skipped) == 1
+    assert "오늘(2026-10-08) 브리핑은 12:00 전까지 보내지 못해 건너뜁니다" in skipped[0].getMessage()
+    assert other.last_brief_date() is None and len(client.posts) == 1
+
+
+def test_weekdays_only_skips_the_weekend(tmp_path):
+    store = StateStore(tmp_path / "state.json")
+    client, run = FakeSlackClient(), FakeRun(statuses=())
+    weekdays = config.load_brief_schedule({"BRIEF_TIME": "07:00", "BRIEF_DAYS": "weekdays"})
+    assert tick(client, store, FakeClock(at(10, 7, 0)), run, state=slack_bot.BriefLoopState(), schedule=weekdays) == "day_off"
+    assert client.posts == [] and store.last_brief_date() is None
+
+
+def test_scheduled_agent_failure_still_posts_header_failure_line_and_credits(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    store = StateStore(tmp_path / "state.json")
+    client = FakeSlackClient()
+    run = FakeRun(RuntimeError(f"agent exploded {SLACK_TOKEN}"), statuses=())
+    with caplog.at_level(logging.INFO, logger="mungchi.slack"):
+        assert tick(client, store, FakeClock(at(8, 7, 0)), run, state=slack_bot.BriefLoopState()) == "failed"
+    [post] = client.posts
+    header, failure, credit_part = post["text"].split("\n\n")
+    assert header == "☀️ *오늘의 브리핑 (10/08 목)*"
+    assert failure == "⚠️ 오늘 브리핑을 만들지 못했어요 (RuntimeError). 실행 로그를 확인해 주세요."
+    assert credit_part.startswith("💳 *Chat KHU 크레딧*: 9,050.5 남음")
+    assert "아침 브리핑 실패 (2026-10-08)" in caplog.text
+    assert SLACK_TOKEN not in caplog.text and SLACK_TOKEN not in post["text"]
+    assert store.last_brief_date() == "2026-10-08"  # not retried every 30 seconds
+
+
+def test_scheduled_briefing_with_a_credit_failure_adds_the_note(tmp_path):
+    from mungchi import credits
+
+    store = StateStore(tmp_path / "state.json")
+    client = FakeSlackClient()
+    failing = lambda: credits.CreditReport(error="크레딧을 확인하지 못했습니다 (HTTP 500).")  # noqa: E731
+    run = FakeRun(TurnResult(text="*① 오늘의 일정*\n• 일정 없음", session_id=SESSION_1), statuses=())
+    assert tick(client, store, FakeClock(at(8, 7, 0)), run, state=slack_bot.BriefLoopState(), credit_fetch=failing) == "sent"
+    [post] = client.posts
+    assert post["text"].endswith("• 일정 없음\n\n💳 *Chat KHU 크레딧*: ⚠️ 확인하지 못했어요 (HTTP 500)")
+
+
+def test_unwritable_state_file_still_sends_only_once_per_process(tmp_path, caplog):
+    class ReadOnlyStore(StateStore):
+        def mark_brief_date(self, day):
+            raise OSError("read-only file system")
+
+    store = ReadOnlyStore(tmp_path / "state.json")
+    client, run = FakeSlackClient(), FakeRun(statuses=())
+    state = slack_bot.BriefLoopState()
+    with caplog.at_level(logging.WARNING, logger="mungchi.slack"):
+        assert tick(client, store, FakeClock(at(8, 7, 0)), run, state=state) == "sent"
+        assert tick(client, store, FakeClock(at(8, 7, 1)), run, state=state) == "already"
+    assert len(client.posts) == 1
+    assert "last_brief_date)를 기록하지 못했습니다" in caplog.text
+
+
+def test_brief_loop_checks_every_30_seconds_and_survives_errors():
+    sleeps, ticks = [], []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) > 3:
+            raise asyncio.CancelledError
+
+    async def flaky_tick(client, destinations, *, schedule, state, env=None, **options):
+        ticks.append((client, destinations, state))
+        raise RuntimeError("clock exploded")
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(slack_bot.morning_brief_loop("client", [OWNER], schedule=MORNING, sleep=fake_sleep, tick=flaky_tick))
+    assert sleeps == [30.0] * 4  # checked right away, then every 30 seconds (wall clock read each time)
+    assert len(ticks) == 4 and all(t[:2] == ("client", [OWNER]) for t in ticks)
+    assert len({id(t[2]) for t in ticks}) == 1  # one state for the whole loop
+
+
+def test_brief_loop_with_the_real_tick_posts_exactly_once_over_a_morning(tmp_path):
+    store = StateStore(tmp_path / "state.json")
+    client, run = FakeSlackClient(), FakeRun(statuses=())
+    clock = FakeClock(at(8, 6, 58))
+    wakeups = []
+
+    async def advance(seconds):  # every wake-up is 30 s later on the wall clock
+        wakeups.append(clock.now)
+        if clock.now >= at(8, 12, 30):
+            raise asyncio.CancelledError
+        clock.now = datetime.fromtimestamp(clock.now.timestamp() + seconds, SEOUL)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            slack_bot.morning_brief_loop(
+                client,
+                [OWNER],
+                schedule=MORNING,
+                sleep=advance,
+                store=store,
+                clock=clock,
+                run=run,
+                credit_fetch=lambda: low_report(9050.5),
+            )
+        )
+    assert len(wakeups) > 600  # 06:58 → 12:30 in 30-second steps
+    assert len(run.calls) == 1 and len(client.posts) == 1
+    assert store.last_brief_date() == "2026-10-08"
+
+
+def test_post_briefing_dms_every_allowed_user_from_one_run(tmp_path):
+    client = DMSlackClient()
+    sessions = ThreadSessions(tmp_path / "threads.json")
+    run = FakeRun(TurnResult(text="*① 오늘의 일정*\n• 일정 없음", session_id=SESSION_1), statuses=())
+    code = asyncio.run(
+        post_briefing(client, [OWNER, "UOTHER1"], run=run, sessions=sessions, now=at(8, 7), credit_fetch=lambda: low_report(9050.5))
+    )
+    assert code == 0 and len(run.calls) == 1  # one agent run, however many people get it
+    assert [p["channel"] for p in client.posts] == [OWNER, "UOTHER1"]
+    assert client.posts[0]["text"] == client.posts[1]["text"]
+    for post, dm_channel in zip(client.posts, ("DOWNER1", "DOTHER1")):
+        assert sessions.get(dm_channel, post["_ts"], persona="mungchi") == SESSION_1
+
+
+def test_post_briefing_keeps_going_when_one_destination_fails(tmp_path, caplog):
+    class HalfBroken(FakeSlackClient):
+        async def chat_postMessage(self, **kwargs):
+            if kwargs["channel"] == OWNER:
+                exc = RuntimeError("boom")
+                exc.response = {"error": "channel_not_found"}
+                raise exc
+            return await super().chat_postMessage(**kwargs)
+
+    client = HalfBroken()
+    with caplog.at_level(logging.ERROR, logger="mungchi.slack"):
+        code = asyncio.run(post_briefing(client, [OWNER, "UOTHER1"], run=FakeRun(statuses=()), now=at(8, 7), credit_fetch=lambda: low_report(9050.5)))
+    assert code == 1
+    assert [p["channel"] for p in client.posts] == ["UOTHER1"]
+    assert f"브리핑을 Slack({OWNER})에 올리지 못했습니다: channel_not_found" in caplog.text
+
+
+def test_brief_slack_without_a_channel_dms_the_allowed_users(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    monkeypatch.setenv("SLACK_ALLOWED_USER_IDS", f"{OWNER},UOTHER1")
+    client = DMSlackClient()
+    monkeypatch.setattr(slack_bot, "AsyncWebClient", lambda token: client)
+    monkeypatch.setattr(slack_bot, "run_turn", FakeRun(TurnResult(text="본문", session_id=SESSION_1), statuses=()))
+    monkeypatch.setattr(slack_bot, "setup_logging", lambda: None)
+    assert main(["--brief", "--slack"]) == 0
+    assert sorted(p["channel"] for p in client.posts) == sorted([OWNER, "UOTHER1"])
+    assert "Slack에 오늘 브리핑을 올렸습니다 (DM (허용된 사용자 2명))." in capsys.readouterr().err
+    # A manual test briefing never stops the scheduled one.
+    assert StateStore(config.get_state_path()).last_brief_date() is None
+
+
+# -- run_bots: where the scheduled briefing goes, and the startup line
+
+
+def _run_bots_with_fake_scheduler(monkeypatch, tmp_path, env):
+    _no_network(monkeypatch)
+    FakeSocket.instances = []
+    built = _patch_build_apps(monkeypatch, tmp_path)
+    started = []
+
+    async def fake_scheduler(client, destinations, **kwargs):
+        started.append({"client": client, "destinations": list(destinations), **kwargs})
+        await asyncio.Event().wait()
+
+    async def no_alert(client, users):
+        return None
+
+    async def let_it_start():
+        await asyncio.sleep(0)
+
+    cfg = config.load_slack_config(env)
+    code = asyncio.run(
+        slack_bot.run_bots(
+            cfg, socket_factory=FakeSocket, wait=let_it_start, credit_alert=no_alert, brief_scheduler=fake_scheduler
+        )
+    )
+    assert code == 0
+    return built, started
+
+
+def test_run_bots_sends_the_morning_briefing_as_dms_by_default(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("BRIEF_TIME", "07:00")
+    built, started = _run_bots_with_fake_scheduler(monkeypatch, tmp_path, ALL_BOTS_ENV)
+    mungchi_app, mungchi_handler = next((app, h) for bot, app, h in built if bot.persona == "mungchi")
+    [call] = started
+    assert call["client"] is mungchi_app.client  # 고뭉치's bot posts it
+    assert call["destinations"] == [OWNER]  # SLACK_BRIEF_CHANNEL unset: a DM to each allowed user
+    assert call["schedule"].describe() == "매일 07:00 (Asia/Seoul)"
+    assert call["sessions"] is mungchi_handler.sessions and call["semaphore"] is mungchi_handler._semaphore
+    err = capsys.readouterr().err
+    assert "아침 브리핑: 매일 07:00 (Asia/Seoul) → DM (허용된 사용자 1명)" in err
+    assert "12:00 전까지 보냅니다" in err
+
+
+def test_run_bots_sends_the_morning_briefing_to_the_brief_channel(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("BRIEF_TIME", "6:45")
+    monkeypatch.setenv("BRIEF_DAYS", "weekdays")
+    _built, started = _run_bots_with_fake_scheduler(monkeypatch, tmp_path, {**ALL_BOTS_ENV, "SLACK_BRIEF_CHANNEL": CHANNEL})
+    assert started[0]["destinations"] == [CHANNEL]
+    assert "아침 브리핑: 평일 06:45 (Asia/Seoul) → 채널 C0123ABCD" in capsys.readouterr().err
+
+
+def test_run_bots_skips_the_morning_briefing_without_moongchi(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("BRIEF_TIME", "07:00")
+    env = {k: v for k, v in ALL_BOTS_ENV.items() if not k.startswith(("SLACK_BOT", "SLACK_APP"))}
+    with caplog.at_level(logging.WARNING, logger="mungchi.slack"):
+        _built, started = _run_bots_with_fake_scheduler(monkeypatch, tmp_path, env)
+    assert started == []
+    assert "고뭉치 봇(SLACK_BOT_TOKEN, SLACK_APP_TOKEN)이 켜져 있지 않아 아침 브리핑을 보내지 않습니다" in caplog.text
+
+
+def test_run_bots_without_or_with_a_bad_brief_time_runs_no_scheduler(tmp_path, monkeypatch, capsys, caplog):
+    _built, started = _run_bots_with_fake_scheduler(monkeypatch, tmp_path, ALL_BOTS_ENV)
+    assert started == []
+    assert "아침 브리핑: 꺼짐 (BRIEF_TIME 미설정)" in capsys.readouterr().err
+
+    monkeypatch.setenv("BRIEF_TIME", "7시")
+    with caplog.at_level(logging.WARNING, logger="mungchi.slack"):
+        _built, started = _run_bots_with_fake_scheduler(monkeypatch, tmp_path, ALL_BOTS_ENV)
+    assert started == []
+    assert "아침 브리핑: 꺼짐 (BRIEF_TIME 값이 잘못됨)" in capsys.readouterr().err
+    assert "BRIEF_TIME 값 '7시'은(는) 쓸 수 없어 아침 브리핑을 끕니다" in caplog.text
+
+
+def test_run_bots_turns_off_a_briefing_to_a_channel_name(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("BRIEF_TIME", "07:00")
+    with caplog.at_level(logging.WARNING, logger="mungchi.slack"):
+        _built, started = _run_bots_with_fake_scheduler(monkeypatch, tmp_path, {**ALL_BOTS_ENV, "SLACK_BRIEF_CHANNEL": "#general"})
+    assert started == []
+    assert "아침 브리핑을 보낼 수 없어 끕니다" in caplog.text and "채널 ID" in caplog.text

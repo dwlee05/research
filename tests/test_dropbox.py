@@ -498,8 +498,8 @@ def test_run_check_reports_since_basis_and_stats(tmp_path):
         "excluded_temp": 1,
     }
 
-    first = check(briefing=True)  # no checkpoint yet: LOOKBACK_DAYS (7 days)
-    assert first["since_basis"] == "lookback_default" and first["since"] == "2026-09-28T09:00+09:00"
+    first = check(briefing=True)  # no checkpoint yet: LOOKBACK_DAYS (default 1 day)
+    assert first["since_basis"] == "lookback_default" and first["since"] == "2026-10-04T09:00+09:00"
     second = check(briefing=True)  # the first briefing moved the checkpoint to NOW
     assert second["since_basis"] == "briefing_checkpoint" and second["since"] == "2026-10-05T09:00+09:00"
     assert second["stats"] == {

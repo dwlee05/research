@@ -21,6 +21,7 @@ MAX_SLACK_THREADS = 200
 # Session ids are UUIDs; anything else in the file is ignored rather than
 # passed to the CLI as ``--resume``.
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
@@ -60,7 +61,8 @@ class StateStore:
     """Tiny JSON store.
 
     ``{"last_checked": {"<source>": "<iso8601>"},
-    "credit_alert": {"renewal_date": "<renewal_date>", "alerted_at": "<iso8601>"}}``.
+    "credit_alert": {"renewal_date": "<renewal_date>", "alerted_at": "<iso8601>"},
+    "last_brief_date": "<YYYY-MM-DD>"}``.
     Every write keeps the other keys as they are.
     """
 
@@ -89,6 +91,18 @@ class StateStore:
             }
             _write_json(self.path, data)
 
+    def last_brief_date(self) -> str | None:
+        """Local date (``YYYY-MM-DD``) the scheduled morning briefing was last started for, if any."""
+        value = self.load().get("last_brief_date")
+        return value if isinstance(value, str) and _DATE_RE.match(value) else None
+
+    def mark_brief_date(self, day: str) -> None:
+        """Record that today's scheduled briefing has started (written before posting, never twice a day)."""
+        with _LOCK:
+            data = self.load()
+            data["last_brief_date"] = day
+            _write_json(self.path, data)
+
     def mark_checked(self, source: str, when: datetime) -> None:
         with _LOCK:
             data = self.load()
@@ -110,8 +124,8 @@ class ThreadSessions:
     read as ``mungchi`` entries; the next write stores them in the new form.
 
     Entries are kept oldest first and capped at ``max_threads`` in total. The
-    file is re-read on every access so the bots see threads started by a cron
-    ``--brief --slack`` run without restarting.
+    file is re-read on every access so the bots see threads started by a
+    separate ``--brief --slack`` run without restarting.
     """
 
     def __init__(self, path: Path | str, max_threads: int = MAX_SLACK_THREADS):

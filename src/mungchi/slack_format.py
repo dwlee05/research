@@ -19,7 +19,9 @@ PLACEHOLDERS = {
     SCHEDULE: "⏰ 일정이 확인 중이에요...",
 }
 PLACEHOLDER_TEXT = PLACEHOLDERS[MUNGCHI]
-BRIEF_HEADER = "☀️ *오늘의 브리핑 ({date})*"
+WEEKDAYS_KO = ("월", "화", "수", "목", "금", "토", "일")
+# First line of every briefing: "☀️ 오늘의 브리핑 (10/08 목)", bold in Slack.
+BRIEF_TITLE = "오늘의 브리핑 ({date})"
 
 # One Dropbox subfolder, as the prompts show it: the folder's link exactly
 # once. In the terminal the bare link goes on the line under the folder name;
@@ -33,7 +35,7 @@ SLACK_FORMAT_PROMPT = (
 ## Slack 출력 (위 '출력' 지침보다 우선)
 이 대화는 Slack 메시지로 오가고, 네 답은 Slack 스레드에 그대로 올라간다. 답은 Slack mrkdwn 문법으로 쓴다.
 - 굵게는 *굵게*(별표 하나), 기울임은 _기울임_, 취소선은 ~취소선~ 으로 쓴다. **별표 두 개**는 쓰지 않는다.
-- 제목에 # 을 쓰지 않는다. 섹션 제목은 *① 공저자 업데이트* 처럼 굵은 한 줄로 쓴다.
+- 제목에 # 을 쓰지 않는다. 섹션 제목은 *① 오늘의 일정* 처럼 굵은 한 줄로 쓴다.
 - 목록은 "• " 로 시작하는 짧은 줄로 쓰고, 들여쓰기는 한 단계까지만 한다.
 - Markdown 표를 쓰지 않는다. 표가 필요하면 목록으로 바꾼다.
 - 링크는 <https://example.com|보이는 글자> 형식으로 쓴다. [글자](주소) 형식은 쓰지 않는다.
@@ -67,8 +69,10 @@ def strip_mention(text: str, bot_user_id: str | None = None) -> str:
     return text.strip()
 
 
-def brief_header(now: datetime) -> str:
-    return BRIEF_HEADER.format(date=now.date().isoformat())
+def brief_header(now: datetime, *, slack: bool = True) -> str:
+    """``☀️ *오늘의 브리핑 (10/08 목)*`` (``now`` already in TIMEZONE); without the bold outside Slack."""
+    title = BRIEF_TITLE.format(date=f"{now:%m/%d} {WEEKDAYS_KO[now.weekday()]}")
+    return f"☀️ *{title}*" if slack else f"☀️ {title}"
 
 
 # ---------------------------------------------------------------- code fences

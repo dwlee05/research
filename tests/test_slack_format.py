@@ -38,7 +38,8 @@ def test_strip_mention_empty_after_mention_and_unknown_bot_id():
 
 def test_brief_header_uses_local_date():
     now = datetime(2026, 10, 5, 7, 50, tzinfo=ZoneInfo("Asia/Seoul"))
-    assert brief_header(now) == "☀️ *오늘의 브리핑 (2026-10-05)*"
+    assert brief_header(now) == "☀️ *오늘의 브리핑 (10/05 월)*"
+    assert brief_header(now, slack=False) == "☀️ 오늘의 브리핑 (10/05 월)"
 
 
 def test_slack_prompt_covers_mrkdwn_rules():

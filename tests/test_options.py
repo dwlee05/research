@@ -130,10 +130,14 @@ def test_model_defaults_and_env_override():
     assert build_options(env={"MUNGCHI_MODEL": "custom-model"}).model == "custom-model"
 
 
-def test_system_prompt_has_three_sections_and_points_to_the_per_turn_time_line():
+def test_system_prompt_has_the_briefing_sections_and_points_to_the_per_turn_time_line():
     prompt = options().system_prompt
-    for heading in ("① 공저자 업데이트", "② 일정", "③ 오늘 챙길 것"):
-        assert heading in prompt
+    # Schedule first, then Dropbox; the credits are appended by code, not written by the model.
+    assert prompt.index("### ① 오늘의 일정") < prompt.index("### ② Dropbox 업데이트")
+    assert "하루치만(days=1)" in prompt
+    assert "Chat KHU 크레딧은 쓰지 않고" in prompt
+    # The old "③ 오늘 챙길 것" section was dropped to save tokens.
+    assert "③" not in prompt and "오늘 챙길 것" not in prompt
     assert NOW_GUIDANCE in prompt and "[지금: YYYY-MM-DD(요일) HH:MM 시간대]" in prompt
     assert "{" not in MUNGCHI_SYSTEM_PROMPT  # no unfilled placeholders, nothing filled per call
 

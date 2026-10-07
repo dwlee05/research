@@ -724,6 +724,31 @@ def test_status_when_running(paths):
     assert BOT_TOKEN not in text and "***" in text  # scrubbed again on display
 
 
+def test_status_shows_the_morning_briefing_schedule_and_last_brief_date(paths, tmp_path, monkeypatch):
+    home, repo = paths
+    monkeypatch.chdir(tmp_path)  # status runs from anywhere; the service's state file is in the repository
+    svc = make_service(paths, FakeRunner(loaded=True, service_pids=[1234]))
+    svc.status()
+    text = output(svc)
+    assert "- 아침 브리핑: 꺼짐 (BRIEF_TIME 미설정)" in text
+    assert "- 마지막 아침 브리핑 (last_brief_date): 아직 없음" in text
+
+    (repo / ".env").write_text(GOOD_ENV + "BRIEF_TIME=07:00\nBRIEF_DAYS=weekdays\n", encoding="utf-8")
+    (repo / ".mungchi_state.json").write_text('{"last_brief_date": "2026-10-08"}', encoding="utf-8")
+    svc = make_service(paths, FakeRunner(loaded=True, service_pids=[1234]))
+    svc.status()
+    text = output(svc)
+    assert "- 아침 브리핑: 평일 07:00 (Asia/Seoul) → DM (허용된 사용자 1명)" in text
+    assert "- 마지막 아침 브리핑 (last_brief_date): 2026-10-08" in text
+
+    (repo / ".env").write_text(GOOD_ENV + "BRIEF_TIME=7시\nSLACK_BRIEF_CHANNEL=C0123ABCD\n", encoding="utf-8")
+    svc = make_service(paths, FakeRunner())
+    svc.status()
+    text = output(svc)
+    assert "- 아침 브리핑: 꺼짐 (BRIEF_TIME 값이 잘못됨)" in text
+    assert "[경고] BRIEF_TIME 값 '7시'은(는) 쓸 수 없어" in text
+
+
 def test_status_when_not_installed_and_with_a_foreground_bot(paths):
     runner = FakeRunner(foreground_pids=[4321])
     svc = make_service(paths, runner)

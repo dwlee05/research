@@ -10,6 +10,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass, field
+from datetime import time, tzinfo
 from pathlib import Path
 from typing import Mapping
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -18,7 +19,9 @@ from .personas import MUNGCHI, PERSONA_LABELS, PERSONAS, SCHEDULE, SLACK_HANDLES
 
 DEFAULT_MODEL = "claude-opus-5-5"
 DEFAULT_TIMEZONE = "Asia/Seoul"
-DEFAULT_LOOKBACK_DAYS = 7
+# Only used by a briefing without a stored checkpoint (the first one): a daily
+# briefing starts with the last 24 hours.
+DEFAULT_LOOKBACK_DAYS = 1
 DEFAULT_STATE_FILE = ".mungchi_state.json"
 SLACK_THREADS_FILE = ".mungchi_slack_threads.json"
 DEFAULT_SLACK_MAX_CONCURRENT = 2
@@ -136,9 +139,18 @@ def get_lookback_days(env: Mapping[str, str] | None = None) -> int:
     return days if days > 0 else DEFAULT_LOOKBACK_DAYS
 
 
-def get_state_path(env: Mapping[str, str] | None = None) -> Path:
+def get_state_path(env: Mapping[str, str] | None = None, base_dir: Path | None = None) -> Path:
+    """``MUNGCHI_STATE_FILE``, else ``.mungchi_state.json`` in the working directory.
+
+    ``base_dir`` stands in for the working directory (e.g. the repository the
+    background service runs in, when ``service status`` is run elsewhere).
+    """
     raw = _get(env, "MUNGCHI_STATE_FILE")
-    return Path(raw).expanduser() if raw else Path.cwd() / DEFAULT_STATE_FILE
+    base = base_dir if base_dir is not None else Path.cwd()
+    if not raw:
+        return base / DEFAULT_STATE_FILE
+    path = Path(raw).expanduser()
+    return path if path.is_absolute() or base_dir is None else base_dir / path
 
 
 def get_slack_threads_path(env: Mapping[str, str] | None = None) -> Path:
@@ -489,19 +501,169 @@ def slack_bot_problems(cfg: SlackConfig) -> list[str]:
 
 
 def slack_brief_problems(cfg: SlackConfig) -> list[str]:
-    """Korean problem lines that keep ``--brief --slack`` (고뭉치's bot token) from posting."""
-    missing = [
-        name
-        for name, value in (("SLACK_BOT_TOKEN", cfg.bot_token), ("SLACK_BRIEF_CHANNEL", cfg.brief_channel))
-        if not value
-    ]
+    """Korean problem lines that keep a briefing (고뭉치's bot token) from being posted.
+
+    Used by ``--brief --slack`` and the scheduled morning briefing. The
+    briefing goes to ``SLACK_BRIEF_CHANNEL``, or without it as a DM to every
+    user in ``SLACK_ALLOWED_USER_IDS`` (see ``brief_destinations``).
+    """
+    no_destination = not (cfg.brief_channel or cfg.allowed_user_ids or cfg.invalid_user_ids)
+    missing = ["SLACK_BOT_TOKEN"] if not cfg.bot_token else []
+    if no_destination:
+        missing.append("SLACK_BRIEF_CHANNEL(또는 SLACK_ALLOWED_USER_IDS)")
     problems = [f"빠진 환경변수: {', '.join(missing)}"] if missing else []
+    if no_destination:
+        problems.append(
+            "브리핑을 보낼 곳이 없습니다. SLACK_BRIEF_CHANNEL에 채널 ID를 넣거나, 비워 두고 SLACK_ALLOWED_USER_IDS에 "
+            "내 멤버 ID를 넣으면 고뭉치 봇이 DM으로 보냅니다."
+        )
     problems += _bot_token_problems(cfg)
     if cfg.brief_channel and not _SLACK_CHANNEL_ID_RE.match(cfg.brief_channel):
         problems.append(
             "SLACK_BRIEF_CHANNEL 값은 채널 이름(#general)이 아니라 채널 ID(C로 시작하는 영문 대문자·숫자)여야 합니다."
         )
+    if not cfg.brief_channel and cfg.invalid_user_ids:
+        problems.append(
+            "SLACK_ALLOWED_USER_IDS에 멤버 ID가 아닌 값이 있습니다: "
+            f"{', '.join(cfg.invalid_user_ids)} — SLACK_BRIEF_CHANNEL이 비어 있으면 브리핑을 이 사람들에게 DM으로 "
+            "보내니, U로 시작하는 멤버 ID만 적으세요."
+        )
     return problems
+
+
+def brief_destinations(cfg: SlackConfig) -> list[str]:
+    """Where a briefing goes: ``SLACK_BRIEF_CHANNEL``, else a DM to each user in ``SLACK_ALLOWED_USER_IDS``.
+
+    A member id as the channel posts to the bot's DM with that person.
+    """
+    if cfg.brief_channel:
+        return [cfg.brief_channel]
+    return sorted(cfg.allowed_user_ids)
+
+
+def describe_brief_destination(cfg: SlackConfig) -> str:
+    """Korean description of ``brief_destinations``, e.g. ``채널 C0123ABCD`` or ``DM (허용된 사용자 1명)``."""
+    if cfg.brief_channel:
+        kind = "DM" if cfg.brief_channel[:1] in ("U", "W", "D") else "채널"
+        return f"{kind} {cfg.brief_channel}"
+    return f"DM (허용된 사용자 {len(cfg.allowed_user_ids)}명)"
+
+
+# ---------------------------------------------------------------- scheduled morning briefing
+
+BRIEF_DAYS_DAILY = "daily"
+BRIEF_DAYS_WEEKDAYS = "weekdays"
+_BRIEF_DAYS_VALUES = {
+    "daily": BRIEF_DAYS_DAILY,
+    "매일": BRIEF_DAYS_DAILY,
+    "weekdays": BRIEF_DAYS_WEEKDAYS,
+    "평일": BRIEF_DAYS_WEEKDAYS,
+}
+BRIEF_DAYS_LABELS = {BRIEF_DAYS_DAILY: "매일", BRIEF_DAYS_WEEKDAYS: "평일"}
+# A briefing missed at BRIEF_TIME (Mac asleep, bot started late) is still
+# sent until this local time; after it the day is skipped.
+DEFAULT_BRIEF_CATCHUP_UNTIL = time(12, 0)
+BRIEF_OFF_UNSET = "BRIEF_TIME 미설정"
+BRIEF_OFF_INVALID = "BRIEF_TIME 값이 잘못됨"
+_HHMM_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
+
+
+def parse_hhmm(value: str | None) -> time | None:
+    """``"07:00"`` or ``"7:00"`` -> ``time(7, 0)``; None for anything else (24-hour clock)."""
+    match = _HHMM_RE.match((value or "").strip())
+    if not match:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if hour > 23 or minute > 59:
+        return None
+    return time(hour, minute)
+
+
+@dataclass(frozen=True)
+class BriefSchedule:
+    """When the running Slack bots send the morning briefing.
+
+    ``at`` is ``BRIEF_TIME`` (None: off), ``days`` ``daily`` or ``weekdays``,
+    ``catchup_until`` the local time after which a missed briefing is skipped
+    for the day (None: until midnight). Times are wall-clock times in ``timezone``.
+    ``warnings`` are Korean lines about values that could not be used.
+    """
+
+    at: time | None = None
+    days: str = BRIEF_DAYS_DAILY
+    catchup_until: time | None = DEFAULT_BRIEF_CATCHUP_UNTIL
+    timezone: tzinfo = field(default_factory=lambda: ZoneInfo(DEFAULT_TIMEZONE))
+    off_reason: str = BRIEF_OFF_UNSET
+    warnings: tuple[str, ...] = ()
+
+    @property
+    def enabled(self) -> bool:
+        return self.at is not None
+
+    @property
+    def timezone_name(self) -> str:
+        return str(getattr(self.timezone, "key", "") or self.timezone)
+
+    def describe(self) -> str:
+        """``매일 07:00 (Asia/Seoul)``, or ``꺼짐 (BRIEF_TIME 미설정)``."""
+        if self.at is None:
+            return f"꺼짐 ({self.off_reason})"
+        return f"{BRIEF_DAYS_LABELS[self.days]} {self.at:%H:%M} ({self.timezone_name})"
+
+    def catchup_text(self) -> str:
+        """Until when a missed briefing is still sent, e.g. ``12:00 전까지``."""
+        return f"{self.catchup_until:%H:%M} 전까지" if self.catchup_until is not None else "그날 자정 전까지"
+
+
+def load_brief_schedule(env: Mapping[str, str] | None = None) -> BriefSchedule:
+    """``BRIEF_TIME``, ``BRIEF_DAYS`` and ``BRIEF_CATCHUP_UNTIL``; never raises.
+
+    An empty or unset ``BRIEF_TIME`` turns the briefing off; an invalid one
+    turns it off with a warning. An invalid ``BRIEF_DAYS`` or
+    ``BRIEF_CATCHUP_UNTIL`` keeps the default with a warning.
+    """
+    warnings: list[str] = []
+    raw_days = _get(env, "BRIEF_DAYS")
+    days = _BRIEF_DAYS_VALUES.get(raw_days.lower(), "") if raw_days else BRIEF_DAYS_DAILY
+    if not days:
+        warnings.append(
+            f"BRIEF_DAYS 값 '{raw_days}'은(는) 쓸 수 없어 매일 보냅니다. daily(매일) 또는 weekdays(평일)를 적으세요."
+        )
+        days = BRIEF_DAYS_DAILY
+
+    raw_catchup = _get(env, "BRIEF_CATCHUP_UNTIL")
+    catchup: time | None = DEFAULT_BRIEF_CATCHUP_UNTIL
+    if raw_catchup == "24:00":
+        catchup = None
+    elif raw_catchup:
+        parsed = parse_hhmm(raw_catchup)
+        if parsed is None:
+            warnings.append(
+                f"BRIEF_CATCHUP_UNTIL 값 '{raw_catchup}'은(는) 쓸 수 없어 기본값 "
+                f"{DEFAULT_BRIEF_CATCHUP_UNTIL:%H:%M}을 씁니다. 12:00처럼 24시간제 HH:MM으로 적으세요."
+            )
+        else:
+            catchup = parsed
+
+    tz = get_timezone(env)
+    raw_time = _get(env, "BRIEF_TIME")
+    if not raw_time:
+        return BriefSchedule(None, days, catchup, tz, BRIEF_OFF_UNSET, tuple(warnings))
+    at = parse_hhmm(raw_time)
+    if at is None:
+        warnings.append(
+            f"BRIEF_TIME 값 '{raw_time}'은(는) 쓸 수 없어 아침 브리핑을 끕니다. 07:00처럼 24시간제 HH:MM으로 적으세요."
+        )
+        return BriefSchedule(None, days, catchup, tz, BRIEF_OFF_INVALID, tuple(warnings))
+    if catchup is not None and catchup <= at:
+        # e.g. BRIEF_TIME=13:00 with the default 12:00: catching up "before noon" would never send.
+        if raw_catchup:
+            warnings.append(
+                f"BRIEF_CATCHUP_UNTIL({catchup:%H:%M})이 BRIEF_TIME({at:%H:%M})보다 늦지 않아서, "
+                "놓친 브리핑은 그날 자정 전까지 보냅니다."
+            )
+        catchup = None
+    return BriefSchedule(at, days, catchup, tz, "", tuple(warnings))
 
 
 # ---------------------------------------------------------------- Secrets
