@@ -31,8 +31,10 @@ settings:
     bot_events:
       - app_mention
       - message.im
+  # 캘린더 추가 제안의 카테고리 버튼(Family, Teaching, …)을 누르려면 켜야 합니다.
+  # Socket Mode라서 Request URL은 필요 없습니다.
   interactivity:
-    is_enabled: false
+    is_enabled: true
   org_deploy_enabled: false
   socket_mode_enabled: true
   token_rotation_enabled: false

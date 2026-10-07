@@ -61,7 +61,8 @@ SEOUL = ZoneInfo("Asia/Seoul")
 # Wednesday 2026-10-07, 10:00 in Seoul.
 NOW = datetime(2026, 10, 7, 10, 0, tzinfo=SEOUL)
 TODAY = NOW.date()
-ENV = {"TIMEZONE": "Asia/Seoul"}
+# The yes / no flow (no categories); the category tests use CAT_ENV.
+ENV = {"TIMEZONE": "Asia/Seoul", "CALENDAR_CATEGORIES": ""}
 KEY = slack_conversation_key("schedule", "D0123ABCD", "1700000000.000200")
 OTHER_KEY = slack_conversation_key("schedule", "D0123ABCD", "1700000000.000900")
 
@@ -427,6 +428,7 @@ def test_two_runs_with_different_keys_never_collide():
 def test_concurrent_tool_runs_keep_their_own_keys(monkeypatch):
     """Two runs' tools in one process (two Slack threads), called at the same time."""
     app = FakeCalendarApp()
+    monkeypatch.setenv("CALENDAR_CATEGORIES", "")
     monkeypatch.setattr(config, "current_platform", lambda: "darwin")
     monkeypatch.setattr(macos_calendar, "default_adapter", lambda tz: app)
     monkeypatch.setattr(event_proposals, "utcnow", lambda: NOW)
@@ -975,14 +977,14 @@ def test_find_similar_events_reads_two_hours_around_on_that_day_only():
 
 def test_calendar_setup_lists_where_new_events_go():
     app = FakeCalendarApp()
-    assert write_target_lines(app, {}) == [
+    assert write_target_lines(app, ENV) == [
         "일정을 추가할 수 있는 캘린더 2개 (메모로 일정 추가):",
         "    - 연구 (iCloud) [기본]",
         "    - Work (Exchange)",
         "추가할 캘린더: 연구 (CALENDAR_WRITE_TARGET이 비어 있어 기본 캘린더에 넣습니다)",
     ]
-    assert write_target_lines(app, {"CALENDAR_WRITE_TARGET": "work"})[-1] == "추가할 캘린더: Work (CALENDAR_WRITE_TARGET)"
-    assert write_target_lines(app, {"CALENDAR_WRITE_TARGET": "가족"})[-1].startswith("[경고] CALENDAR_WRITE_TARGET의 '가족'")
+    assert write_target_lines(app, {**ENV, "CALENDAR_WRITE_TARGET": "work"})[-1] == "추가할 캘린더: Work (CALENDAR_WRITE_TARGET)"
+    assert write_target_lines(app, {**ENV, "CALENDAR_WRITE_TARGET": "가족"})[-1].startswith("[경고] CALENDAR_WRITE_TARGET의 '가족'")
 
     class Broken(FakeCalendarApp):
         def list_writable_calendars(self):
@@ -1011,3 +1013,324 @@ def test_calendar_write_target_setting():
     assert config.get_calendar_write_target({}) == ""
     assert config.get_calendar_write_target({"CALENDAR_WRITE_TARGET": "  연구   캘린더 "}) == "연구 캘린더"
     assert time(12, 0) == event_proposals.parse_clock("12:00") and event_proposals.parse_clock(None) is None
+
+
+# ---------------------------------------------------------------- categories (CALENDAR_CATEGORIES)
+
+from mungchi.tools.event_proposals import (  # noqa: E402
+    CLARIFY,
+    Answer,
+    category_question,
+    cli_prompt,
+    parse_answer,
+    proposal_question,
+)
+
+# Categories on: the default five (CALENDAR_CATEGORIES unset).
+CAT_ENV = {"TIMEZONE": "Asia/Seoul"}
+CATEGORY_NAMES = ["Family", "Teaching", "Research", "Event-Outside", "Event-KHU"]
+CATEGORY_WRITABLE = [{"name": name, "source": "iCloud", "is_default": False} for name in CATEGORY_NAMES] + WRITABLE
+QUESTION_KHU = (
+    "카테고리를 골라주세요 (추천: Event-KHU) — 1 Family · 2 Teaching · 3 Research · 4 Event-Outside · 5 Event-KHU"
+    " · 번호/이름으로 답하거나 '네'(추천대로), '아니요'(취소)"
+)
+
+
+def category_app(**kwargs):
+    return FakeCalendarApp(writable=kwargs.pop("writable", CATEGORY_WRITABLE), **kwargs)
+
+
+def run_categories(app, events, store=None, env=None, key=KEY, **args):
+    """``run_propose`` with categories on (no CALENDAR_CATEGORIES in the env: the default five)."""
+    store = store or StateStore(config.get_state_path())
+    payload = run_propose(
+        {"events": events, "source_note": NOTE, **args},
+        key,
+        env={**CAT_ENV, **(env or {})},
+        now=NOW,
+        store=store,
+        adapter_factory=lambda tz: app,
+        platform="darwin",
+    )
+    return payload, store
+
+
+def category_creator(app, env=None):
+    return lambda proposal: create_proposal_events(
+        proposal, env={**CAT_ENV, **(env or {})}, now=NOW, adapter_factory=lambda tz: app, platform="darwin"
+    )
+
+
+def test_calendar_categories_setting():
+    default = config.get_calendar_categories({})
+    assert [c.label for c in default] == CATEGORY_NAMES and [c.calendar for c in default] == CATEGORY_NAMES
+    assert dict((c.label, c.aliases) for c in default) == {
+        "Family": ("가족", "집", "개인"),
+        "Teaching": ("강의", "수업", "티칭", "교육"),
+        "Research": ("연구",),
+        "Event-Outside": ("외부", "외부행사", "학회"),
+        "Event-KHU": ("경희", "학교", "교내", "khu"),
+    }
+    assert config.get_calendar_categories({"CALENDAR_CATEGORIES": ""}) == []  # off: the yes / no flow
+    assert config.get_calendar_categories({"CALENDAR_CATEGORIES": "  ,  "}) == []
+    custom = config.get_calendar_categories({"CALENDAR_CATEGORIES": "Family=가족, Research , research, 수업=  Teaching 2026 "})
+    assert [(c.label, c.calendar) for c in custom] == [("Family", "가족"), ("Research", "Research"), ("수업", "Teaching 2026")]
+    assert custom[0].aliases == ("가족", "집", "개인") and custom[2].aliases == ()
+    aliased = config.get_calendar_categories({"CALENDAR_CATEGORY_ALIASES": "family=우리집|애들, Event-KHU=", "CALENDAR_CATEGORIES": "Family,Event-KHU"})
+    assert [c.aliases for c in aliased] == [("우리집", "애들"), ()]
+    many = ",".join(f"C{i}" for i in range(15))
+    assert len(config.get_calendar_categories({"CALENDAR_CATEGORIES": many})) == config.MAX_CALENDAR_CATEGORIES
+
+
+def test_the_category_question_and_the_cli_prompt():
+    assert category_question(CATEGORY_NAMES, "Event-KHU") == QUESTION_KHU
+    assert category_question(CATEGORY_NAMES[:2]) == "카테고리를 골라주세요 — 1 Family · 2 Teaching · 번호/이름으로 답하거나 '아니요'(취소)"
+    assert category_question(CATEGORY_NAMES, assigned=True) == "일정마다 정한 카테고리로 추가할까요? (네 / 아니요 / 고칠 내용)"
+    proposal = {"categories": [{"label": n, "calendar": n} for n in CATEGORY_NAMES], "suggested_category": "Research", "events": [{}]}
+    assert cli_prompt(proposal) == (
+        "카테고리를 골라주세요 (추천: Research) [1 Family · 2 Teaching · 3 Research · 4 Event-Outside · 5 Event-KHU / 네 / 아니요] "
+    )
+    assert cli_prompt({**proposal, "suggested_category": None}).endswith("5 Event-KHU / 아니요] ")
+    assert cli_prompt({"events": [{}]}) == event_proposals.CLI_CONFIRM_PROMPT
+    assert proposal_question({"events": [{}]}) == CONFIRM_QUESTION
+
+
+def _pending(suggested="Event-KHU", events=({},)):
+    categories = [{"label": c.label, "calendar": c.calendar, "aliases": list(c.aliases)} for c in config.get_calendar_categories({})]
+    return {"id": "p1", "categories": categories, "suggested_category": suggested, "events": [dict(e) for e in events]}
+
+
+@pytest.mark.parametrize(
+    "text,label",
+    [
+        ("1", "Family"), ("2", "Teaching"), (" 5 ", "Event-KHU"), ("3번", "Research"), ("4번이요", "Event-Outside"), ("2️⃣", "Teaching"),
+        ("Research", "Research"), ("research", "Research"), ("RESEARCH!", "Research"), ("event-khu", "Event-KHU"),
+        ("Event KHU", "Event-KHU"), ("event_outside", "Event-Outside"),
+        ("연구", "Research"), (unicodedata.normalize("NFD", "연구"), "Research"), ("가족", "Family"), ("집", "Family"),
+        ("수업", "Teaching"), ("강의", "Teaching"), ("학회", "Event-Outside"), ("외부행사", "Event-Outside"),
+        ("경희", "Event-KHU"), ("학교", "Event-KHU"), ("교내", "Event-KHU"), ("KHU", "Event-KHU"),
+        # A part of one category's name.
+        ("outside", "Event-Outside"), ("khu", "Event-KHU"), ("teach", "Teaching"), ("fam", "Family"),
+        # Polite endings.
+        ("Research로", "Research"), ("연구로 넣어줘", "Research"), ("khu로 해줘", "Event-KHU"), ("Teaching 캘린더에", "Teaching"),
+        ("수업 캘린더로 넣어주세요", "Teaching"),
+        # "네" means the suggestion.
+        ("네", "Event-KHU"), ("응", "Event-KHU"), ("👍", "Event-KHU"), ("ok", "Event-KHU"),
+    ],
+)
+def test_category_replies_pick_one_category(text, label):
+    assert parse_answer(text, _pending()) == Answer(event_proposals.YES, label)
+
+
+@pytest.mark.parametrize("text", ["아니요", "취소", "no", "됐어요"])
+def test_negative_replies_cancel_a_category_proposal(text):
+    assert parse_answer(text, _pending()) == Answer(NO)
+
+
+def test_unclear_category_replies_are_asked_about_once_more():
+    ambiguous = parse_answer("event", _pending())
+    assert ambiguous.kind == CLARIFY and ambiguous.category is None
+    assert ambiguous.message == "'event'에 맞는 카테고리가 여러 개예요: 4 Event-Outside · 5 Event-KHU. 번호나 전체 이름으로 골라 주세요."
+    out_of_range = parse_answer("7", _pending())
+    assert out_of_range.kind == CLARIFY and out_of_range.message.startswith("1~5 가운데 번호로 골라 주세요: 1 Family")
+    no_suggestion = parse_answer("네", _pending(suggested=None))
+    assert no_suggestion.kind == CLARIFY
+    assert no_suggestion.message == (
+        "추천한 카테고리가 없어요. 번호나 이름으로 골라 주세요: 1 Family · 2 Teaching · 3 Research · 4 Event-Outside · 5 Event-KHU"
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "", "시간은 1시로 바꿔줘", "연구실 미팅 시간 바꿔줘", "네 근데 Research로", "1시", "2026", "Research 말고 다른 거", "e",
+        "그냥 넣지 마세요 나중에",
+        # Too short for a part of a name, or a part of an alias only.
+        "re", "se", "행사", "외",
+    ],
+)
+def test_anything_else_goes_to_the_model(text):
+    assert parse_answer(text, _pending()) == Answer(None)
+
+
+def test_without_categories_only_yes_and_no_count():
+    old = {"id": "p1", "events": [{}]}
+    assert parse_answer("네", old) == Answer(YES) and parse_answer("아니요", old) == Answer(NO)
+    assert parse_answer("2", old) == Answer(None) and parse_answer("Research", old) == Answer(None)
+
+
+def test_when_every_event_has_its_own_category_only_yes_and_no_count():
+    assigned = _pending(suggested=None, events=({"category": "Research"}, {"category": "Event-KHU"}))
+    assert parse_answer("네", assigned) == Answer(YES)  # each keeps its own category
+    assert parse_answer("아니요", assigned) == Answer(NO)
+    assert parse_answer("Family", assigned) == Answer(None)  # a change: for the model
+    assert proposal_question(assigned) == event_proposals.ASSIGNED_QUESTION
+    mixed = _pending(suggested=None, events=({"category": "Research"}, {}))
+    assert parse_answer("네", mixed).kind == CLARIFY and parse_answer("1", mixed) == Answer(YES, "Family")
+
+
+def test_category_proposal_is_stored_with_the_suggestion_and_asks_for_a_category():
+    app = category_app()
+    payload, store = run_categories(app, [EXAMPLE], suggested_category="event-khu")
+    assert payload["ok"] and payload["can_confirm"]
+    assert payload["categories"] == CATEGORY_NAMES and payload["suggested_category"] == "Event-KHU"
+    assert payload["confirm_question"] == QUESTION_KHU
+    assert "calendar" not in payload and payload["warnings"] == []
+    # No calendar in the preview line: the user picks it.
+    assert payload["preview"] == "• 10/22(목) 12:00–13:00 신임교수모임 (10월) · 메모: 발표: 김평식 교수님"
+    pending = store.pending_proposal(KEY, NOW)
+    assert pending["suggested_category"] == "Event-KHU" and pending["calendar"] is None
+    assert [(c["label"], c["calendar"]) for c in pending["categories"]] == [(n, n) for n in CATEGORY_NAMES]
+    assert pending["categories"][4]["aliases"] == ["경희", "학교", "교내", "khu"]
+    assert len(pending["id"]) == 32 and pending["id"] != run_categories(app, [EXAMPLE], store=store)[1].pending_proposal(KEY, NOW)["id"]
+    assert app.created == []
+
+
+def test_the_suggestion_is_matched_by_alias_or_dropped():
+    app = category_app()
+    by_alias, _ = run_categories(app, [EXAMPLE], suggested_category="학교")
+    assert by_alias["suggested_category"] == "Event-KHU"
+    by_calendar_arg, _ = run_categories(app, [EXAMPLE], calendar="연구")  # "연구 캘린더에 넣어줘"
+    assert by_calendar_arg["suggested_category"] == "Research"
+    unknown, store = run_categories(app, [EXAMPLE], suggested_category="Lecture")
+    assert unknown["ok"] and unknown["suggested_category"] is None
+    assert unknown["confirm_question"].startswith("카테고리를 골라주세요 — 1 Family")
+    assert "'Lecture'은(는) 고를 수 있는 카테고리가 아니라서" in unknown["suggestion_problem"]
+    assert store.pending_proposal(KEY, NOW)["suggested_category"] is None
+
+
+def test_missing_category_calendars_are_not_offered_and_warned_about():
+    writable = [{"name": n, "is_default": False} for n in ("Family", "research", "Event-Outside")] + WRITABLE
+    payload, store = run_categories(category_app(writable=writable), [EXAMPLE], suggested_category="Event-KHU")
+    assert payload["ok"] and payload["categories"] == ["Family", "Research", "Event-Outside"]
+    note = "Mac 캘린더에 'Teaching', 'Event-KHU' 캘린더가 없어요. 캘린더 앱에서 그 이름으로 캘린더를 만들거나 .env의 CALENDAR_CATEGORIES를 고치세요."
+    assert payload["warnings"] == [note] and payload["preview"].endswith(f"⚠️ {note}")
+    assert payload["suggested_category"] is None  # Event-KHU is not offered
+    pending = store.pending_proposal(KEY, NOW)
+    # The calendar name as the Calendar app writes it.
+    assert [(c["label"], c["calendar"]) for c in pending["categories"]] == [
+        ("Family", "Family"), ("Research", "research"), ("Event-Outside", "Event-Outside")
+    ]
+    assert parse_answer("3", pending) == Answer(YES, "Event-Outside")
+    none_there, store = run_categories(FakeCalendarApp(), [EXAMPLE])
+    assert none_there["ok"] is False and store.pending_proposal(KEY, NOW) is None
+    assert none_there["error"].startswith("Mac 캘린더에 카테고리 캘린더('Family', 'Teaching', 'Research', 'Event-Outside', 'Event-KHU')가 하나도 없어요.")
+
+
+def test_categories_win_over_the_write_target_and_need_full_access():
+    payload, _ = run_categories(category_app(), [EXAMPLE], env={"CALENDAR_WRITE_TARGET": "Work"})
+    assert payload["categories"] == CATEGORY_NAMES and "calendar" not in payload
+    write_only, store = run_categories(category_app(status=WRITE_ONLY), [EXAMPLE])
+    assert write_only["ok"] is False and write_only["error"] == event_proposals.WRITE_ONLY_CATEGORY_TEXT
+    assert "CALENDAR_CATEGORIES를 비우세요" in write_only["error"] and store.pending_proposal(KEY, NOW) is None
+
+
+def test_empty_categories_keep_the_old_yes_no_flow():
+    app = category_app()
+    payload, store = run_categories(app, [{**EXAMPLE, "category": "Research"}], env={"CALENDAR_CATEGORIES": "", "CALENDAR_WRITE_TARGET": "Work"}, suggested_category="Research")
+    assert payload["calendar"] == "Work" and payload["confirm_question"] == CONFIRM_QUESTION
+    assert "categories" not in payload and "카테고리" not in payload["preview"]
+    pending = store.pending_proposal(KEY, NOW)
+    assert "categories" not in pending and "category" not in pending["events"][0]
+    assert parse_answer("네", pending) == Answer(YES)
+    assert confirm_proposal(store, KEY, YES, now=NOW, create=category_creator(app, {"CALENDAR_CATEGORIES": ""})).startswith(
+        "✅ 캘린더에 추가했어요\n• 10/22(목) 12:00–13:00 신임교수모임 (10월) · 캘린더: Work"
+    )
+    assert [c["calendar_name"] for c in app.created] == ["Work"]
+
+
+def test_creating_into_the_picked_category():
+    app = category_app()
+    _, store = run_categories(app, [EXAMPLE, {**EXAMPLE, "title": "신임교수모임 (11월)", "date": "2026-11-19"}], suggested_category="Event-KHU")
+    reply = confirm_proposal(store, KEY, YES, now=NOW, create=category_creator(app), category="Event-KHU")
+    assert [c["calendar_name"] for c in app.created] == ["Event-KHU", "Event-KHU"]
+    assert reply == (
+        "✅ Event-KHU 캘린더에 추가했어요\n"
+        "• 10/22(목) 12:00–13:00 신임교수모임 (10월)\n"
+        "• 11/19(목) 12:00–13:00 신임교수모임 (11월)"
+    )
+    assert store.pending_proposal(KEY, NOW) is None
+
+
+def test_a_label_can_name_a_differently_named_calendar():
+    app = category_app(writable=[{"name": "가족", "is_default": False}, {"name": "Research", "is_default": False}])
+    payload, store = run_categories(app, [EXAMPLE], env={"CALENDAR_CATEGORIES": "Family=가족,Research"})
+    assert payload["categories"] == ["Family", "Research"]
+    assert parse_answer("집", store.pending_proposal(KEY, NOW)) == Answer(YES, "Family")
+    confirm_proposal(store, KEY, YES, now=NOW, create=category_creator(app), category="Family")
+    assert [c["calendar_name"] for c in app.created] == ["가족"]
+
+
+def test_per_event_categories_override_the_pick():
+    app = category_app()
+    events = [{**EXAMPLE, "category": "research"}, {**EXAMPLE, "title": "학과 회의", "date": "2026-10-23", "weekday_in_text": None}]
+    payload, store = run_categories(app, events, suggested_category="Event-KHU")
+    assert [e.get("category") for e in payload["events"]] == ["Research", None]
+    assert payload["preview"].splitlines()[0].endswith("· 카테고리: Research")
+    pending = store.pending_proposal(KEY, NOW)
+    assert [e.get("category") for e in pending["events"]] == ["Research", None]
+    reply = confirm_proposal(store, KEY, YES, now=NOW, create=category_creator(app), category="Family")
+    assert [(c["title"], c["calendar_name"]) for c in app.created] == [("신임교수모임 (10월)", "Research"), ("학과 회의", "Family")]
+    assert reply.splitlines() == [
+        "✅ 캘린더에 추가했어요",
+        "• 10/22(목) 12:00–13:00 신임교수모임 (10월) · 캘린더: Research",
+        "• 10/23(금) 12:00–13:00 학과 회의 · 캘린더: Family",
+    ]
+
+
+def test_per_event_categories_must_exist():
+    writable = [{"name": n, "is_default": False} for n in ("Family", "Research")]
+    unknown, store = run_categories(category_app(writable=writable), [{**EXAMPLE, "category": "Lecture"}])
+    assert unknown["ok"] is False and store.pending_proposal(KEY, NOW) is None
+    assert unknown["errors"] == ["1번 일정: 'Lecture'은(는) 고를 수 있는 카테고리가 아니에요 (고를 수 있는 카테고리: Family, Research)."]
+    missing, _ = run_categories(category_app(writable=writable), [{**EXAMPLE, "category": "Event-KHU"}], store=store)
+    assert missing["errors"][0].startswith("1번 일정: Mac 캘린더에 'Event-KHU' 캘린더가 없어요.")
+
+
+def test_every_event_with_its_own_category_needs_only_a_yes():
+    app = category_app()
+    events = [{**EXAMPLE, "category": "Research"}, {**EXAMPLE, "title": "학회", "date": "2026-10-24", "weekday_in_text": None, "category": "학회"}]
+    payload, store = run_categories(app, events)
+    assert payload["confirm_question"] == event_proposals.ASSIGNED_QUESTION
+    confirm_proposal(store, KEY, YES, now=NOW, create=category_creator(app))
+    assert [c["calendar_name"] for c in app.created] == ["Research", "Event-Outside"]
+
+
+def test_no_event_is_created_without_a_category():
+    app = category_app()
+    _, store = run_categories(app, [EXAMPLE])
+    reply = confirm_proposal(store, KEY, YES, now=NOW, create=category_creator(app))  # no pick: never a guess
+    assert app.created == [] and reply == (
+        "❌ 캘린더에 추가하지 못했어요\n❌ 10/22(목) 12:00–13:00 신임교수모임 (10월) 추가 실패: 카테고리를 고르지 않아 추가하지 않았어요"
+    )
+
+
+def test_taking_a_proposal_by_id_only_takes_that_one(tmp_path):
+    store = StateStore(tmp_path / "s.json")
+    store.save_pending_proposal(KEY, {"id": "new", "events": []}, NOW)
+    assert store.take_pending_proposal(KEY, NOW, proposal_id="old") is None
+    assert store.pending_proposal(KEY, NOW)["id"] == "new"  # left as it is
+    assert store.take_pending_proposal(KEY, NOW, proposal_id="new")["id"] == "new"
+    assert store.take_pending_proposal(KEY, NOW, proposal_id="new") is None
+
+
+def test_calendar_setup_lists_the_categories():
+    writable = [{"name": n, "source": "iCloud", "is_default": False} for n in ("Family", "Research")]
+    lines = write_target_lines(FakeCalendarApp(writable=writable), {"CALENDAR_CATEGORIES": "Family,Research,Event-KHU"})
+    assert lines[-2:] == [
+        "카테고리 (CALENDAR_CATEGORIES, 일정을 추가할 때 고릅니다): Family, Research",
+        "[경고] Mac 캘린더에 'Event-KHU' 캘린더가 없어요. 캘린더 앱에서 그 이름으로 캘린더를 만들거나 .env의 CALENDAR_CATEGORIES를 고치세요.",
+    ]
+    mapped = write_target_lines(FakeCalendarApp(writable=[{"name": "가족"}]), {"CALENDAR_CATEGORIES": "Family=가족"})
+    assert mapped[-1] == "카테고리 (CALENDAR_CATEGORIES, 일정을 추가할 때 고릅니다): Family(가족)"
+
+
+def test_env_example_lists_the_default_categories():
+    from pathlib import Path
+
+    from dotenv import dotenv_values
+
+    values = dotenv_values(Path(__file__).resolve().parents[1] / ".env.example")
+    assert values["CALENDAR_CATEGORIES"] == config.DEFAULT_CALENDAR_CATEGORIES
+    assert values["CALENDAR_CATEGORY_ALIASES"] == ""
+    assert config.get_calendar_categories(values) == config.get_calendar_categories({})

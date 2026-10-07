@@ -4,9 +4,12 @@ scheduled morning briefing they send (``BRIEF_TIME``) and briefing delivery
 questions, alone or together ("날씨랑 토큰 좀 말해봐"), are answered by code,
 without an agent turn. A short briefing request to 고뭉치 ("오늘 건너뛴 브리핑
 좀 해봐", or a bare ``@고뭉치``) gets the same code-driven briefing as the
-morning one, in its thread. "네" / "아니요" to a calendar proposal waiting in
-the thread (events from a pasted note) is handled by code too: the events
-are created, or the proposal dropped, without an agent turn.
+morning one, in its thread. The answer to a calendar proposal waiting in
+the thread (events from a pasted note) is handled by code too, without an
+agent turn: a category picked by number or name ("2", "Research", "khu"),
+"네" (the suggested category), "아니요", or a click on one of the category
+buttons posted under the preview. The events are created, or the proposal
+dropped.
 
 One process runs up to three Slack apps, one per persona: 고뭉치 (@moongchi,
 the orchestrator), 업뎃 (@update) and 일정 (@schedule), each with its own
@@ -22,7 +25,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
+import re
 import sys
 import time
 import traceback
@@ -67,6 +72,16 @@ FRESH_SESSION_NOTE = "이 스레드의 이전 대화는 이어 갈 수 없어서
 CREDIT_CRASH_TEXT = "⚠️ 크레딧을 확인하지 못했어요 ({kind}). 잠시 후 다시 시도해 주세요."
 WEATHER_CRASH_TEXT = "⚠️ 날씨를 가져오지 못했어요 ({kind}). 잠시 후 다시 시도해 주세요."
 CALENDAR_CRASH_TEXT = "❌ 캘린더에 추가하지 못했어요 ({kind}). 다시 부탁해 주세요."
+# Category buttons under a calendar proposal (Block Kit, needs Interactivity).
+CATEGORY_ACTION_PREFIX = "mungchi_cal_"
+CATEGORY_ACTION_RE = re.compile(rf"^{CATEGORY_ACTION_PREFIX}")
+PICK_ACTION = CATEGORY_ACTION_PREFIX + "pick_{index}"
+CONFIRM_ACTION = CATEGORY_ACTION_PREFIX + "confirm"
+CANCEL_ACTION = CATEGORY_ACTION_PREFIX + "cancel"
+STALE_ACTION_TEXT = "이미 처리됐거나 만료된 요청이에요"
+BUTTONS_ANSWERED_TEXT = "버튼 대신 답장으로 처리했어요."
+BUTTONS_REPLACED_TEXT = "새 메시지가 와서 이 제안은 닫았어요."
+MAX_BUTTON_TEXT_CHARS = 75
 
 # Low-credit alert inside the running bots: first check shortly after start, then hourly.
 CREDIT_CHECK_FIRST_DELAY_SECONDS = 60.0
@@ -193,6 +208,66 @@ def compose_reply(result: TurnResult, persona: str = MUNGCHI) -> str:
 def to_slack_chunks(text: str) -> list[str]:
     """Final outgoing text: secrets scrubbed, mrkdwn safety net, Slack-sized chunks."""
     return chunk_text(to_mrkdwn(scrub(text)))
+
+
+def _button(action_id: str, text: str, value: Mapping[str, Any], *, primary: bool = False) -> dict[str, Any]:
+    label = text if len(text) <= MAX_BUTTON_TEXT_CHARS else text[: MAX_BUTTON_TEXT_CHARS - 1] + "…"
+    button: dict[str, Any] = {
+        "type": "button",
+        "action_id": action_id,
+        "text": {"type": "plain_text", "text": label, "emoji": True},
+        "value": json.dumps(dict(value), ensure_ascii=False, separators=(",", ":")),
+    }
+    if primary:
+        button["style"] = "primary"
+    return button
+
+
+def category_blocks(proposal: Mapping[str, Any] | None) -> tuple[str, list[dict[str, Any]]] | None:
+    """``(fallback text, blocks)`` with one button per category of a pending proposal, or None without categories.
+
+    The suggested category is the primary button; 취소 comes last. Each
+    button's value carries the proposal id (and the category), so a click only
+    ever answers this very proposal. When every event already has its own
+    category there is one 추가 button instead. Pure.
+    """
+    labels = event_proposals.category_labels(proposal)
+    proposal_id = str((proposal or {}).get("id") or "")
+    if not labels or not proposal_id:
+        return None
+    if event_proposals.all_events_assigned(proposal):
+        text = "일정마다 정한 카테고리로 추가할까요?"
+        buttons = [_button(CONFIRM_ACTION, "추가", {"proposal_id": proposal_id, "confirm": True}, primary=True)]
+    else:
+        suggested = (proposal or {}).get("suggested_category")
+        text = "카테고리를 골라주세요" + (f" (추천: {suggested})" if suggested in labels else "")
+        buttons = [
+            _button(
+                PICK_ACTION.format(index=index),
+                label,
+                {"proposal_id": proposal_id, "category": label},
+                primary=label == suggested,
+            )
+            for index, label in enumerate(labels, start=1)
+        ]
+    buttons.append(_button(CANCEL_ACTION, "취소", {"proposal_id": proposal_id, "cancel": True}))
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+        {"type": "actions", "block_id": f"{CATEGORY_ACTION_PREFIX}{proposal_id}", "elements": buttons},
+    ]
+    return text, blocks
+
+
+def button_answer(value: Mapping[str, Any], proposal: Mapping[str, Any]) -> event_proposals.Answer | None:
+    """What a button click means for ``proposal`` (already matched by id); None for a button it does not offer."""
+    if value.get("cancel"):
+        return event_proposals.Answer(event_proposals.NO)
+    if value.get("confirm"):
+        return event_proposals.Answer(event_proposals.YES) if event_proposals.all_events_assigned(proposal) else None
+    category = value.get("category")
+    if isinstance(category, str) and category in event_proposals.category_labels(proposal):
+        return event_proposals.Answer(event_proposals.YES, category)
+    return None
 
 
 def quick_info_request(text: str, label: str | None = None) -> set[str]:
@@ -416,8 +491,10 @@ class SlackHandler:
         # Threads with an agent turn running or queued: a "네" sent meanwhile came
         # before its preview was shown, so it never confirms anything.
         self._turns: dict[str, int] = {}
-        # Threads whose answer to a proposal is being applied right now.
-        self._confirming: set[str] = set()
+        # Threads whose answer to a proposal is being applied right now: the proposal.
+        self._confirming: dict[str, Mapping[str, Any]] = {}
+        # Category buttons still clickable, per thread: (channel, message ts, proposal id).
+        self._button_messages: dict[str, tuple[str, str, str]] = {}
         self._semaphore = semaphore or asyncio.Semaphore(max(1, max_concurrent))
         self._locks: dict[str, list[Any]] = {}
         self._seen = RecentKeys()
@@ -482,7 +559,8 @@ class SlackHandler:
         # The user's text without this bot's mention; empty means 고뭉치's briefing
         # or ``default_prompt()``.
         request = strip_mention(str(event.get("text") or ""), self.bot_user_id)
-        # "네" / "아니요" to a calendar proposal waiting in this thread: code only.
+        # The answer to a calendar proposal waiting in this thread (a category,
+        # "네", "아니요"): code only.
         if await self._answer_proposal(channel, thread_ts, request):
             return
         wanted = quick_info_request(request, weather.configured_label())
@@ -498,7 +576,7 @@ class SlackHandler:
         # Anything else goes to an agent run, and replaces a calendar proposal
         # waiting in this thread: the agent re-proposes if needed, so a later
         # "네" can never confirm a preview the conversation has moved past.
-        self._drop_proposal(channel, thread_ts)
+        await self._replace_proposal(channel, thread_ts)
         if self.wants_briefing(request):
             await self._answer_briefing(channel, thread_ts)
             return
@@ -518,7 +596,7 @@ class SlackHandler:
             return  # refuse once per thread
         await self._post(channel, thread_ts, REFUSAL_TEXT)
 
-    # -- calendar proposals: "네" / "아니요" (no agent turn, no LLM call)
+    # -- calendar proposals: a category, "네", "아니요" or a button (no agent turn, no LLM call)
 
     def _conversation_key(self, channel: str, thread_ts: str) -> str:
         return event_proposals.slack_conversation_key(self.persona, channel, thread_ts)
@@ -530,52 +608,167 @@ class SlackHandler:
         except OSError as exc:
             log.warning("기다리던 캘린더 제안을 지우지 못했습니다: %s", safe_error(exc))
 
-    async def _answer_proposal(self, channel: str, thread_ts: str, request: str) -> bool:
-        """Apply a short yes / no to this thread's pending calendar proposal. False: not such an answer.
+    async def _replace_proposal(self, channel: str, thread_ts: str) -> None:
+        """Drop this thread's pending proposal (a new message replaces it) and close its buttons."""
+        self._drop_proposal(channel, thread_ts)
+        await self._retire_buttons(self._conversation_key(channel, thread_ts), BUTTONS_REPLACED_TEXT)
 
-        Only an explicit, short "네"-like reply creates the events, and only
-        in the thread (and bot) where the proposal was shown, before it
-        expires. Nothing is created for a reply sent while this thread's
-        agent turn was still running (it came before the preview). A second
-        answer while the first is being applied is dropped: answered once is enough.
-        """
-        kind = event_proposals.reply_kind(request)
+    async def _retire_buttons(self, key: str, text: str) -> None:
+        """Replace this thread's category buttons (if any are still up) with ``text``."""
+        entry = self._button_messages.pop(key, None)
+        if entry is not None:
+            channel, ts, _proposal_id = entry
+            await self._update(channel, ts, text, blocks=[])
+
+    async def _offer_category_buttons(self, channel: str, thread_ts: str) -> None:
+        """After an agent turn: post the category buttons for the proposal it left in this thread, if any."""
         key = self._conversation_key(channel, thread_ts)
-        if kind is None or self._turns.get(key):
-            return False
-        if key in self._confirming:
-            return True
         try:
-            if self.proposals.pending_proposal(key, utcnow()) is None:
-                return False
+            pending = self.proposals.pending_proposal(key, utcnow())
+        except OSError as exc:
+            log.warning("캘린더 제안을 읽지 못했습니다: %s", safe_error(exc))
+            return
+        offer = category_blocks(pending)
+        if pending is None or offer is None:
+            return
+        text, blocks = offer
+        ts = await self._post(channel, thread_ts, text, blocks=blocks)
+        if ts:
+            self._button_messages[key] = (channel, ts, str(pending.get("id") or ""))
+
+    async def _answer_proposal(self, channel: str, thread_ts: str, request: str) -> bool:
+        """Apply an answer to this thread's pending calendar proposal. False: not such an answer.
+
+        Only an explicit answer (``event_proposals.parse_answer``: a category
+        by number or name, "네" for the suggested one, "아니요"; without
+        categories a short "네" / "아니요") creates or cancels anything, and
+        only in the thread (and bot) where the proposal was shown, before it
+        expires. Nothing is created for a reply sent while this thread's agent
+        turn was still running (it came before the preview). A reply that fits
+        several categories is asked about once more and the proposal stays. A
+        second answer while the first is being applied is dropped: answered once is enough.
+        """
+        key = self._conversation_key(channel, thread_ts)
+        if self._turns.get(key):
+            return False
+        applying = self._confirming.get(key)
+        if applying is not None:
+            return event_proposals.parse_answer(request, applying).kind is not None
+        try:
+            pending = self.proposals.pending_proposal(key, utcnow())
         except OSError as exc:
             log.warning("캘린더 제안을 읽지 못했습니다: %s", safe_error(exc))
             return False
-        log.info(
-            "%s: 스레드 %s:%s 캘린더 제안 %s (에이전트 실행 없음)",
-            self.texts.label,
-            channel,
-            thread_ts,
-            "추가" if kind == event_proposals.YES else "취소",
-        )
-        self._confirming.add(key)
+        if pending is None:
+            return False
+        answer = event_proposals.parse_answer(request, pending)
+        if answer.kind is None:
+            return False
+        if answer.kind == event_proposals.CLARIFY:
+            log.info("%s: 스레드 %s:%s 캘린더 제안의 카테고리를 다시 묻습니다 (에이전트 실행 없음)", self.texts.label, channel, thread_ts)
+            await self._post_shortcut(channel, thread_ts, answer.message)
+            return True
+
+        async def deliver(reply: str) -> None:
+            await self._post_shortcut(channel, thread_ts, reply)
+            await self._retire_buttons(key, BUTTONS_ANSWERED_TEXT)
+
+        await self._apply_answer(channel, thread_ts, pending, answer, deliver)
+        return True
+
+    async def _apply_answer(
+        self,
+        channel: str,
+        thread_ts: str,
+        pending: Mapping[str, Any],
+        answer: event_proposals.Answer,
+        deliver: Callable[[str], Awaitable[None]],
+    ) -> bool:
+        """Take ``pending`` out of the store and create its events (or cancel it), then ``deliver`` the reply.
+
+        Shared by text answers and button clicks. The proposal is taken out on
+        the event loop, and only if it is still that very proposal (same id),
+        so it is never created twice. False: it was already gone.
+        """
+        key = self._conversation_key(channel, thread_ts)
+        what = "취소" if answer.kind == event_proposals.NO else f"추가 ({answer.category or '일정마다 정한 카테고리'})"
+        log.info("%s: 스레드 %s:%s 캘린더 제안 %s (에이전트 실행 없음)", self.texts.label, channel, thread_ts, what)
+        self._confirming[key] = pending
         try:
             async with self._thread_lock(f"{self.persona}:{channel}:{thread_ts}"):
                 try:
-                    # Taken out here, on the event loop: it can never be created twice.
-                    proposal = self.proposals.take_pending_proposal(key, utcnow())
+                    proposal = self.proposals.take_pending_proposal(key, utcnow(), proposal_id=pending.get("id"))
                     if proposal is None:
-                        return True
+                        return False
                     reply = await asyncio.to_thread(
-                        event_proposals.answer_text, proposal, kind, create=self.create_events
+                        event_proposals.answer_text,
+                        proposal,
+                        answer.kind or "",
+                        create=self.create_events,
+                        category=answer.category,
                     )
                 except Exception as exc:  # noqa: BLE001 - reported in Slack without details
                     _log_exception("캘린더 제안을 처리하지 못했습니다.", exc)
                     reply = CALENDAR_CRASH_TEXT.format(kind=type(exc).__name__)
-            await self._post_shortcut(channel, thread_ts, reply)
+            await deliver(reply)
         finally:
-            self._confirming.discard(key)
+            self._confirming.pop(key, None)
         return True
+
+    async def handle_action(self, body: Mapping[str, Any]) -> None:
+        """A click on a category button (Bolt has already acked it).
+
+        The allow-list comes first: anyone else gets an ephemeral refusal and
+        nothing happens. The button's proposal id must be the one pending in
+        this thread for this bot (not expired, not answered yet); otherwise the
+        clicker sees "이미 처리됐거나 만료된 요청이에요". Then the same code as a
+        text answer creates the events, and the button message is replaced by
+        the result, so the buttons cannot be clicked twice.
+        """
+        user = str((body.get("user") or {}).get("id") or "")
+        container = body.get("container") or {}
+        message = body.get("message") or {}
+        channel = str((body.get("channel") or {}).get("id") or container.get("channel_id") or "")
+        message_ts = str(message.get("ts") or container.get("message_ts") or "")
+        thread_ts = str(message.get("thread_ts") or container.get("thread_ts") or message_ts)
+        if not channel or not message_ts:
+            log.warning("%s 봇: 채널이나 메시지가 없는 버튼 클릭을 무시합니다.", self.texts.label)
+            return
+        if not self.is_allowed(user):
+            log.warning("%s 봇: 허용되지 않은 사용자(%s)의 버튼 클릭을 거절했습니다.", self.texts.label, user)
+            await self._ephemeral(channel, user, thread_ts, REFUSAL_TEXT)
+            return
+        actions = body.get("actions") or [{}]
+        try:
+            value = json.loads(str(actions[0].get("value") or ""))
+        except (ValueError, AttributeError):
+            value = {}
+        value = value if isinstance(value, dict) else {}
+        key = self._conversation_key(channel, thread_ts)
+        if key in self._confirming:
+            return  # a second click while the first is being applied: answered once is enough
+        try:
+            pending = self.proposals.pending_proposal(key, utcnow())
+        except OSError as exc:
+            log.warning("캘린더 제안을 읽지 못했습니다: %s", safe_error(exc))
+            pending = None
+        proposal_id = str(value.get("proposal_id") or "")
+        answer = button_answer(value, pending) if pending is not None and proposal_id == pending.get("id") else None
+        if answer is None:
+            log.info("%s: 스레드 %s:%s 이미 처리됐거나 만료된 캘린더 버튼 클릭", self.texts.label, channel, thread_ts)
+            await self._ephemeral(channel, user, thread_ts, STALE_ACTION_TEXT)
+            return
+
+        async def deliver(reply: str) -> None:
+            self._button_messages.pop(key, None)  # this very message becomes the result
+            chunks = to_slack_chunks(reply) or [CALENDAR_CRASH_TEXT.format(kind="빈 응답")]
+            if not await self._update(channel, message_ts, chunks[0], blocks=[]):
+                await self._post(channel, thread_ts, chunks[0])
+            for chunk in chunks[1:]:
+                await self._post(channel, thread_ts, chunk)
+
+        if not await self._apply_answer(channel, thread_ts, pending, answer, deliver):
+            await self._ephemeral(channel, user, thread_ts, STALE_ACTION_TEXT)
 
     # -- weather and credit shortcuts (no agent turn, no LLM call, no session)
     #
@@ -751,6 +944,8 @@ class SlackHandler:
         if result.failed:
             log.warning("%s 답을 끝내지 못했습니다: %s", josa(label, "이", "가"), scrub(result.error or ""))
         await self._finish(channel, thread_ts, placeholder, to_slack_chunks(reply))
+        # A calendar proposal made in this turn: its category buttons go right under the answer.
+        await self._offer_category_buttons(channel, thread_ts)
         log.info("%s: 스레드 %s:%s 답변 완료", label, channel, thread_ts)
 
     # -- Slack I/O (failures are logged, never raised)
@@ -763,30 +958,42 @@ class SlackHandler:
         for chunk in rest:
             await self._post(channel, thread_ts, chunk)
 
-    async def _post(self, channel: str, thread_ts: str, text: str) -> str | None:
+    async def _post(
+        self, channel: str, thread_ts: str, text: str, *, blocks: list[dict[str, Any]] | None = None
+    ) -> str | None:
+        extra = {"blocks": blocks} if blocks is not None else {}
         try:
             response = await self.client.chat_postMessage(
-                channel=channel, thread_ts=thread_ts, text=text, unfurl_links=False, unfurl_media=False
+                channel=channel, thread_ts=thread_ts, text=text, unfurl_links=False, unfurl_media=False, **extra
             )
         except Exception as exc:  # noqa: BLE001
             log.error("%s 봇: Slack 메시지를 보내지 못했습니다: %s", self.texts.label, describe_slack_error(exc, self.persona))
             return None
         return response.get("ts")
 
-    async def _update(self, channel: str, ts: str, text: str) -> bool:
+    async def _update(self, channel: str, ts: str, text: str, *, blocks: list[dict[str, Any]] | None = None) -> bool:
+        """``chat_update``; ``blocks=[]`` removes the message's blocks (e.g. the buttons)."""
+        extra = {"blocks": blocks} if blocks is not None else {}
         try:
-            await self.client.chat_update(channel=channel, ts=ts, text=text)
+            await self.client.chat_update(channel=channel, ts=ts, text=text, **extra)
         except Exception as exc:  # noqa: BLE001
             log.warning("%s 봇: Slack 메시지를 고치지 못했습니다: %s", self.texts.label, describe_slack_error(exc, self.persona))
             return False
         return True
+
+    async def _ephemeral(self, channel: str, user: str, thread_ts: str, text: str) -> None:
+        """A message only ``user`` sees (e.g. a refused or stale button click)."""
+        try:
+            await self.client.chat_postEphemeral(channel=channel, user=user, thread_ts=thread_ts, text=text)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("%s 봇: 나만 보이는 메시지를 보내지 못했습니다: %s", self.texts.label, describe_slack_error(exc, self.persona))
 
 
 # ---------------------------------------------------------------- Bolt app
 
 
 def register_listeners(app: Any, handler: SlackHandler) -> None:
-    """Wire Bolt events to ``handler``. Bolt acks each event before the listener runs."""
+    """Wire Bolt events and the category buttons to ``handler``. Bolt acks each event before the listener runs."""
 
     @app.event("app_mention")
     async def on_app_mention(event: dict[str, Any], body: dict[str, Any], context: Any) -> None:
@@ -797,6 +1004,13 @@ def register_listeners(app: Any, handler: SlackHandler) -> None:
     async def on_message(event: dict[str, Any], body: dict[str, Any], context: Any) -> None:
         handler.bot_user_id = handler.bot_user_id or getattr(context, "bot_user_id", None)
         await handler.handle_event(event, event_id=body.get("event_id"), source="dm")
+
+    # Category buttons under a calendar proposal. Actions are not acked by
+    # Bolt itself: ack first, then create the events (EventKit may take a while).
+    @app.action(CATEGORY_ACTION_RE)
+    async def on_calendar_action(ack: Any, body: dict[str, Any]) -> None:
+        await ack()
+        await handler.handle_action(body)
 
     @app.error
     async def on_error(error: Exception) -> None:

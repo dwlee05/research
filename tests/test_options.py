@@ -1157,20 +1157,24 @@ def _bound_propose_tool(tools):
     return tool
 
 
-def _call_propose(tool, monkeypatch):
+# The user's Mac calendars: the five default categories and one more.
+CATEGORY_CALENDARS = ["Family", "Teaching", "Research", "Event-Outside", "Event-KHU"]
+
+
+def _call_propose(tool, monkeypatch, **args):
     class App:
         def authorization_status(self):
             return macos_calendar.GRANTED
 
         def list_writable_calendars(self):
-            return [{"name": "연구", "source": "iCloud", "is_default": True}]
+            return [{"name": name, "source": "iCloud", "is_default": name == "연구"} for name in ["연구", *CATEGORY_CALENDARS]]
 
         def find_similar_events(self, start, end, title):
             return []
 
     monkeypatch.setattr(config, "current_platform", lambda: "darwin")
     monkeypatch.setattr(macos_calendar, "default_adapter", lambda tz: App())
-    result = asyncio.run(tool.handler({"events": [NOTE_EVENT], "source_note": "메모"}))
+    result = asyncio.run(tool.handler({"events": [NOTE_EVENT], "source_note": "메모", **args}))
     return json.loads(result["content"][0]["text"])
 
 
@@ -1182,10 +1186,16 @@ def test_build_options_binds_the_conversation_key_into_its_own_propose_tool(serv
     build_options(env={}, persona=persona)  # another run in the same process, without a key
     bound, unbound = (_bound_propose_tool(tools) for tools in server_tools)
     assert bound is not unbound
-    payload = _call_propose(bound, monkeypatch)
-    assert payload["ok"] and payload["can_confirm"] and payload["confirm_question"] == CONFIRM_QUESTION
+    payload = _call_propose(bound, monkeypatch, suggested_category="Event-KHU")
+    assert payload["ok"] and payload["can_confirm"]
+    assert payload["confirm_question"] == (
+        "카테고리를 골라주세요 (추천: Event-KHU) — 1 Family · 2 Teaching · 3 Research · 4 Event-Outside · 5 Event-KHU"
+        " · 번호/이름으로 답하거나 '네'(추천대로), '아니요'(취소)"
+    )
     store = StateStore(config.get_state_path())
-    assert store.pending_proposal(key, utcnow())["events"][0]["title"] == "신임교수모임 (10월)"
+    pending = store.pending_proposal(key, utcnow())
+    assert pending["events"][0]["title"] == "신임교수모임 (10월)" and pending["suggested_category"] == "Event-KHU"
+    assert [c["label"] for c in pending["categories"]] == CATEGORY_CALENDARS
     store.clear_pending_proposal(key)
     assert _call_propose(unbound, monkeypatch)["can_confirm"] is False
     assert store.load().get("pending_events") == {}
@@ -1196,16 +1206,31 @@ def test_prompts_propose_and_end_with_the_exact_question():
     direct = {p: build_options(env={}, persona=p).system_prompt for p in ("update", "schedule")}
     for prompt in (*direct.values(), SCHEDULE_PROMPT):
         assert "## 메모로 일정 추가 (propose_calendar_events)" in prompt
-        assert f'마지막 줄은 정확히 "{CONFIRM_QUESTION}"으로 끝낸다' in prompt
+        assert (
+            f'마지막 줄은 결과의 confirm_question(카테고리를 고르라는 질문, 또는 "{CONFIRM_QUESTION}")을 '
+            "한 글자도 바꾸지 말고 그대로 쓴다"
+        ) in prompt
         assert '예: "신임교수모임 (10월)"' in prompt and '"발표: 김평식 교수님"' in prompt
         assert '"오후 12시"는 12:00(정오)이다. "오전 12시"는 00:00(자정)으로 넣고' in prompt
         assert "weekday_in_text" in prompt and "오늘이거나 오늘 뒤에 오는 가장 가까운 그 날짜" in prompt
         assert "시작 시각이 없으면 짐작하지 않는다" in prompt and "몇 시인지 묻는다" in prompt
         assert "일정이 추가되었다거나 등록되었다고 절대 말하지 않는다" in prompt
         assert "can_confirm이 false면 이 질문 대신 note를 전한다" in prompt
+        # The agent suggests a category; the user picks it.
+        assert "suggested_category에 가장 알맞은 카테고리 하나를 추천만 하고, 사용자 대신 고르지 않는다" in prompt
+        for line in (
+            "- Family: 가족·개인 일",
+            "- Teaching: 강의, 수업, 학생, 채점, 조교(TA), 시험",
+            "- Research: 논문, 공저자, 실험, IRB, 연구 회의",
+            "- Event-KHU: 경희대 안의 회의·행사, 학과·단과대 행사(예: 신임교수모임)",
+            "- Event-Outside: 경희대 밖의 학회, 워크숍, 세미나, 외부 행사",
+        ):
+            assert line in prompt
+        assert '사용자가 정해 줬을 때만(예: "1번은 Research, 2번은 Event-KHU") 그 일정의 category에 넣는다' in prompt
     for prompt in direct.values():
         assert "사용자 메시지 맨 앞의 [지금: ...] 줄의 날짜를 기준으로" in prompt
-        assert "앞의 제안은 이미 취소된 것이다" in prompt and "다시 불러 새 미리보기와 같은 질문으로 끝낸다" in prompt
+        assert "앞의 제안은 이미 취소된 것이다" in prompt
+        assert "다시 불러 새 미리보기와 결과의 confirm_question으로 끝낸다" in prompt
         assert "Agent" not in prompt
     assert "고뭉치가 맡긴 글 맨 앞의 [지금: ...] 줄의 날짜를 기준으로" in SCHEDULE_PROMPT
     assert "고뭉치에게 그대로 보고하고" in SCHEDULE_PROMPT
@@ -1222,7 +1247,11 @@ def test_mungchi_routes_notes_to_schedule_and_relays_the_question():
     assert "'일정' 에이전트에게 맡긴다. 업뎃에게는 맡기지 않는다." in section
     assert "너에게는 일정을 제안하거나 추가하는 도구가 없다" in section
     assert "메모 원문 전체(고치거나 줄이지 말고 그대로)" in section and "[지금: ...] 줄" in section
-    assert f'답의 마지막 줄을 정확히 "{CONFIRM_QUESTION}"으로 끝낸다' in section
+    assert (
+        f'답의 마지막 줄은 보고에 있는 확인 질문(카테고리를 고르라는 질문, 또는 "{CONFIRM_QUESTION}")을 '
+        "한 글자도 바꾸지 말고 그대로 쓴다"
+    ) in section
+    assert "카테고리(넣을 캘린더)는 사용자가 고른다" in section
     assert "일정이 추가되었다거나 등록되었다고 절대 말하지 않는다" in section
     assert "메모 원문과 고칠 내용을 함께 '일정' 에이전트에게 다시 맡겨" in section
     assert "propose_calendar_events" not in prompt  # not its tool
@@ -1375,3 +1404,54 @@ def test_one_shot_shows_the_preview_and_points_to_chat_or_slack(monkeypatch, cap
     # The one-shot run's tool has no conversation: it never stores anything to confirm.
     payload = _call_propose(_bound_propose_tool(server_tools[-1]), monkeypatch)
     assert payload["can_confirm"] is False and StateStore(config.get_state_path()).load().get("pending_events") is None
+
+
+# ---------------------------------------------------------------- terminal chat with categories
+
+CATEGORY_ROWS = [{"label": n, "calendar": n, "aliases": []} for n in CATEGORY_CALENDARS]
+CATEGORY_QUESTION = (
+    "카테고리를 골라주세요 (추천: Event-KHU) [1 Family · 2 Teaching · 3 Research · 4 Event-Outside · 5 Event-KHU / 네 / 아니요] "
+)
+
+
+class CategoryProposingSDKClient(ProposingSDKClient):
+    async def query(self, prompt, session_id="default"):
+        await FakeSDKClient.query(self, prompt, session_id)
+        typed = without_now_line(prompt)
+        if typed in self.propose_on:
+            items, _ = event_proposals.normalize_events([NOTE_EVENT], tz=ZoneInfo("Asia/Seoul"), now=NOW)
+            proposal = {
+                "id": typed,
+                "calendar": None,
+                "categories": CATEGORY_ROWS,
+                "suggested_category": "Event-KHU",
+                "events": [e.to_state() for e in items],
+            }
+            self.store.save_pending_proposal(self.key, proposal, utcnow())
+
+
+@pytest.mark.parametrize("answer,label", [("2", "Teaching"), ("research", "Research"), ("네", "Event-KHU"), ("khu", "Event-KHU")])
+def test_chat_asks_for_a_numbered_category_and_creates_by_code(chat, monkeypatch, capsys, answer, label):
+    monkeypatch.setattr(main_module, "ClaudeSDKClient", CategoryProposingSDKClient)
+    asked, created, store, prompts = chat(["메모", answer, "종료"], {"메모"})
+    assert asked == ["\n나> ", CATEGORY_QUESTION, "\n나> "]
+    assert [p["chosen_category"] for p in created] == [label] and prompts == ["메모"]  # never reaches the agent
+    assert "✅ 캘린더에 추가했어요" in capsys.readouterr().out
+    assert store.pending_proposal("cli:test", utcnow()) is None
+
+
+def test_chat_asks_again_for_an_unclear_category_and_cancels_on_no(chat, monkeypatch, capsys):
+    monkeypatch.setattr(main_module, "ClaudeSDKClient", CategoryProposingSDKClient)
+    asked, created, store, prompts = chat(["메모", "event", "9", "아니요", "종료"], {"메모"})
+    assert asked == ["\n나> ", CATEGORY_QUESTION, CATEGORY_QUESTION, CATEGORY_QUESTION, "\n나> "]
+    out = capsys.readouterr().out
+    assert "'event'에 맞는 카테고리가 여러 개예요: 4 Event-Outside · 5 Event-KHU." in out
+    assert "1~5 가운데 번호로 골라 주세요" in out and "취소했어요" in out
+    assert created == [] and prompts == ["메모"]
+
+
+def test_chat_sends_anything_else_to_the_agent_with_categories(chat, monkeypatch):
+    monkeypatch.setattr(main_module, "ClaudeSDKClient", CategoryProposingSDKClient)
+    asked, created, store, prompts = chat(["메모", "1번은 Research로", "5", "종료"], {"메모", "1번은 Research로"})
+    assert prompts == ["메모", "1번은 Research로"]
+    assert [(p["id"], p["chosen_category"]) for p in created] == [("1번은 Research로", "Event-KHU")]

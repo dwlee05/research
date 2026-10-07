@@ -176,10 +176,12 @@ class StateStore:
             _write_json(self.path, data)
         return stored
 
-    def take_pending_proposal(self, key: str, now: datetime) -> dict[str, Any] | None:
+    def take_pending_proposal(self, key: str, now: datetime, proposal_id: str | None = None) -> dict[str, Any] | None:
         """Remove and return the proposal under ``key`` in one step (None if there is none or it expired).
 
-        Two confirmations of one proposal can never both get it.
+        Two confirmations of one proposal can never both get it. With
+        ``proposal_id`` only that very proposal is taken: a newer one under the
+        same key (or none) returns None and is left as it is.
         """
         with _LOCK:
             data = self.load()
@@ -187,6 +189,8 @@ class StateStore:
             if not isinstance(raw, dict) or key not in raw:
                 return None
             proposal = self._live_proposals(data, now).get(key)
+            if proposal_id is not None and (proposal is None or proposal.get("id") != proposal_id):
+                return None
             data[_PENDING_KEY] = {k: v for k, v in self._live_proposals(data, now).items() if k != key}
             _write_json(self.path, data)
         return proposal

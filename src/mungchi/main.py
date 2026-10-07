@@ -516,32 +516,47 @@ async def confirm_in_terminal(
     create: Creator | None = None,
     now: Clock | None = None,
 ) -> Any:
-    """After a chat turn: if it left a calendar proposal, ask ``캘린더에 추가할까요? [네/아니요]``.
+    """After a chat turn: if it left a calendar proposal, ask for the answer.
 
-    "네" creates the events (code, never the agent) and prints the result,
-    "아니요" cancels. Anything else cancels the proposal and is returned, to be
-    sent to the agent as the next message (e.g. "시간은 1시로 바꿔줘").
+    With categories the prompt lists them by number
+    (``카테고리를 골라주세요 (추천: Event-KHU) [1 Family · 2 Teaching · … / 네 / 아니요]``):
+    a number, a name, "네" (the suggestion) creates the events (code, never
+    the agent), "아니요" cancels, a reply that fits several categories is
+    asked about again. Without categories: ``캘린더에 추가할까요? [네/아니요]``.
+    Anything else cancels the proposal and is returned, to be sent to the
+    agent as the next message (e.g. "시간은 1시로 바꿔줘").
     Returns None when nothing more is to be sent, ``CHAT_EXIT`` on end of input.
     """
-    if store.pending_proposal(conversation_key, (now or utcnow)()) is None:
+    pending = store.pending_proposal(conversation_key, (now or utcnow)())
+    if pending is None:
         return None
     while True:
         try:
-            answer = (await asyncio.to_thread(input, event_proposals.CLI_CONFIRM_PROMPT)).strip()
+            reply = (await asyncio.to_thread(input, event_proposals.cli_prompt(pending))).strip()
         except EOFError:
             print()
             store.clear_pending_proposal(conversation_key)
             return CHAT_EXIT
-        if answer:
+        if not reply:
+            continue
+        answer = event_proposals.parse_answer(reply, pending)
+        if answer.kind != event_proposals.CLARIFY:
             break
-    kind = event_proposals.reply_kind(answer)
-    if kind is None:
+        print(answer.message)
+    if answer.kind is None:
         store.clear_pending_proposal(conversation_key)  # replaced by whatever the agent does next
-        return answer
-    reply = await asyncio.to_thread(
-        event_proposals.confirm_proposal, store, conversation_key, kind, now=(now or utcnow)(), create=create
+        return reply
+    result = await asyncio.to_thread(
+        event_proposals.confirm_proposal,
+        store,
+        conversation_key,
+        answer.kind,
+        now=(now or utcnow)(),
+        create=create,
+        category=answer.category,
+        proposal_id=pending.get("id"),
     )
-    print(reply or event_proposals.CANCELLED_TEXT)
+    print(result or event_proposals.CANCELLED_TEXT)
     return None
 
 
@@ -555,7 +570,7 @@ async def run_chat(
     create: Creator | None = None,
 ) -> int:
     """The terminal chat. With ``conversation_key`` (the one bound into ``options``),
-    a turn that proposes calendar events is followed by the yes/no question."""
+    a turn that proposes calendar events is followed by the category (or yes/no) question."""
     # One long-lived client keeps the whole conversation in a single session;
     # every line the user types is sent with the current time in front.
     print(CHAT_GREETINGS[persona])

@@ -61,6 +61,14 @@ class FakeSlackClient:
             raise RuntimeError("update failed")
         return {"ok": True}
 
+    async def chat_postEphemeral(self, **kwargs):
+        self.calls.append(("ephemeral", dict(kwargs)))
+        return {"ok": True}
+
+    @property
+    def ephemerals(self) -> list[dict]:
+        return [kw for kind, kw in self.calls if kind == "ephemeral"]
+
     @property
     def posts(self) -> list[dict]:
         return [kw for kind, kw in self.calls if kind == "post"]
@@ -640,8 +648,11 @@ def test_bolt_app_builds_offline_and_routes_events(tmp_path, monkeypatch):
     app, handler = build_app(cfg, sessions=ThreadSessions(tmp_path / "t.json"))
     assert app.process_before_response is False  # ack first, then run the listener
     listeners = {listener.ack_function.__name__: listener for listener in app._async_listeners}
-    assert set(listeners) == {"on_app_mention", "on_message"}
-    assert all(listener.auto_acknowledgement for listener in listeners.values())
+    assert set(listeners) == {"on_app_mention", "on_message", "on_calendar_action"}
+    # Events are acked by Bolt; the button listener acks itself, first thing.
+    assert listeners["on_app_mention"].auto_acknowledgement and listeners["on_message"].auto_acknowledgement
+    assert not listeners["on_calendar_action"].auto_acknowledgement
+    listeners.pop("on_calendar_action")
     assert handler.client is app.client
     assert handler.allowed_user_ids == {OWNER}
     assert handler._semaphore._value == 3
@@ -1055,9 +1066,9 @@ def test_three_bolt_apps_build_offline_with_shared_state(tmp_path, monkeypatch):
     assert [bot.persona for bot, _app, _handler in apps] == ["mungchi", "update", "schedule"]
     handlers = [handler for _bot, _app, handler in apps]
     for bot, app, handler in apps:
-        listeners = {listener.ack_function.__name__ for listener in app._async_listeners}
-        assert listeners == {"on_app_mention", "on_message"}
-        assert all(listener.auto_acknowledgement for listener in app._async_listeners)
+        listeners = {listener.ack_function.__name__: listener for listener in app._async_listeners}
+        assert set(listeners) == {"on_app_mention", "on_message", "on_calendar_action"}  # buttons on every bot
+        assert listeners["on_app_mention"].auto_acknowledgement and listeners["on_message"].auto_acknowledgement
         assert app.process_before_response is False
         assert handler.client is app.client
         assert handler.persona == bot.persona
@@ -2456,6 +2467,7 @@ class CalendarWrites:
         self.fail_titles = set(fail_titles)
         self.delay = delay
         self.created: list[str] = []
+        self.calendars: list[str | None] = []  # calendar_name per created event
 
     def authorization_status(self):
         return "granted"
@@ -2466,6 +2478,7 @@ class CalendarWrites:
 
             _time.sleep(self.delay)
         self.created.append(title)
+        self.calendars.append(calendar_name)
         if title in self.fail_titles:
             return {"ok": False, "id": None, "calendar": "", "error": "읽기 전용 캘린더예요"}
         return {"ok": True, "id": f"EV-{len(self.created)}", "calendar": calendar_name or "연구", "error": None}
@@ -2674,3 +2687,308 @@ def test_code_only_shortcuts_keep_the_proposal_but_a_briefing_replaces_it(tmp_pa
     assert store.pending_proposal(key, utcnow()) is not None
     asyncio.run(handler.handle_event(dm("브리핑", ts="1700000000.000400", thread_ts=ROOT), event_id="Ev2", source="dm"))
     assert store.pending_proposal(key, utcnow()) is None and app.created == []
+
+
+# ---------------------------------------------------------------- calendar categories: text answers and buttons
+
+import json  # noqa: E402
+
+CATEGORY_ROWS = [
+    {"label": c.label, "calendar": c.calendar, "aliases": list(c.aliases)} for c in config.get_calendar_categories({})
+]
+LABELS = [row["label"] for row in CATEGORY_ROWS]
+
+
+def store_category_proposal(store, persona, channel, thread_ts, *, suggested="Event-KHU", events=NOTE_EVENTS, pid="pid-1", now=None):
+    items, problems = normalize_events(events, tz=ZoneInfo("Asia/Seoul"), now=datetime(2099, 1, 1, tzinfo=timezone.utc))
+    assert problems == []
+    key = slack_conversation_key(persona, channel, thread_ts)
+    proposal = {
+        "id": pid,
+        "calendar": None,
+        "calendar_label": "",
+        "categories": CATEGORY_ROWS,
+        "suggested_category": suggested,
+        "events": [e.to_state() for e in items],
+    }
+    store.save_pending_proposal(key, proposal, now or utcnow())
+    return key
+
+
+def click(value, *, user=OWNER, channel=DM, message_ts="1700000100.000009", thread_ts=ROOT, action_id="mungchi_cal_pick_5"):
+    """A block_actions payload as Slack sends it for a button in a thread."""
+    return {
+        "type": "block_actions",
+        "user": {"id": user},
+        "channel": {"id": channel},
+        "container": {"type": "message", "message_ts": message_ts, "channel_id": channel, "thread_ts": thread_ts},
+        "message": {"ts": message_ts, "thread_ts": thread_ts, "text": "카테고리를 골라주세요"},
+        "actions": [{"action_id": action_id, "type": "button", "value": json.dumps(value)}],
+    }
+
+
+@pytest.mark.parametrize(
+    "text,label",
+    [("2", "Teaching"), ("<@UBOT> khu", "Event-KHU"), ("연구", "Research"), ("Research로 넣어줘", "Research"), ("네", "Event-KHU")],
+)
+def test_a_category_reply_creates_the_events_in_that_calendar_without_an_agent_turn(tmp_path, text, label):
+    handler, client, run, app, store = proposal_handler(tmp_path)
+    key = store_category_proposal(store, "schedule", DM, ROOT)
+    asyncio.run(handler.handle_event(dm(text, ts="1700000000.000300", thread_ts=ROOT), event_id="Ev1", source="dm"))
+    assert run.calls == []  # never the model
+    assert app.created == ["신임교수모임 (10월)", "신임교수모임 (11월)"] and app.calendars == [label, label]
+    [post] = client.posts
+    assert post["thread_ts"] == ROOT and post["text"] == (
+        f"✅ {label} 캘린더에 추가했어요\n"
+        "• 2099/10/22(목) 12:00–13:00 신임교수모임 (10월)\n"
+        "• 2099/11/19(목) 12:00–13:00 신임교수모임 (11월)"
+    )
+    assert store.pending_proposal(key, utcnow()) is None
+
+
+def test_an_unclear_category_reply_is_asked_about_and_the_proposal_stays(tmp_path):
+    handler, client, run, app, store = proposal_handler(tmp_path)
+    key = store_category_proposal(store, "schedule", DM, ROOT, suggested=None)
+    for i, text in enumerate(("event", "네", "9")):
+        asyncio.run(handler.handle_event(dm(text, ts=f"1700000000.00030{i}", thread_ts=ROOT), event_id=f"Ev{i}", source="dm"))
+    assert [p["text"].split(":")[0] for p in client.posts] == [
+        "'event'에 맞는 카테고리가 여러 개예요",
+        "추천한 카테고리가 없어요. 번호나 이름으로 골라 주세요",
+        "1~5 가운데 번호로 골라 주세요",
+    ]
+    assert app.created == [] and run.calls == [] and store.pending_proposal(key, utcnow()) is not None
+    asyncio.run(handler.handle_event(dm("4", ts="1700000000.000310", thread_ts=ROOT), event_id="Ev9", source="dm"))
+    assert app.calendars == ["Event-Outside", "Event-Outside"]
+
+
+def test_no_cancels_and_other_text_goes_to_the_agent_with_categories(tmp_path):
+    handler, client, run, app, store = proposal_handler(tmp_path)
+    key = store_category_proposal(store, "schedule", DM, ROOT)
+    asyncio.run(handler.handle_event(dm("아니요", ts="1700000000.000300", thread_ts=ROOT), event_id="Ev1", source="dm"))
+    assert [p["text"] for p in client.posts] == ["취소했어요"] and store.pending_proposal(key, utcnow()) is None
+    store_category_proposal(store, "schedule", DM, ROOT)
+    asyncio.run(handler.handle_event(dm("1번은 Research, 2번은 Event-KHU", ts="1700000000.000400", thread_ts=ROOT), event_id="Ev2", source="dm"))
+    assert [c["prompt"] for c in run.calls] == ["1번은 Research, 2번은 Event-KHU"] and app.created == []
+    assert store.pending_proposal(key, utcnow()) is None  # the agent re-proposes
+
+
+def test_the_category_buttons_payload():
+    proposal = {"id": "abc123", "categories": CATEGORY_ROWS, "suggested_category": "Event-KHU", "events": [{}]}
+    text, blocks = slack_bot.category_blocks(proposal)
+    assert text == "카테고리를 골라주세요 (추천: Event-KHU)"
+    section, actions = blocks
+    assert section == {"type": "section", "text": {"type": "mrkdwn", "text": text}}
+    assert actions["type"] == "actions" and actions["block_id"] == "mungchi_cal_abc123"
+    buttons = actions["elements"]
+    assert [b["text"]["text"] for b in buttons] == [*LABELS, "취소"]
+    assert [b["action_id"] for b in buttons] == [f"mungchi_cal_pick_{i}" for i in range(1, 6)] + ["mungchi_cal_cancel"]
+    assert len({b["action_id"] for b in buttons}) == len(buttons)  # unique within the block, as Slack requires
+    assert all(b["type"] == "button" and b["text"]["type"] == "plain_text" for b in buttons)
+    assert [b.get("style") for b in buttons] == [None, None, None, None, "primary", None]  # only the suggestion
+    assert [json.loads(b["value"]) for b in buttons] == [
+        *({"proposal_id": "abc123", "category": label} for label in LABELS),
+        {"proposal_id": "abc123", "cancel": True},
+    ]
+    assert slack_bot.CATEGORY_ACTION_RE.match(buttons[0]["action_id"]) and slack_bot.CATEGORY_ACTION_RE.match(buttons[-1]["action_id"])
+    # No suggestion: no primary button; every event with its own category: one 추가 button.
+    _, plain = slack_bot.category_blocks({**proposal, "suggested_category": None})
+    assert all("style" not in b for b in plain[1]["elements"])
+    assigned = {**proposal, "events": [{"category": "Research"}]}
+    text, blocks = slack_bot.category_blocks(assigned)
+    assert text == "일정마다 정한 카테고리로 추가할까요?"
+    assert [(b["text"]["text"], b.get("style")) for b in blocks[1]["elements"]] == [("추가", "primary"), ("취소", None)]
+    # The yes / no flow (no categories) and a proposal without an id get no buttons.
+    assert slack_bot.category_blocks({"id": "x", "events": [{}]}) is None
+    assert slack_bot.category_blocks({**proposal, "id": ""}) is None and slack_bot.category_blocks(None) is None
+
+
+class CategoryProposingRun(FakeRun):
+    """Like run_turn whose agent calls propose_calendar_events with categories on."""
+
+    def __init__(self, store, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.store = store
+
+    async def __call__(self, prompt, **kwargs):
+        key = kwargs.get("conversation_key")
+        if key:
+            _p, _persona, channel, thread_ts = key.split(":", 3)
+            store_category_proposal(self.store, _persona, channel, thread_ts, pid=f"pid-{len(self.calls) + 1}")
+        return await super().__call__(prompt, **kwargs)
+
+
+def _proposing_handler(tmp_path, persona="update", **kwargs):
+    store = StateStore(tmp_path / "state.json")
+    run = CategoryProposingRun(store, TurnResult(text="• 10/22(목) …\n카테고리를 골라주세요 …", session_id=SESSION_1), statuses=())
+    return proposal_handler(tmp_path, persona, run=run, **kwargs)
+
+
+def test_an_agent_proposal_gets_category_buttons_under_the_answer(tmp_path):
+    handler, client, run, app, store = _proposing_handler(tmp_path)
+    asyncio.run(handler.handle_event(dm("메모: 10월 22일(목) 오후 12시", ts=ROOT), event_id="Ev1", source="dm"))
+    placeholder, buttons = client.posts
+    assert client.updates[-1]["ts"] == placeholder["_ts"] and "blocks" not in client.updates[-1]  # the answer as before
+    assert client.updates[-1]["text"].startswith("• 10/22(목)")
+    assert buttons["thread_ts"] == ROOT and buttons["text"] == "카테고리를 골라주세요 (추천: Event-KHU)"
+    assert buttons["blocks"] == slack_bot.category_blocks(store.pending_proposal(slack_conversation_key("update", DM, ROOT), utcnow()))[1]
+    assert handler._button_messages[slack_conversation_key("update", DM, ROOT)] == (DM, buttons["_ts"], "pid-1")
+
+
+def test_no_buttons_without_a_category_proposal(tmp_path):
+    handler, client, run, app, store = proposal_handler(tmp_path)
+    asyncio.run(handler.handle_event(dm("내일 일정은?", ts=ROOT), event_id="Ev1", source="dm"))
+    assert all("blocks" not in p for p in client.posts) and len(client.posts) == 1
+    # The yes / no flow (no categories) stays text-only too.
+    old = ProposingRun(store, statuses=())
+    handler.run = old
+    asyncio.run(handler.handle_event(dm("메모", ts="1700000000.000900"), event_id="Ev2", source="dm"))
+    assert all("blocks" not in p for p in client.posts)
+
+
+def test_a_click_by_the_owner_creates_the_events_and_replaces_the_buttons(tmp_path):
+    handler, client, run, app, store = _proposing_handler(tmp_path)
+    asyncio.run(handler.handle_event(dm("메모", ts=ROOT), event_id="Ev1", source="dm"))
+    buttons_ts = client.posts[-1]["_ts"]
+    asyncio.run(handler.handle_action(click({"proposal_id": "pid-1", "category": "Research"}, message_ts=buttons_ts)))
+    assert app.created == ["신임교수모임 (10월)", "신임교수모임 (11월)"] and app.calendars == ["Research", "Research"]
+    update = client.updates[-1]
+    assert update["ts"] == buttons_ts and update["channel"] == DM and update["blocks"] == []  # no buttons left
+    assert update["text"].startswith("✅ Research 캘린더에 추가했어요\n• 2099/10/22(목) 12:00–13:00 신임교수모임 (10월)")
+    assert client.ephemerals == [] and len(run.calls) == 1
+    assert store.pending_proposal(slack_conversation_key("update", DM, ROOT), utcnow()) is None
+    # Clicking again (the message was already replaced, or a stale copy): nothing more is created.
+    asyncio.run(handler.handle_action(click({"proposal_id": "pid-1", "category": "Family"}, message_ts=buttons_ts)))
+    assert len(app.created) == 2
+    assert client.ephemerals[-1] == {"channel": DM, "user": OWNER, "thread_ts": ROOT, "text": "이미 처리됐거나 만료된 요청이에요"}
+
+
+def test_the_cancel_button_cancels(tmp_path):
+    handler, client, run, app, store = proposal_handler(tmp_path)
+    key = store_category_proposal(store, "schedule", DM, ROOT)
+    asyncio.run(handler.handle_action(click({"proposal_id": "pid-1", "cancel": True}, action_id="mungchi_cal_cancel")))
+    assert app.created == [] and store.pending_proposal(key, utcnow()) is None
+    assert client.updates[-1]["text"] == "취소했어요" and client.updates[-1]["blocks"] == []
+
+
+def test_a_click_by_someone_else_is_refused_ephemerally_and_creates_nothing(tmp_path):
+    handler, client, run, app, store = proposal_handler(tmp_path)
+    key = store_category_proposal(store, "schedule", CHANNEL, ROOT)
+    asyncio.run(handler.handle_action(click({"proposal_id": "pid-1", "category": "Family"}, user=STRANGER, channel=CHANNEL)))
+    assert app.created == [] and client.updates == [] and client.posts == []
+    assert client.ephemerals == [{"channel": CHANNEL, "user": STRANGER, "thread_ts": ROOT, "text": REFUSAL_TEXT}]
+    assert store.pending_proposal(key, utcnow()) is not None  # still waiting for the owner
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"proposal_id": "old-id", "category": "Family"},  # an earlier preview's buttons
+        {"proposal_id": "pid-1", "category": "Lecture"},  # not offered
+        {"proposal_id": "pid-1", "confirm": True},  # not every event has its own category
+        {"category": "Family"},
+        "not json",
+    ],
+)
+def test_a_stale_or_unknown_click_does_nothing(tmp_path, value):
+    handler, client, run, app, store = proposal_handler(tmp_path)
+    key = store_category_proposal(store, "schedule", DM, ROOT)
+    body = click(value)
+    if value == "not json":
+        body["actions"][0]["value"] = "{not json"
+    asyncio.run(handler.handle_action(body))
+    assert app.created == [] and client.updates == [] and run.calls == []
+    assert [e["text"] for e in client.ephemerals] == [slack_bot.STALE_ACTION_TEXT]
+    assert store.pending_proposal(key, utcnow())["id"] == "pid-1"
+
+
+def test_an_expired_proposal_or_another_thread_is_stale(tmp_path):
+    handler, client, run, app, store = proposal_handler(tmp_path)
+    store_category_proposal(store, "schedule", DM, ROOT, now=utcnow() - timedelta(hours=25))
+    asyncio.run(handler.handle_action(click({"proposal_id": "pid-1", "category": "Family"})))
+    store_category_proposal(store, "schedule", DM, "1700000000.999999")
+    asyncio.run(handler.handle_action(click({"proposal_id": "pid-1", "category": "Family"})))  # this thread has none
+    assert app.created == [] and len(client.ephemerals) == 2
+
+
+def test_a_double_click_creates_the_events_once(tmp_path):
+    app = CalendarWrites(delay=0.05)
+    handler, client, run, app, store = proposal_handler(tmp_path, app=app)
+    store_category_proposal(store, "schedule", DM, ROOT)
+
+    async def scenario():
+        await asyncio.gather(
+            handler.handle_action(click({"proposal_id": "pid-1", "category": "Family"})),
+            handler.handle_action(click({"proposal_id": "pid-1", "category": "Research"})),
+            handler.handle_event(dm("2", ts="1700000000.000300", thread_ts=ROOT), event_id="Ev1", source="dm"),
+        )
+
+    asyncio.run(scenario())
+    assert app.created == ["신임교수모임 (10월)", "신임교수모임 (11월)"] and app.calendars == ["Family", "Family"]
+    assert [u["text"].splitlines()[0] for u in client.updates] == ["✅ Family 캘린더에 추가했어요"]
+    assert client.posts == [] and run.calls == []
+
+
+def test_a_text_answer_closes_the_buttons(tmp_path):
+    handler, client, run, app, store = _proposing_handler(tmp_path)
+    asyncio.run(handler.handle_event(dm("메모", ts=ROOT), event_id="Ev1", source="dm"))
+    buttons_ts = client.posts[-1]["_ts"]
+    asyncio.run(handler.handle_event(dm("3", ts="1700000000.000300", thread_ts=ROOT), event_id="Ev2", source="dm"))
+    assert app.calendars == ["Research", "Research"]
+    assert client.posts[-1]["text"].startswith("✅ Research 캘린더에 추가했어요")
+    closed = client.updates[-1]
+    assert closed == {"channel": DM, "ts": buttons_ts, "text": slack_bot.BUTTONS_ANSWERED_TEXT, "blocks": []}
+    assert handler._button_messages == {}
+
+
+def test_a_new_message_closes_the_old_buttons_and_the_new_proposal_gets_new_ones(tmp_path):
+    handler, client, run, app, store = _proposing_handler(tmp_path)
+    asyncio.run(handler.handle_event(dm("메모", ts=ROOT), event_id="Ev1", source="dm"))
+    first_buttons = client.posts[-1]["_ts"]
+    asyncio.run(handler.handle_event(dm("시간은 1시로 바꿔줘", ts="1700000000.000300", thread_ts=ROOT), event_id="Ev2", source="dm"))
+    assert {"channel": DM, "ts": first_buttons, "text": slack_bot.BUTTONS_REPLACED_TEXT, "blocks": []} in client.updates
+    second_buttons = client.posts[-1]
+    assert json.loads(second_buttons["blocks"][1]["elements"][0]["value"])["proposal_id"] == "pid-2"
+    # The old buttons' proposal is gone: a click on them does nothing.
+    asyncio.run(handler.handle_action(click({"proposal_id": "pid-1", "category": "Family"}, message_ts=first_buttons)))
+    assert app.created == [] and client.ephemerals[-1]["text"] == slack_bot.STALE_ACTION_TEXT
+
+
+def test_buttons_route_through_bolt_with_an_ack_first(tmp_path, monkeypatch):
+    _no_network(monkeypatch)
+    cfg = config.load_slack_config({**ALL_BOTS_ENV})
+    apps = slack_bot.build_apps(cfg, sessions=ThreadSessions(tmp_path / "t.json"))
+    _bot, app, handler = apps[1]  # 업뎃
+    store = StateStore(tmp_path / "state.json")
+    created = CalendarWrites()
+    handler.client, handler.proposals = FakeSlackClient(), store
+    handler.create_events = lambda proposal: create_proposal_events(
+        proposal, env={"TIMEZONE": "Asia/Seoul"}, adapter_factory=lambda tz: created, platform="darwin"
+    )
+    store_category_proposal(store, "update", DM, ROOT)
+    [listener] = [x for x in app._async_listeners if x.ack_function.__name__ == "on_calendar_action"]
+
+    from slack_bolt.request.async_request import AsyncBoltRequest
+    from slack_bolt.response import BoltResponse
+
+    body = click({"proposal_id": "pid-1", "category": "Teaching"})
+    acks: list[str] = []
+
+    async def ack():
+        acks.append("ack" if not created.created else "late")
+
+    async def scenario():
+        request = AsyncBoltRequest(body=body, mode="socket_mode")
+        assert all([await m.async_matches(request, BoltResponse(status=200)) for m in listener.matchers])
+        other = AsyncBoltRequest(body={**body, "actions": [{"action_id": "someone_else", "value": "{}"}]}, mode="socket_mode")
+        assert not all([await m.async_matches(other, BoltResponse(status=200)) for m in listener.matchers])
+        await listener.ack_function(ack=ack, body=body)
+
+    asyncio.run(scenario())
+    assert acks == ["ack"] and created.calendars == ["Teaching", "Teaching"]
+
+
+@pytest.mark.parametrize("name", sorted(MANIFESTS))
+def test_slack_manifests_enable_interactivity_for_the_buttons(name):
+    text = _manifest(name)
+    assert re.search(r"^  interactivity:\n    is_enabled: true$", text, re.MULTILINE)
+    assert "request_url" not in text  # Socket Mode: no public URL

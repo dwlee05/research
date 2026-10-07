@@ -4,7 +4,8 @@ Shows the calendar permission, asks macOS for access if it has not been
 decided yet (the system dialog appears once), then lists the calendars by
 account and the events of today and tomorrow that the '일정' agent would read
 under the current ``MACOS_CALENDARS`` filter, and the calendars events from a
-pasted note can be added to (``CALENDAR_WRITE_TARGET``). No Claude API call is made.
+pasted note can be added to (the categories of ``CALENDAR_CATEGORIES``, or
+without them ``CALENDAR_WRITE_TARGET``). No Claude API call is made.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from typing import Mapping, TextIO
 
 from . import config
 from .agents import WEEKDAYS_KO
-from .tools import calendar_tool, macos_calendar
+from .tools import calendar_tool, event_proposals, macos_calendar
 from .tools.calendar_tool import AdapterFactory
 from .tools.common import safe_error
 
@@ -51,6 +52,17 @@ def write_target_lines(adapter: macos_calendar.CalendarAdapter, env: Mapping[str
         source = f" ({calendar.get('source')})" if calendar.get("source") else ""
         default = " [기본]" if calendar.get("is_default") else ""
         lines.append(f"    - {calendar.get('name') or ''}{source}{default}")
+    categories = config.get_calendar_categories(env)
+    if categories:
+        offered, missing = event_proposals.available_categories(categories, writable)
+        shown = ", ".join(
+            f"{c['label']}" + (f"({c['calendar']})" if c["label"] != c["calendar"] else "") for c in offered
+        )
+        lines.append(f"카테고리 (CALENDAR_CATEGORIES, 일정을 추가할 때 고릅니다): {shown or '(없음)'}")
+        if missing:
+            quoted = ", ".join(f"'{c.calendar}'" for c in missing)
+            lines.append(f"[경고] Mac 캘린더에 {quoted} 캘린더가 없어요. {event_proposals.CATEGORY_FIX_HINT}")
+        return lines
     target = config.get_calendar_write_target(env)
     name, error = macos_calendar.resolve_write_calendar(writable, None, target)
     if error:

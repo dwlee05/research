@@ -405,6 +405,79 @@ def get_default_event_minutes(env: Mapping[str, str] | None = None) -> int:
     return minutes if MIN_EVENT_MINUTES <= minutes <= MAX_EVENT_MINUTES else DEFAULT_EVENT_MINUTES
 
 
+# Categories asked for before events from a note are added: each one is a
+# calendar in the Mac Calendar app. Unset: these five; empty: no categories
+# (the old "네" flow into CALENDAR_WRITE_TARGET or the default calendar).
+DEFAULT_CALENDAR_CATEGORIES = "Family,Teaching,Research,Event-Outside,Event-KHU"
+# Korean (and short) words that pick a category in a reply, besides its own name.
+DEFAULT_CATEGORY_ALIASES: dict[str, tuple[str, ...]] = {
+    "Family": ("가족", "집", "개인"),
+    "Teaching": ("강의", "수업", "티칭", "교육"),
+    "Research": ("연구",),
+    "Event-Outside": ("외부", "외부행사", "학회"),
+    "Event-KHU": ("경희", "학교", "교내", "khu"),
+}
+# One button per category (plus 취소) and numbers 1..N in replies.
+MAX_CALENDAR_CATEGORIES = 10
+MAX_CATEGORY_LABEL_CHARS = 40
+
+
+@dataclass(frozen=True)
+class CalendarCategory:
+    """One category: the ``label`` shown and typed, the Mac ``calendar`` it goes to, and reply ``aliases``."""
+
+    label: str
+    calendar: str
+    aliases: tuple[str, ...] = ()
+
+
+def _category_key(text: str) -> str:
+    return " ".join(text.split()).casefold()
+
+
+def _parse_category_aliases(raw: str) -> dict[str, tuple[str, ...]]:
+    """``CALENDAR_CATEGORY_ALIASES``: ``Family=가족|집,Teaching=강의|수업`` -> ``{"family": ("가족", "집"), ...}``."""
+    parsed: dict[str, tuple[str, ...]] = {}
+    for entry in split_csv(raw):
+        label, sep, words = entry.partition("=")
+        if not sep or not label.strip():
+            continue
+        parsed[_category_key(label)] = tuple(w.strip() for w in words.split("|") if w.strip())
+    return parsed
+
+
+def get_calendar_categories(env: Mapping[str, str] | None = None) -> list[CalendarCategory]:
+    """``CALENDAR_CATEGORIES``: the categories to choose from (empty list: categories are off).
+
+    Unset means ``DEFAULT_CALENDAR_CATEGORIES``; an empty value turns them off.
+    Entries are comma-separated, each a calendar name (``Research``) or
+    ``label=calendar name`` (``Family=가족``). Repeated labels are dropped and
+    at most ``MAX_CALENDAR_CATEGORIES`` are kept. Aliases come from
+    ``DEFAULT_CATEGORY_ALIASES``; ``CALENDAR_CATEGORY_ALIASES``
+    (``Family=가족|집,Teaching=강의``) replaces them for the labels it names.
+    """
+    raw = _env(env).get("CALENDAR_CATEGORIES")
+    if raw is None:
+        raw = DEFAULT_CALENDAR_CATEGORIES
+    defaults = {_category_key(label): words for label, words in DEFAULT_CATEGORY_ALIASES.items()}
+    overrides = _parse_category_aliases(_get(env, "CALENDAR_CATEGORY_ALIASES"))
+    categories: list[CalendarCategory] = []
+    seen: set[str] = set()
+    for entry in split_csv(raw):
+        label, sep, calendar = entry.partition("=")
+        label = " ".join(label.split())[:MAX_CATEGORY_LABEL_CHARS]
+        calendar = " ".join(calendar.split()) if sep else label
+        key = _category_key(label)
+        if not label or not calendar or key in seen:
+            continue
+        seen.add(key)
+        aliases = overrides.get(key, defaults.get(key, ()))
+        categories.append(CalendarCategory(label=label, calendar=calendar, aliases=tuple(aliases)))
+        if len(categories) == MAX_CALENDAR_CATEGORIES:
+            break
+    return categories
+
+
 # ---------------------------------------------------------------- Slack
 
 # Member ids start with U (or W on Enterprise Grid); channel ids with C/G,
