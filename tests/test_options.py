@@ -1235,7 +1235,7 @@ def test_prompts_propose_and_end_with_the_exact_question():
     assert "고뭉치가 맡긴 글 맨 앞의 [지금: ...] 줄의 날짜를 기준으로" in SCHEDULE_PROMPT
     assert "고뭉치에게 그대로 보고하고" in SCHEDULE_PROMPT
     # 업뎃 handles notes directly, but its subagent under 고뭉치 never proposes.
-    assert "아래 '메모로 일정 추가'대로 직접 처리한다" in direct["update"]
+    assert "아래 '메모로 일정 추가'대로, 사진을 보내면 아래 '사진으로 일정 추가'대로 직접 처리한다" in direct["update"]
     assert "propose_calendar_events" not in UPDATE_PROMPT
     assert options().agents["schedule"].prompt == SCHEDULE_PROMPT
     assert SCHEDULE_PROMPT == build_schedule_prompt() + build_propose_section()
@@ -1455,3 +1455,134 @@ def test_chat_sends_anything_else_to_the_agent_with_categories(chat, monkeypatch
     asked, created, store, prompts = chat(["메모", "1번은 Research로", "5", "종료"], {"메모", "1번은 Research로"})
     assert prompts == ["메모", "1번은 Research로"]
     assert [(p["id"], p["chosen_category"]) for p in created] == [("1번은 Research로", "Event-KHU")]
+
+
+# ---------------------------------------------------------------- photos -> calendar: run_turn and --image
+
+import base64  # noqa: E402
+
+from mungchi import images as image_prep  # noqa: E402
+
+
+class ImageSDKClient(FakeSDKClient):
+    """Records what ``query`` got: a string, or the messages of a streaming-input iterable."""
+
+    async def query(self, prompt, session_id="default"):
+        if isinstance(prompt, str):
+            self.prompts.append(prompt)
+            return
+        async for message in prompt:
+            self.prompts.append(message)
+
+
+@pytest.fixture
+def image_sdk(monkeypatch):
+    FakeSDKClient.instances = []
+    monkeypatch.setattr(main_module, "ClaudeSDKClient", ImageSDKClient)
+    return ImageSDKClient
+
+
+PHOTO = ("image/jpeg", b"\xff\xd8\xff\xe0fake-jpeg")
+
+
+def test_run_turn_sends_images_as_content_blocks_in_the_sdk_streaming_format(image_sdk):
+    result = asyncio.run(run_turn("이 포스터 일정 넣어줘", persona="update", resume="sess-1", images=[PHOTO, ("image/png", b"png")]))
+    assert result.text.endswith("변경 없음")
+    [client] = image_sdk.instances
+    [message] = client.prompts
+    assert set(message) == {"type", "message", "parent_tool_use_id"} and message["type"] == "user"
+    assert message["parent_tool_use_id"] is None and message["message"]["role"] == "user"
+    first, second, text = message["message"]["content"]
+    assert first == {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": base64.b64encode(PHOTO[1]).decode()}}
+    assert second["source"]["media_type"] == "image/png"
+    assert text["type"] == "text" and without_now_line(text["text"]) == "이 포스터 일정 넣어줘"  # the time stamp first
+    assert client.options.resume == "sess-1"  # a photo turn continues the thread's session like any other
+
+
+def test_a_photo_without_text_asks_for_its_events(image_sdk):
+    asyncio.run(run_turn("  ", persona="schedule", images=[PHOTO]))
+    [message] = image_sdk.instances[0].prompts
+    assert without_now_line(message["message"]["content"][-1]["text"]) == "이 이미지에 있는 일정을 캘린더에 등록해줘"
+    assert image_prep.DEFAULT_IMAGE_PROMPT == "이 이미지에 있는 일정을 캘린더에 등록해줘"
+
+
+def test_text_turns_are_still_plain_strings(image_sdk):
+    asyncio.run(run_turn("질문", persona="update"))
+    asyncio.run(run_turn("질문", persona="update", images=[]))
+    assert all(isinstance(p, str) for c in image_sdk.instances for p in c.prompts)
+
+
+def test_only_direct_personas_take_images_and_at_most_five(image_sdk):
+    with pytest.raises(ValueError, match="업뎃이나 일정에게만"):
+        asyncio.run(run_turn("q", persona="mungchi", images=[PHOTO]))
+    with pytest.raises(ValueError, match="5장까지만"):
+        asyncio.run(run_turn("q", persona="update", images=[PHOTO] * 6))
+    assert image_sdk.instances == []  # nothing was started
+
+
+def test_direct_prompts_explain_photos_and_moongchi_never_gets_them():
+    for persona in ("update", "schedule"):
+        prompt = build_options(env={}, persona=persona).system_prompt
+        section = prompt[prompt.index("## 사진으로 일정 추가") : prompt.index("## 지금 시각")]
+        assert "날짜, 시각, 제목, 장소, 발표자" in section and "한국어와 영어를 모두 읽는다" in section
+        assert "지어내지 않고" in section and "미리보기 뒤에 묻는다" in section
+        assert "suggested_category를 추천해 propose_calendar_events를 한 번 부르고" in section
+        assert "사진에 일정이 없으면" in section and "한 줄로 답한다" in section
+        assert "Agent" not in section
+    assert "## 사진으로 일정 추가" not in options().system_prompt
+    assert "## 사진으로 일정 추가" not in SCHEDULE_PROMPT and "## 사진으로 일정 추가" not in UPDATE_PROMPT
+
+
+def _photo_file(tmp_path, name="poster.jpg", size=(2000, 1500)):
+    from PIL import Image
+
+    path = tmp_path / name
+    Image.new("RGB", size, "white").save(path, format="JPEG" if name.endswith(".jpg") else "PNG")
+    return str(path)
+
+
+def test_cli_image_option_rules(tmp_path, capsys):
+    parser = build_parser()
+    assert parser.parse_args(["--agent", "update", "--image", "a.jpg", "--image", "b.png"]).image == ["a.jpg", "b.png"]
+    assert "--image" in parser.format_help() and "최대 5장" in parser.format_help()
+    for argv, message in (
+        (["--image", "a.jpg"], "--image는 --agent update 또는 --agent schedule과 함께 써야 합니다"),
+        (["--agent", "update", *sum((["--image", f"{i}.jpg"] for i in range(6)), [])], "--image는 5장까지만 쓸 수 있습니다"),
+        (["--brief", "--image", "a.jpg"], "--image는 --brief"),
+        (["--agent", "update", "--image", "a.jpg", "slack"], "--image는 --brief"),
+    ):
+        with pytest.raises(SystemExit) as caught:
+            main(argv)
+        assert caught.value.code == 2 and message in capsys.readouterr().err
+
+
+def test_cli_image_one_shot_sends_the_prepared_photos(image_sdk, tmp_path, capsys):
+    photo = _photo_file(tmp_path)
+    assert main(["--agent", "update", "--image", photo, "Research로 넣을 거야"]) == 0
+    [client] = image_sdk.instances
+    [message] = client.prompts
+    image_block, text = message["message"]["content"]
+    assert image_block["source"]["media_type"] == "image/jpeg"
+    from PIL import Image
+
+    assert Image.open(io.BytesIO(base64.b64decode(image_block["source"]["data"]))).size == (1568, 1176)
+    assert without_now_line(text["text"]) == "Research로 넣을 거야"
+    assert client.options.system_prompt == build_options(env={}, persona="update").system_prompt
+
+
+def test_cli_image_errors_are_korean_and_exit_1(image_sdk, tmp_path, capsys):
+    assert main(["--agent", "schedule", "--image", str(tmp_path / "missing.jpg"), "q"]) == 1
+    assert "[오류] 사진 파일을 찾을 수 없어요" in capsys.readouterr().err and image_sdk.instances == []
+
+
+def test_cli_image_chat_mode_sends_the_photos_with_the_first_message_only(image_sdk, tmp_path, monkeypatch, capsys):
+    photo = _photo_file(tmp_path, "a.png", (100, 80))
+    lines = iter(["", "고마워", "종료"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(lines))
+    assert main(["--agent", "schedule", "--image", photo]) == 0
+    [client] = image_sdk.instances
+    first, second = client.prompts
+    assert [b["type"] for b in first["message"]["content"]] == ["image", "text"]
+    assert without_now_line(first["message"]["content"][-1]["text"]) == "이 이미지에 있는 일정을 캘린더에 등록해줘"
+    assert isinstance(second, str) and without_now_line(second) == "고마워"
+    assert "사진 1장을 첫 메시지와 함께 보냅니다" in capsys.readouterr().out

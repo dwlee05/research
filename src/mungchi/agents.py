@@ -10,7 +10,8 @@ and ``get_weather``); Dropbox and the calendar stay delegated.
 
 A note pasted to put in the calendar is turned into a proposal
 (``propose_calendar_events``) by 업뎃 or 일정 answering directly, or by the
-일정 subagent when 고뭉치 delegates it. The agent only suggests a category
+일정 subagent when 고뭉치 delegates it; a photo sent to 업뎃 or 일정 directly
+is read the same way (``IMAGE_SECTION``). The agent only suggests a category
 (Family, Teaching, Research, Event-Outside, Event-KHU); nobody can create
 events: code does, after the user picks the category (or says "네").
 """
@@ -361,6 +362,17 @@ def build_propose_section(*, direct: bool = False) -> str:
     return _PROPOSE_BODY.format(**_PROPOSE_FRAMING["direct" if direct else "subagent"], confirm=CONFIRM_QUESTION)
 
 
+# Only 업뎃 and 일정 answering directly ever get photos (Slack, ``--image``).
+IMAGE_SECTION = """
+## 사진으로 일정 추가
+사용자 메시지에 사진(포스터, 이메일·메신저 화면, 시간표 등)이 함께 오면:
+1. 사진에 보이는 일정을 빠짐없이 뽑는다: 날짜, 시각, 제목, 장소, 발표자. 한국어와 영어를 모두 읽는다.
+2. 연도와 시각은 위 '메모로 일정 추가'와 같은 규칙으로 정한다. 사진에 없거나 흐려서 읽을 수 없는 날짜·시각·장소는 지어내지 않고 비워 둔 채 미리보기 뒤에 묻는다.
+3. 그다음은 메모와 똑같다: suggested_category를 추천해 propose_calendar_events를 한 번 부르고(source_note에는 사진에서 읽은 일정 글을 그대로 적는다), 결과의 preview와 confirm_question으로 끝낸다.
+4. 사진에 일정이 없으면 propose_calendar_events를 부르지 말고 "사진에서 일정을 찾지 못했어요."처럼 한 줄로 답한다.
+"""
+
+
 # Only in the direct version: the user talks to 업뎃 / 일정 without 고뭉치.
 _CREDITS_NOTE = (
     "- 이 시스템에서 '토큰'·'크레딧'은 Chat KHU(Mindlogic) API 크레딧을 말한다(암호화폐가 아님. "
@@ -372,7 +384,7 @@ _DIRECT_TAIL = {
     UPDATE: """\
 
 ## 대화
-- 공저자 업데이트와 상관없는 요청은 직접 처리하지 않는다. 일정·약속·날씨는 '일정' 에이전트, 종합 브리핑은 고뭉치 담당이라고 짧게 안내한다. 단, 메모를 붙여 넣고 캘린더에 넣어 달라고 하면(또는 날짜·시간이 든 메모·공지를 붙여 넣으면) 아래 '메모로 일정 추가'대로 직접 처리한다.
+- 공저자 업데이트와 상관없는 요청은 직접 처리하지 않는다. 일정·약속·날씨는 '일정' 에이전트, 종합 브리핑은 고뭉치 담당이라고 짧게 안내한다. 단, 메모를 붙여 넣고 캘린더에 넣어 달라고 하면(또는 날짜·시간이 든 메모·공지를 붙여 넣으면) 아래 '메모로 일정 추가'대로, 사진을 보내면 아래 '사진으로 일정 추가'대로 직접 처리한다.
 """
     + _CREDITS_NOTE
     + """\
@@ -445,7 +457,7 @@ def build_direct_prompt(persona: str) -> str:
         body = build_schedule_prompt(direct=True)
     else:
         raise ValueError(f"no direct prompt for persona {persona!r}")
-    return body + _DIRECT_TAIL[persona] + build_propose_section(direct=True) + _DIRECT_OUTPUT
+    return body + _DIRECT_TAIL[persona] + build_propose_section(direct=True) + IMAGE_SECTION + _DIRECT_OUTPUT
 
 
 def build_agents() -> dict[str, AgentDefinition]:

@@ -51,6 +51,10 @@ def _no_network(self, request):
     raise httpx.ConnectError("tests never use the network", request=request)
 
 
+async def _no_network_async(self, request):
+    raise httpx.ConnectError("tests never use the network", request=request)
+
+
 @pytest.fixture(autouse=True)
 def isolated_env(monkeypatch: pytest.MonkeyPatch, tmp_path):
     """No real credentials leak into tests and no state is written to the repo.
@@ -61,8 +65,8 @@ def isolated_env(monkeypatch: pytest.MonkeyPatch, tmp_path):
 
     The briefing's weather line (on by default) is off here so the briefing
     tests see the header, the answer and the credits only; the weather tests
-    turn it on themselves. A real httpx request (one not given a
-    ``MockTransport``) fails as if offline instead of reaching the internet.
+    turn it on themselves. A real httpx request, sync or async (one not given
+    a ``MockTransport``), fails as if offline instead of reaching the internet.
     git is never run either: the running-version lookup sees no git (the
     package version) unless a test gives it a fake git.
     """
@@ -70,6 +74,7 @@ def isolated_env(monkeypatch: pytest.MonkeyPatch, tmp_path):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("BRIEF_WEATHER", "off")
     monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _no_network)
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", _no_network_async)
     monkeypatch.setattr(version, "run_git", lambda args, **kwargs: None)
     monkeypatch.setattr(config, "current_platform", lambda: "linux")
     monkeypatch.chdir(tmp_path)

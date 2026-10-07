@@ -11,6 +11,12 @@ agent turn: a category picked by number or name ("2", "Research", "khu"),
 buttons posted under the preview. The events are created, or the proposal
 dropped.
 
+A photo (poster, email screenshot, timetable) sent to 업뎃 or 일정 (a mention
+with an image, or a DM) is downloaded with the bot token, shrunk in memory
+(``images``) and sent to the agent with the text, which proposes its events
+like a pasted note. The allow-list is checked before anything is
+downloaded. 고뭉치 points photos to 업뎃 / 일정 without an agent turn.
+
 One process runs up to three Slack apps, one per persona: 고뭉치 (@moongchi,
 the orchestrator), 업뎃 (@update) and 일정 (@schedule), each with its own
 ``AsyncApp`` and Socket Mode connection. They share the allow-list, the
@@ -35,11 +41,13 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
+from urllib.parse import urlsplit
 
+import httpx
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 
-from . import briefing, config, credits, quick_info, version, weather
+from . import briefing, config, credits, images, quick_info, version, weather
 from .briefing import BRIEF_CRASH_TEXT, Briefing, build_briefing
 from .main import TurnResult, run_turn
 from .personas import MUNGCHI, PERSONA_LABELS, PERSONAS, SCHEDULE, SLACK_HANDLES, UPDATE, josa
@@ -66,6 +74,8 @@ WeatherText = Callable[[], str]
 BriefingBuilder = Callable[..., Awaitable[Briefing]]
 # ``event_proposals.create_proposal_events``-like (blocking: run in a worker thread).
 EventCreator = Callable[[Mapping[str, Any]], event_proposals.CreationOutcome]
+# ``download_slack_file``-like: (url_private_download, bot token) -> the file's bytes.
+FileFetcher = Callable[[str, str], Awaitable[bytes]]
 
 REFUSAL_TEXT = "죄송하지만 이 봇은 소유자만 사용할 수 있어요."
 FRESH_SESSION_NOTE = "이 스레드의 이전 대화는 이어 갈 수 없어서, 다음 메시지부터는 새 대화로 시작해요."
@@ -82,6 +92,11 @@ STALE_ACTION_TEXT = "이미 처리됐거나 만료된 요청이에요"
 BUTTONS_ANSWERED_TEXT = "버튼 대신 답장으로 처리했어요."
 BUTTONS_REPLACED_TEXT = "새 메시지가 와서 이 제안은 닫았어요."
 MAX_BUTTON_TEXT_CHARS = 75
+# Photos: 고뭉치 does not read them; 업뎃 and 일정 do.
+IMAGE_REDIRECT_TEXT = "사진 속 일정 등록은 @업뎃이나 @일정에게 보내주세요"
+FILE_SHARE_SUBTYPE = "file_share"
+NO_IMAGE_READ_TEXT = "보낸 사진을 하나도 읽지 못했어요."
+FILE_DOWNLOAD_TIMEOUT_SECONDS = 30.0
 
 # Low-credit alert inside the running bots: first check shortly after start, then hourly.
 CREDIT_CHECK_FIRST_DELAY_SECONDS = 60.0
@@ -208,6 +223,63 @@ def compose_reply(result: TurnResult, persona: str = MUNGCHI) -> str:
 def to_slack_chunks(text: str) -> list[str]:
     """Final outgoing text: secrets scrubbed, mrkdwn safety net, Slack-sized chunks."""
     return chunk_text(to_mrkdwn(scrub(text)))
+
+
+class FileDownloadError(RuntimeError):
+    """A Slack file could not be downloaded; ``str()`` is a short Korean reason (never the token or the URL)."""
+
+    def __init__(self, reason: str, *, missing_scope: bool = False):
+        super().__init__(reason)
+        self.missing_scope = missing_scope
+
+
+def is_slack_file_url(url: str) -> bool:
+    """Only Slack's own https file hosts ever get the bot token."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    host = (parts.hostname or "").lower()
+    return parts.scheme == "https" and (host == "slack.com" or host.endswith(".slack.com"))
+
+
+async def download_slack_file(
+    url: str,
+    token: str,
+    *,
+    max_bytes: int = images.MAX_FILE_BYTES,
+    transport: httpx.AsyncBaseTransport | None = None,
+    timeout: float = FILE_DOWNLOAD_TIMEOUT_SECONDS,
+) -> bytes:
+    """A Slack file's bytes (``url_private_download`` with ``Authorization: Bearer <bot token>``), in memory.
+
+    Refuses anything that is not a Slack https address, stops reading past
+    ``max_bytes``, and turns Slack's HTML sign-in page (what a token without
+    ``files:read`` gets) into ``FileDownloadError(missing_scope=True)``. Errors
+    never carry the token or the URL. httpx drops the token on a redirect to
+    another host.
+    """
+    if not is_slack_file_url(url):
+        raise FileDownloadError("Slack 파일 주소가 아니에요")
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, transport=transport) as client:
+            async with client.stream("GET", url, headers={"Authorization": f"Bearer {token}"}) as response:
+                if response.status_code != 200:
+                    raise FileDownloadError(f"HTTP {response.status_code}")
+                if response.headers.get("content-type", "").lower().startswith("text/html"):
+                    raise FileDownloadError("files:read 권한이 없어요", missing_scope=True)
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in response.aiter_bytes():
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise FileDownloadError(images.TOO_BIG_TEXT)
+                    chunks.append(chunk)
+    except FileDownloadError:
+        raise
+    except httpx.HTTPError as exc:
+        raise FileDownloadError(type(exc).__name__) from None
+    return b"".join(chunks)
 
 
 def _button(action_id: str, text: str, value: Mapping[str, Any], *, primary: bool = False) -> dict[str, Any]:
@@ -462,6 +534,8 @@ class SlackHandler:
         briefing_builder: BriefingBuilder | None = None,
         proposals: StateStore | None = None,
         create_events: EventCreator | None = None,
+        bot_token: str | None = None,
+        file_fetcher: FileFetcher | None = None,
     ):
         self.allowed_user_ids = frozenset(allowed_user_ids)
         if not self.allowed_user_ids:
@@ -488,6 +562,9 @@ class SlackHandler:
         # and what creates their events once confirmed (the Calendar app adapter).
         self.proposals = proposals or StateStore(config.get_state_path())
         self.create_events = create_events or event_proposals.create_proposal_events
+        # Photos are downloaded with this bot's own token (never logged).
+        self.bot_token = bot_token if bot_token is not None else getattr(client, "token", None)
+        self.file_fetcher = file_fetcher or download_slack_file
         # Threads with an agent turn running or queued: a "네" sent meanwhile came
         # before its preview was shown, so it never confirms anything.
         self._turns: dict[str, int] = {}
@@ -506,7 +583,10 @@ class SlackHandler:
         """Why an event is skipped, or None if it should be handled."""
         if source == "dm" and event.get("channel_type") != "im":
             return "not_dm"
-        if event.get("subtype"):
+        subtype = event.get("subtype")
+        # A photo sent in a DM arrives as a message with the file_share subtype;
+        # edits, joins and every other subtype are still skipped.
+        if subtype and subtype != FILE_SHARE_SUBTYPE:
             return "subtype"
         if event.get("bot_id") or event.get("bot_profile"):
             return "bot"
@@ -559,6 +639,10 @@ class SlackHandler:
         # The user's text without this bot's mention; empty means 고뭉치's briefing
         # or ``default_prompt()``.
         request = strip_mention(str(event.get("text") or ""), self.bot_user_id)
+        # Photos (and other files) attached to the message. Checked after the allow-list.
+        files = [file for file in (event.get("files") or []) if isinstance(file, Mapping)]
+        if files and await self._answer_files(channel, thread_ts, request, files):
+            return
         # The answer to a calendar proposal waiting in this thread (a category,
         # "네", "아니요"): code only.
         if await self._answer_proposal(channel, thread_ts, request):
@@ -770,6 +854,73 @@ class SlackHandler:
         if not await self._apply_answer(channel, thread_ts, pending, answer, deliver):
             await self._ephemeral(channel, user, thread_ts, STALE_ACTION_TEXT)
 
+    # -- photos -> calendar (업뎃 and 일정)
+
+    async def _answer_files(self, channel: str, thread_ts: str, request: str, files: list[Mapping[str, Any]]) -> bool:
+        """A message with files. True: handled here; False: go on with its text as before.
+
+        업뎃 / 일정: up to 5 images go to the agent with the text (``_answer``
+        with ``files``); notes about skipped files are posted first. 고뭉치:
+        an image gets ``IMAGE_REDIRECT_TEXT`` (no agent turn). Files without
+        any image: a short note, then the text (if any) as an ordinary message.
+        """
+        selection = images.select_images(files)
+        log.info(
+            "%s: 스레드 %s:%s 파일 %d개 (읽을 사진 %d장)", self.texts.label, channel, thread_ts, len(files), len(selection.images)
+        )
+        if self.persona == MUNGCHI and selection.any_image:
+            await self._post_shortcut(channel, thread_ts, IMAGE_REDIRECT_TEXT)
+            return True
+        if selection.notes:
+            await self._post_shortcut(channel, thread_ts, "\n".join(selection.notes))
+        if not selection.images:
+            return not request
+        await self._replace_proposal(channel, thread_ts)
+        await self._answer(channel, thread_ts, request, files=selection.images)
+        return True
+
+    async def _full_file(self, file: Mapping[str, Any]) -> Mapping[str, Any]:
+        """The file object with its download address (``files.info`` when the event left it out)."""
+        if (file.get("url_private_download") or file.get("url_private")) and file.get("file_access") != "check_file_info":
+            return file
+        file_id = file.get("id")
+        if not file_id:
+            return file
+        response = await self.client.files_info(file=file_id)
+        full = response.get("file") if response is not None else None
+        return full if isinstance(full, Mapping) else file
+
+    async def _fetch_images(self, files: list[Mapping[str, Any]]) -> tuple[list[images.ImageInput], list[str]]:
+        """Download and prepare the photos, in memory: ``(images for run_turn, Korean notes about failures)``."""
+        prepared: list[images.ImageInput] = []
+        notes: list[str] = []
+        for file in files:
+            name = images.short_name(file.get("name") or file.get("title"))
+            try:
+                full = await self._full_file(file)
+                url = str(full.get("url_private_download") or full.get("url_private") or "")
+                if not url or not self.bot_token:
+                    raise FileDownloadError("파일 주소나 봇 토큰이 없어요")
+                data = await self.file_fetcher(url, self.bot_token)
+                prepared.append(await asyncio.to_thread(images.prepare_image, data, images.file_mimetype(full)))
+                del data
+            except images.ImageError as exc:
+                notes.append(f"{name}: {exc}")
+            except FileDownloadError as exc:
+                log.warning("%s 봇: 사진을 받지 못했습니다: %s", self.texts.label, scrub(str(exc)))
+                if exc.missing_scope:
+                    notes.append(
+                        f"{name}: 봇에 files:read 권한이 없어 사진을 받지 못했어요. "
+                        f"slack_manifests/{self.texts.handle}.yaml대로 권한을 주고 앱을 다시 설치하세요."
+                    )
+                else:
+                    notes.append(f"{name}: 사진을 받지 못했어요 ({scrub(str(exc))}).")
+            except Exception as exc:  # noqa: BLE001 - one photo failing never stops the others
+                log.warning("%s 봇: 사진을 받지 못했습니다: %s", self.texts.label, safe_error(exc, redact_urls=True))
+                notes.append(f"{name}: 사진을 받지 못했어요 ({type(exc).__name__}).")
+        log.info("%s: 사진 %d장 준비, %d장 실패", self.texts.label, len(prepared), len(notes))
+        return prepared, notes
+
     # -- weather and credit shortcuts (no agent turn, no LLM call, no session)
     #
     # The reply goes into the thread; the thread -> session map is not touched.
@@ -877,7 +1028,9 @@ class SlackHandler:
             if entry[1] == 0:
                 self._locks.pop(key, None)
 
-    async def _answer(self, channel: str, thread_ts: str, prompt: str) -> None:
+    async def _answer(
+        self, channel: str, thread_ts: str, prompt: str, *, files: list[Mapping[str, Any]] | None = None
+    ) -> None:
         key = self._conversation_key(channel, thread_ts)
         # Counted before the first await, so a "네" arriving meanwhile sees it.
         self._turns[key] = self._turns.get(key, 0) + 1
@@ -886,14 +1039,31 @@ class SlackHandler:
             # Messages in one thread run in order per bot; all bots share the cost cap.
             async with self._thread_lock(f"{self.persona}:{channel}:{thread_ts}"):
                 async with self._semaphore:
-                    await self._run_and_reply(channel, thread_ts, placeholder, prompt)
+                    await self._run_and_reply(channel, thread_ts, placeholder, prompt, files=files)
         finally:
             self._turns[key] -= 1
             if not self._turns[key]:
                 del self._turns[key]
 
-    async def _run_and_reply(self, channel: str, thread_ts: str, placeholder: str | None, prompt: str) -> None:
+    async def _run_and_reply(
+        self,
+        channel: str,
+        thread_ts: str,
+        placeholder: str | None,
+        prompt: str,
+        *,
+        files: list[Mapping[str, Any]] | None = None,
+    ) -> None:
         persona, label = self.persona, self.texts.label
+        # Photos: downloaded and shrunk here (in memory), sent with the text as image blocks.
+        run_extra: dict[str, Any] = {}
+        image_notes: list[str] = []
+        if files:
+            prepared, image_notes = await self._fetch_images(files)
+            if not prepared:
+                await self._finish(channel, thread_ts, placeholder, to_slack_chunks("\n".join([NO_IMAGE_READ_TEXT, *image_notes])))
+                return
+            run_extra["images"] = prepared
         resume = self.sessions.get(channel, thread_ts, persona=persona)
         # Only 고뭉치 shows progress ("→ 업뎃에게 맡기는 중..."); 업뎃 and 일정
         # keep their placeholder until the answer replaces it.
@@ -915,8 +1085,9 @@ class SlackHandler:
                 on_status=updater,
                 extra_system_prompt=SLACK_FORMAT_PROMPT,
                 persona=persona,
-                # A calendar proposal made in this turn waits for "네" in this thread, for this bot.
+                # A calendar proposal made in this turn waits for the answer in this thread, for this bot.
                 conversation_key=self._conversation_key(channel, thread_ts),
+                **run_extra,
             )
         except Exception as exc:  # noqa: BLE001 - reported in Slack without details
             crash = exc
@@ -936,6 +1107,8 @@ class SlackHandler:
             return
 
         reply = compose_reply(result, persona)
+        if image_notes:
+            reply += "\n\n" + "\n".join(f"⚠️ {note}" for note in image_notes)
         if result.session_id:
             remember_session(self.sessions, channel, thread_ts, result.session_id, persona=persona)
         elif resume and result.failed:
@@ -1040,6 +1213,7 @@ def build_app(
         max_concurrent=cfg.max_concurrent,
         semaphore=semaphore,
         our_bot_user_ids=our_bot_user_ids,
+        bot_token=bot.bot_token,
     )
     register_listeners(app, handler)
     return app, handler

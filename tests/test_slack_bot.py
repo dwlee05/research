@@ -88,6 +88,8 @@ class FakeRun:
         self.calls: list[dict] = []
         # The conversation key each run was bound to (where a calendar proposal would wait).
         self.keys: list[str | None] = []
+        # The images each run was given (None: a text-only run, as before).
+        self.images: list[list | None] = []
         self.active = 0
         self.max_active = 0
 
@@ -101,7 +103,9 @@ class FakeRun:
         persona="mungchi",
         briefing=False,
         conversation_key=None,
+        images=None,
     ):
+        self.images.append(images)
         self.calls.append(
             {
                 "prompt": prompt,
@@ -718,7 +722,7 @@ def test_slack_manifest_requests_only_needed_scopes(name):
     text = _manifest(name)
     lines = text.splitlines()
     assert sorted(_manifest_list(lines, "bot")) == sorted(
-        ["app_mentions:read", "chat:write", "im:history", "im:read", "im:write"]
+        ["app_mentions:read", "chat:write", "files:read", "im:history", "im:read", "im:write"]
     )
     assert sorted(_manifest_list(lines, "bot_events")) == ["app_mention", "message.im"]
     assert "socket_mode_enabled: true" in text
@@ -2992,3 +2996,270 @@ def test_slack_manifests_enable_interactivity_for_the_buttons(name):
     text = _manifest(name)
     assert re.search(r"^  interactivity:\n    is_enabled: true$", text, re.MULTILINE)
     assert "request_url" not in text  # Socket Mode: no public URL
+
+
+# ---------------------------------------------------------------- photos -> calendar
+
+import io  # noqa: E402
+
+import httpx  # noqa: E402
+from PIL import Image  # noqa: E402
+
+from mungchi import images as image_prep  # noqa: E402
+
+
+def jpeg_bytes(size=(2400, 1800), color="white") -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", size, color).save(buffer, format="JPEG")
+    return buffer.getvalue()
+
+
+def slack_file(name="poster.jpg", mimetype="image/jpeg", size=50_000, **extra):
+    file = {
+        "id": f"F-{name}",
+        "name": name,
+        "mimetype": mimetype,
+        "size": size,
+        "url_private": f"https://files.slack.com/files-pri/T1-F1/{name}",
+        "url_private_download": f"https://files.slack.com/files-pri/T1-F1/download/{name}",
+    }
+    return {**file, **extra}
+
+
+class FakeFetcher:
+    """Stands in for download_slack_file: records (url, token) and returns image bytes."""
+
+    def __init__(self, data=None, error=None):
+        self.data = data or jpeg_bytes()
+        self.error = error
+        self.calls: list[tuple[str, str]] = []
+
+    async def __call__(self, url, token):
+        self.calls.append((url, token))
+        if self.error is not None:
+            raise self.error
+        return self.data
+
+
+def photo_handler(tmp_path, persona="update", run=None, fetcher=None, **kwargs):
+    fetcher = fetcher or FakeFetcher()
+    handler, client, run, app, store = proposal_handler(
+        tmp_path, persona, run=run, bot_token=SLACK_TOKEN, file_fetcher=fetcher, **kwargs
+    )
+    return handler, client, run, fetcher, store
+
+
+def photo_dm(text="", files=None, **extra):
+    return dm(text, subtype="file_share", files=files if files is not None else [slack_file()], **extra)
+
+
+def test_file_share_messages_in_dms_and_mentions_with_files_are_handled(tmp_path):
+    handler, client, run, fetcher, store = photo_handler(tmp_path)
+    assert handler.ignore_reason(photo_dm(), "dm") is None
+    assert handler.ignore_reason(mention("<@UBOT> 이거", files=[slack_file()]), "mention") is None
+    assert handler.ignore_reason(mention("<@UBOT>", subtype="file_share", files=[slack_file()]), "mention") is None
+    for subtype in ("message_changed", "message_deleted", "channel_join", "bot_message", "thread_broadcast"):
+        assert handler.ignore_reason(dm(subtype=subtype, files=[slack_file()]), "dm") == "subtype"
+    assert handler.ignore_reason({**photo_dm(), "channel_type": "channel"}, "dm") == "not_dm"
+
+
+def test_a_photo_in_a_dm_goes_to_the_agent_with_the_images_then_buttons(tmp_path):
+    store = StateStore(tmp_path / "state.json")
+    run = CategoryProposingRun(store, TurnResult(text="• 10/22(목) 12:00–13:00 신임교수모임 (10월)\n카테고리를 골라주세요 …", session_id=SESSION_1), statuses=())
+    handler, client, run, fetcher, store = photo_handler(tmp_path, run=run)
+    asyncio.run(handler.handle_event(photo_dm(ts=ROOT, client_msg_id="m-photo"), event_id="Ev1", source="dm"))
+    assert [c["prompt"] for c in run.calls] == [""]  # run_turn fills in "이 이미지에 있는 일정을 캘린더에 등록해줘"
+    [images_given] = run.images
+    [(media_type, data)] = images_given
+    assert media_type == "image/jpeg" and Image.open(io.BytesIO(data)).size == (1568, 1176)  # shrunk before sending
+    assert fetcher.calls == [("https://files.slack.com/files-pri/T1-F1/download/poster.jpg", SLACK_TOKEN)]
+    assert run.keys == [slack_conversation_key("update", DM, ROOT)] and run.calls[0]["persona"] == "update"
+    placeholder, buttons = client.posts
+    assert placeholder["text"] == PLACEHOLDERS["update"] and client.updates[-1]["text"].startswith("• 10/22(목)")
+    assert buttons["blocks"][1]["type"] == "actions"  # the same category buttons as for a pasted note
+    # The same message delivered again (retry) is not downloaded twice.
+    asyncio.run(handler.handle_event(photo_dm(ts=ROOT, client_msg_id="m-photo"), event_id="Ev1", source="dm"))
+    assert len(fetcher.calls) == 1 and len(run.calls) == 1
+
+
+def test_a_mention_with_a_photo_and_text_sends_both(tmp_path):
+    handler, client, run, fetcher, store = photo_handler(tmp_path, persona="schedule")
+    event = mention("<@UBOT> 이 포스터 일정 Research로", files=[slack_file("a.png", "image/png"), slack_file("b.webp", "image/webp")])
+    asyncio.run(handler.handle_event(event, event_id="Ev1", source="mention"))
+    assert [c["prompt"] for c in run.calls] == ["이 포스터 일정 Research로"]
+    assert len(run.images[0]) == 2 and len(fetcher.calls) == 2
+
+
+def test_strangers_photos_are_never_downloaded(tmp_path):
+    handler, client, run, fetcher, store = photo_handler(tmp_path)
+    asyncio.run(handler.handle_event(photo_dm(user=STRANGER), event_id="Ev1", source="dm"))
+    asyncio.run(handler.handle_event(mention("<@UBOT>", user=STRANGER, files=[slack_file()], ts="1700000000.000777"), event_id="Ev2", source="mention"))
+    assert fetcher.calls == [] and run.calls == []
+    assert REFUSAL_TEXT in [p["text"] for p in client.posts]
+
+
+def test_at_most_five_images_are_read_and_skipped_files_are_noted(tmp_path):
+    handler, client, run, fetcher, store = photo_handler(tmp_path)
+    files = [slack_file(f"{i}.jpg") for i in range(6)] + [
+        slack_file("notice.pdf", "application/pdf"),
+        slack_file("huge.png", "image/png", size=image_prep.MAX_FILE_BYTES + 1),
+    ]
+    asyncio.run(handler.handle_event(photo_dm(files=files), event_id="Ev1", source="dm"))
+    assert [url.rsplit("/", 1)[1] for url, _token in fetcher.calls] == ["0.jpg", "1.jpg", "2.jpg", "3.jpg", "4.jpg"]
+    assert len(run.images[0]) == 5
+    note = client.posts[0]["text"]
+    assert "사진은 한 번에 5장까지만 읽어요" in note and "20MB보다 큰 사진은 읽지 않았어요: huge.png" in note
+    assert "읽지 않은 파일: notice.pdf" in note
+
+
+def test_a_pdf_gets_the_images_only_note(tmp_path):
+    handler, client, run, fetcher, store = photo_handler(tmp_path)
+    asyncio.run(handler.handle_event(photo_dm(files=[slack_file("notice.pdf", "application/pdf")]), event_id="Ev1", source="dm"))
+    assert fetcher.calls == [] and run.calls == []
+    [note] = client.posts
+    assert note["text"].startswith("지금은 사진(JPG·PNG·GIF·WebP·HEIC)만 읽을 수 있어요")
+    # With text, the text still goes to the agent as before (without images).
+    asyncio.run(handler.handle_event(photo_dm("이 공지 일정 알려줘", files=[slack_file("n.pdf", "application/pdf")], ts="1700000000.000300"), event_id="Ev2", source="dm"))
+    assert [c["prompt"] for c in run.calls] == ["이 공지 일정 알려줘"] and run.images == [None]
+
+
+def test_moongchi_points_photos_to_update_or_schedule(tmp_path):
+    handler, client, run, fetcher, store = photo_handler(tmp_path, persona="mungchi", briefing_builder=RecordingBuilder())
+    asyncio.run(handler.handle_event(photo_dm(), event_id="Ev1", source="dm"))
+    asyncio.run(handler.handle_event(mention("<@UBOT> 이거 등록해줘", files=[slack_file()], ts="1700000000.000555"), event_id="Ev2", source="mention"))
+    assert [p["text"] for p in client.posts] == ["사진 속 일정 등록은 @업뎃이나 @일정에게 보내주세요"] * 2
+    assert run.calls == [] and fetcher.calls == [] and handler.briefing_builder.calls == []
+    # A file that is not a photo and no text: a note, never the briefing.
+    asyncio.run(handler.handle_event(photo_dm(files=[slack_file("a.pdf", "application/pdf")], ts="1700000000.000600"), event_id="Ev3", source="dm"))
+    assert client.posts[-1]["text"].startswith("지금은 사진") and handler.briefing_builder.calls == []
+
+
+def test_heic_without_pillow_heif_is_a_korean_note_without_an_agent_turn(tmp_path, monkeypatch):
+    monkeypatch.setattr(image_prep, "_heif_registered", False)
+    heic = b"\x00\x00\x00\x18ftypheic" + b"\x00" * 64
+    handler, client, run, fetcher, store = photo_handler(tmp_path, fetcher=FakeFetcher(data=heic))
+    asyncio.run(handler.handle_event(photo_dm(files=[slack_file("IMG_0001.HEIC", "image/heic")]), event_id="Ev1", source="dm"))
+    assert run.calls == []
+    reply = client.updates[-1]["text"]
+    assert reply.startswith("보낸 사진을 하나도 읽지 못했어요.") and "IMG_0001.HEIC: HEIC 사진은 아직 읽을 수 없어요" in reply
+
+
+def test_one_failed_photo_is_noted_under_the_answer(tmp_path):
+    class HalfBroken(FakeFetcher):
+        async def __call__(self, url, token):
+            if url.endswith("bad.jpg"):
+                self.calls.append((url, token))
+                return b"garbage"
+            return await super().__call__(url, token)
+
+    handler, client, run, fetcher, store = photo_handler(tmp_path, fetcher=HalfBroken())
+    asyncio.run(handler.handle_event(photo_dm(files=[slack_file("good.jpg"), slack_file("bad.jpg")]), event_id="Ev1", source="dm"))
+    assert len(run.images[0]) == 1
+    assert client.updates[-1]["text"].endswith("⚠️ bad.jpg: 사진을 읽지 못했어요. JPG나 PNG로 다시 보내 주세요.")
+
+
+def test_missing_files_read_scope_is_explained(tmp_path):
+    fetcher = FakeFetcher(error=slack_bot.FileDownloadError("files:read 권한이 없어요", missing_scope=True))
+    handler, client, run, fetcher, store = photo_handler(tmp_path, persona="schedule", fetcher=fetcher)
+    asyncio.run(handler.handle_event(photo_dm(), event_id="Ev1", source="dm"))
+    assert run.calls == []
+    assert "봇에 files:read 권한이 없어 사진을 받지 못했어요. slack_manifests/schedule.yaml대로" in client.updates[-1]["text"]
+
+
+def test_a_file_without_its_address_is_looked_up_with_files_info(tmp_path):
+    class InfoClient(FakeSlackClient):
+        async def files_info(self, **kwargs):
+            self.calls.append(("files_info", dict(kwargs)))
+            return {"ok": True, "file": slack_file("full.jpg")}
+
+    handler, client, run, fetcher, store = photo_handler(tmp_path, client=InfoClient())
+    partial = {"id": "F-full.jpg", "name": "full.jpg", "mimetype": "image/jpeg", "file_access": "check_file_info"}
+    asyncio.run(handler.handle_event(photo_dm(files=[partial]), event_id="Ev1", source="dm"))
+    assert ("files_info", {"file": "F-full.jpg"}) in client.calls
+    assert fetcher.calls == [("https://files.slack.com/files-pri/T1-F1/download/full.jpg", SLACK_TOKEN)]
+
+
+def test_build_app_gives_the_handler_its_own_bot_token(tmp_path, monkeypatch):
+    _no_network(monkeypatch)
+    cfg = config.load_slack_config(ALL_BOTS_ENV)
+    tokens = {bot.persona: bot.bot_token for bot in cfg.bots}
+    for bot, _app, handler in slack_bot.build_apps(cfg, sessions=ThreadSessions(tmp_path / "t.json")):
+        assert handler.bot_token == tokens[bot.persona] and handler.file_fetcher is slack_bot.download_slack_file
+
+
+# -- the real downloader, on a fake transport
+
+
+def _transport(handler):
+    seen: list[httpx.Request] = []
+
+    def handle(request):
+        seen.append(request)
+        return handler(request)
+
+    return httpx.MockTransport(handle), seen
+
+
+def test_download_sends_the_bot_token_only_to_slack(tmp_path):
+    transport, seen = _transport(lambda request: httpx.Response(200, headers={"content-type": "image/jpeg"}, content=b"\xff\xd8data"))
+    url = "https://files.slack.com/files-pri/T1-F1/download/poster.jpg"
+    data = asyncio.run(slack_bot.download_slack_file(url, SLACK_TOKEN, transport=transport))
+    assert data == b"\xff\xd8data"
+    [request] = seen
+    assert request.headers["authorization"] == f"Bearer {SLACK_TOKEN}" and str(request.url) == url
+    for bad in ("http://files.slack.com/x.jpg", "https://evil.example.com/x.jpg", "https://slack.com.evil.io/x.jpg", "ftp://files.slack.com/x"):
+        with pytest.raises(slack_bot.FileDownloadError, match="Slack 파일 주소가 아니에요"):
+            asyncio.run(slack_bot.download_slack_file(bad, SLACK_TOKEN, transport=transport))
+    assert len(seen) == 1  # never sent anywhere else
+
+
+def test_download_failures_are_short_and_never_carry_the_token(caplog):
+    url = "https://files.slack.com/files-pri/T1-F1/download/poster.jpg"
+    login_page, _ = _transport(lambda r: httpx.Response(200, headers={"content-type": "text/html; charset=utf-8"}, content=b"<html>"))
+    with pytest.raises(slack_bot.FileDownloadError) as caught:
+        asyncio.run(slack_bot.download_slack_file(url, SLACK_TOKEN, transport=login_page))
+    assert caught.value.missing_scope and str(caught.value) == "files:read 권한이 없어요"
+    missing, _ = _transport(lambda r: httpx.Response(404))
+    with pytest.raises(slack_bot.FileDownloadError, match="HTTP 404"):
+        asyncio.run(slack_bot.download_slack_file(url, SLACK_TOKEN, transport=missing))
+    big, _ = _transport(lambda r: httpx.Response(200, headers={"content-type": "image/png"}, content=b"x" * 2048))
+    with pytest.raises(slack_bot.FileDownloadError, match="20MB보다 큰 사진"):
+        asyncio.run(slack_bot.download_slack_file(url, SLACK_TOKEN, transport=big, max_bytes=1024))
+
+    def leaky(request):
+        raise httpx.ConnectError(f"cannot connect with {request.headers['authorization']} to {request.url}", request=request)
+
+    broken, _ = _transport(leaky)
+    with pytest.raises(slack_bot.FileDownloadError) as caught:
+        asyncio.run(slack_bot.download_slack_file(url, SLACK_TOKEN, transport=broken))
+    assert str(caught.value) == "ConnectError"
+    assert caught.value.__cause__ is None and caught.value.__suppress_context__  # the httpx error (with the URL) is dropped
+    assert SLACK_TOKEN not in str(caught.value) and url not in str(caught.value)
+
+
+def test_a_failing_download_in_the_handler_never_logs_or_posts_the_token(tmp_path, caplog, monkeypatch):
+    monkeypatch.setenv("SLACK_UPDATE_BOT_TOKEN", SLACK_TOKEN)
+
+    async def leaky_fetch(url, token):
+        raise RuntimeError(f"boom Authorization: Bearer {token} at {url}")
+
+    handler, client, run, fetcher, store = photo_handler(tmp_path, fetcher=leaky_fetch)
+    with caplog.at_level(logging.INFO, logger="mungchi.slack"):
+        asyncio.run(handler.handle_event(photo_dm(), event_id="Ev1", source="dm"))
+    texts = [c[1].get("text", "") for c in client.calls]
+    assert run.calls == [] and any("poster.jpg: 사진을 받지 못했어요 (RuntimeError)" in t for t in texts)
+    assert SLACK_TOKEN not in caplog.text and all(SLACK_TOKEN not in t for t in texts)
+    assert "files-pri" not in caplog.text  # the address is not logged either
+
+
+def test_a_redirect_to_another_host_never_gets_the_token():
+    def handle(request):
+        if request.url.host == "files.slack.com":
+            return httpx.Response(302, headers={"location": "https://cdn.example.net/signed/poster.jpg"})
+        return httpx.Response(200, headers={"content-type": "image/jpeg"}, content=b"\xff\xd8ok")
+
+    transport, seen = _transport(handle)
+    data = asyncio.run(slack_bot.download_slack_file("https://files.slack.com/files-pri/T1-F1/download/p.jpg", SLACK_TOKEN, transport=transport))
+    assert data == b"\xff\xd8ok"
+    first, second = seen
+    assert first.headers["authorization"] == f"Bearer {SLACK_TOKEN}" and "authorization" not in second.headers

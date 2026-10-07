@@ -22,7 +22,7 @@ from .common import MAX_RESULT_SIZE_CHARS, safe_error, tool_result
 TOOL_NAME = "propose_calendar_events"
 
 TOOL_DESCRIPTION = (
-    "붙여 넣은 메모·공지에서 뽑은 일정을 캘린더 추가 '제안'으로 만든다. 캘린더에 추가하지는 않는다: "
+    "붙여 넣은 메모·공지(또는 사진)에서 뽑은 일정을 캘린더 추가 '제안'으로 만든다. 캘린더에 추가하지는 않는다: "
     "사용자가 미리보기를 보고 카테고리를 고르거나 '네'라고 답해야 프로그램이 추가하며, 네가 추가할 방법은 없다. "
     f"events는 1~{event_proposals.MAX_EVENTS}개. 각 일정: title(짧고 알아보기 쉬운 제목), date(YYYY-MM-DD), "
     "start_time·end_time(24시간제 HH:MM, 모르면 null), all_day(종일 여부), location(있으면), notes(발표자 등 메모), "
@@ -76,7 +76,7 @@ INPUT_SCHEMA: dict[str, Any] = {
                 "required": ["title", "date"],
             },
         },
-        "source_note": {"type": "string", "description": "사용자가 붙여 넣은 메모 원문."},
+        "source_note": {"type": "string", "description": "사용자가 붙여 넣은 메모 원문(사진이면 사진에서 읽은 일정 글)."},
         "suggested_category": {
             "type": "string",
             "description": (

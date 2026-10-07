@@ -10,7 +10,7 @@ import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Awaitable, Callable, Mapping, MutableMapping, Sequence, TextIO
+from typing import Any, AsyncIterator, Awaitable, Callable, Mapping, MutableMapping, Sequence, TextIO
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -24,7 +24,7 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
-from . import config
+from . import config, images as image_prep
 from .agents import (
     AGENT_LABELS,
     PERSONA_TOOLS,
@@ -444,14 +444,40 @@ async def _notify(on_status: StatusCallback, line: str) -> None:
         print(f"[경고] 진행 상황을 전하지 못했습니다: {scrub(f'{type(exc).__name__}: {exc}')}", file=sys.stderr)
 
 
+def image_message(text: str, images: Sequence[image_prep.ImageInput]) -> dict[str, Any]:
+    """One user message with image content blocks (base64) first, then ``text``.
+
+    The streaming-input format of the Agent SDK (``ClaudeSDKClient.query``
+    with an async iterable of messages): ``{"type": "user", "message":
+    {"role": "user", "content": [image blocks..., {"type": "text", ...}]}}``.
+    """
+    content: list[dict[str, Any]] = [
+        {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_prep.to_base64(data)}}
+        for media_type, data in images
+    ]
+    content.append({"type": "text", "text": text})
+    return {"type": "user", "message": {"role": "user", "content": content}, "parent_tool_use_id": None}
+
+
+async def _one_message(message: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
+    # Built before the client reads it: an exception inside this generator would
+    # only be logged by the SDK and the turn would hang.
+    yield message
+
+
 async def stream_turn(
     client: ClaudeSDKClient,
     prompt: str,
     renderer: Renderer,
     on_status: StatusCallback | None = None,
+    *,
+    images: Sequence[image_prep.ImageInput] | None = None,
 ) -> TurnResult:
-    """Send one prompt on an open client and feed the reply through ``renderer``."""
-    await client.query(prompt)
+    """Send one prompt (with ``images``, as image content blocks) on an open client and feed the reply through ``renderer``."""
+    if images:
+        await client.query(_one_message(image_message(prompt, images)))
+    else:
+        await client.query(prompt)
     seen = len(renderer.status_lines)
     async for message in client.receive_response():
         renderer.handle(message)
@@ -473,6 +499,7 @@ async def run_turn(
     clock: Clock | None = None,
     briefing: bool = False,
     conversation_key: str | None = None,
+    images: Sequence[image_prep.ImageInput] | None = None,
 ) -> TurnResult:
     """Run one turn of ``persona`` in a fresh session (or ``resume`` an earlier one).
 
@@ -481,8 +508,19 @@ async def run_turn(
     "→ 업뎃에게 맡기는 중...". Without ``renderer`` nothing is printed.
     The prompt is sent with the current time in front (``stamp_prompt``).
     ``briefing=True`` only for briefing runs; ``conversation_key`` is where a
-    calendar proposal made in this turn waits for "네" (see ``build_options``).
+    calendar proposal made in this turn waits for the user's answer (see ``build_options``).
+
+    ``images`` (``(media type, bytes)``, already prepared by
+    ``images.prepare_image``, at most 5) go with the text as image content
+    blocks; only 업뎃 and 일정 answering directly take them. An empty prompt
+    with images asks for the events in them (``images.DEFAULT_IMAGE_PROMPT``).
     """
+    if images:
+        if persona not in DIRECT_PERSONAS:
+            raise ValueError("사진은 업뎃이나 일정에게만 보낼 수 있습니다.")
+        if len(images) > image_prep.MAX_IMAGES:
+            raise ValueError(f"사진은 한 번에 {image_prep.MAX_IMAGES}장까지만 보낼 수 있습니다.")
+        prompt = prompt.strip() or image_prep.DEFAULT_IMAGE_PROMPT
     options = build_options(
         resume=resume,
         extra_system_prompt=extra_system_prompt,
@@ -492,13 +530,15 @@ async def run_turn(
     )
     renderer = renderer or Renderer(echo=False)
     async with ClaudeSDKClient(options=options) as client:
-        return await stream_turn(client, stamp_prompt(prompt, clock), renderer, on_status)
+        return await stream_turn(client, stamp_prompt(prompt, clock), renderer, on_status, images=images)
 
 
-async def run_once(prompt: str, persona: str = MUNGCHI) -> int:
+async def run_once(
+    prompt: str, persona: str = MUNGCHI, images: Sequence[image_prep.ImageInput] | None = None
+) -> int:
     # No conversation key: a calendar proposal is shown but never stored, since
     # nobody can answer "네" to a one-shot question.
-    result = await run_turn(prompt, renderer=Renderer(), persona=persona)
+    result = await run_turn(prompt, renderer=Renderer(), persona=persona, images=images)
     if result.proposed:
         print(f"[참고] {event_proposals.ONE_SHOT_NOTE}", file=sys.stderr)
     return 1 if result.failed else 0
@@ -568,15 +608,24 @@ async def run_chat(
     conversation_key: str | None = None,
     store: StateStore | None = None,
     create: Creator | None = None,
+    images: Sequence[image_prep.ImageInput] | None = None,
 ) -> int:
     """The terminal chat. With ``conversation_key`` (the one bound into ``options``),
-    a turn that proposes calendar events is followed by the category (or yes/no) question."""
+    a turn that proposes calendar events is followed by the category (or yes/no) question.
+    ``images`` (``--image``) go with the first message; an empty first line
+    sends ``images.DEFAULT_IMAGE_PROMPT`` (the events in them)."""
     # One long-lived client keeps the whole conversation in a single session;
     # every line the user types is sent with the current time in front.
     print(CHAT_GREETINGS[persona])
     if conversation_key and store is None:
         store = StateStore(config.get_state_path())
     queued: str | None = None
+    pending_images = list(images or [])
+    if pending_images:
+        print(
+            f"사진 {len(pending_images)}장을 첫 메시지와 함께 보냅니다. "
+            f"그냥 Enter를 누르면 \"{image_prep.DEFAULT_IMAGE_PROMPT}\"로 보냅니다."
+        )
     async with ClaudeSDKClient(options=options) as client:
         while True:
             if queued is not None:
@@ -588,12 +637,15 @@ async def run_chat(
                     print()
                     break
                 prompt = line.strip()
+                if not prompt and pending_images:
+                    prompt = image_prep.DEFAULT_IMAGE_PROMPT
             if not prompt:
                 continue
             if prompt.lower() in EXIT_WORDS:
                 break
             print()
-            await stream_turn(client, stamp_prompt(prompt, clock), Renderer())
+            first_images, pending_images = pending_images, []
+            await stream_turn(client, stamp_prompt(prompt, clock), Renderer(), images=first_images)
             if conversation_key and store is not None:
                 follow_up = await confirm_in_terminal(store, conversation_key, create=create)
                 if follow_up is CHAT_EXIT:
@@ -631,6 +683,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  python -m mungchi slack                 # Slack 봇 실행 (Socket Mode, BRIEF_TIME이 있으면 아침 브리핑도)\n"
             "  python -m mungchi --brief --slack       # 오늘 브리핑을 지금 바로 Slack에 올리기 (아침 브리핑 시험용)\n"
             '  python -m mungchi --agent update "누가 무슨 파일 고쳤어?"   # 업뎃에게 바로 묻기\n'
+            "  python -m mungchi --agent update --image poster.jpg   # 사진 속 일정을 캘린더에 (대화 모드, 첫 메시지에 사진)\n"
+            '  python -m mungchi --agent schedule --image a.png --image b.png "11월 것만"   # 질문 한 번: 미리보기만\n'
             "  python -m mungchi --agent schedule      # '일정'과 바로 대화 (일정, 오늘·내일 날씨)\n"
             '  python -m mungchi --agent schedule "내일 비 오면 일정 바꿔야 할까?"   # 날씨가 걸린 일정 질문\n'
             "  python -m mungchi --list-models         # 쓸 수 있는 모델 ID 확인 (MUNGCHI_MODEL 고르기)\n"
@@ -683,6 +737,16 @@ def build_parser() -> argparse.ArgumentParser:
         choices=list(DIRECT_PERSONAS),
         metavar="{update,schedule}",
         help="고뭉치 대신 업뎃(update) 또는 '일정'(schedule)과 바로 이야기합니다 (질문 한 번 또는 대화 모드)",
+    )
+    opts.add_argument(
+        "--image",
+        action="append",
+        metavar="사진",
+        help=(
+            "--agent와 함께: 사진(JPG·PNG·GIF·WebP·HEIC, 한 장 20MB까지) 속 일정을 읽어 캘린더 추가를 제안합니다. "
+            f"여러 장이면 --image를 되풀이합니다(최대 {image_prep.MAX_IMAGES}장). 질문과 함께 쓰면 미리보기만, "
+            "질문 없이 쓰면 대화 모드의 첫 메시지에 사진을 붙입니다"
+        ),
     )
     opts.add_argument(
         "--list-models",
@@ -815,6 +879,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--dropbox-check는 질문이나 다른 옵션(--brief, --slack, --agent, --list-models, --calendar-setup, slack)과 "
             "함께 쓸 수 없습니다."
         )
+    if args.image and (
+        args.brief
+        or args.slack
+        or args.list_models
+        or args.credits
+        or args.weather
+        or args.calendar_setup
+        or args.dropbox_check
+        or args.question == SLACK_COMMAND
+    ):
+        parser.error(
+            "--image는 --brief, --slack, --list-models, --credits, --weather, --calendar-setup, --dropbox-check, slack과 "
+            "함께 쓸 수 없습니다."
+        )
+    if args.image and not args.agent:
+        parser.error(
+            "--image는 --agent update 또는 --agent schedule과 함께 써야 합니다(사진 속 일정은 업뎃·일정이 읽습니다). "
+            "예: python -m mungchi --agent update --image poster.jpg"
+        )
+    if args.image and len(args.image) > image_prep.MAX_IMAGES:
+        parser.error(f"--image는 {image_prep.MAX_IMAGES}장까지만 쓸 수 있습니다(받은 사진 {len(args.image)}장).")
     if args.hours is not None and not args.dropbox_check:
         parser.error("--hours는 --dropbox-check와 함께 써야 합니다. 예: python -m mungchi --dropbox-check --hours 72")
     if args.hours is not None and args.hours <= 0:
@@ -870,11 +955,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             from .briefing import run_brief_cli
 
             return run_brief_cli()
+        images = None
+        if args.image:
+            try:
+                images = image_prep.load_image_files(args.image)
+            except image_prep.ImageError as exc:
+                print(f"[오류] {exc}", file=sys.stderr)
+                return 1
         if args.question:
-            return asyncio.run(run_once(args.question, persona))
+            return asyncio.run(run_once(args.question, persona, images=images))
         # The chat's own conversation key: a calendar proposal made in it is confirmed in it.
         key = event_proposals.cli_conversation_key()
-        return asyncio.run(run_chat(build_options(persona=persona, conversation_key=key), persona, conversation_key=key))
+        return asyncio.run(
+            run_chat(build_options(persona=persona, conversation_key=key), persona, conversation_key=key, images=images)
+        )
     except KeyboardInterrupt:
         print(f"\n{label}: 중단했습니다.", file=sys.stderr)
         return 130

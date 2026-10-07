@@ -23,6 +23,8 @@ oauth_config:
     bot:
       - app_mentions:read
       - chat:write
+      # 사진 속 일정 등록은 업뎃·일정 봇이 합니다(고뭉치는 사진을 내려받지 않고 안내만). 세 앱의 권한을 같게 둡니다.
+      - files:read
       - im:history
       - im:read
       - im:write

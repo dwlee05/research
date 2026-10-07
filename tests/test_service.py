@@ -1260,7 +1260,7 @@ def test_cli_service_argument_errors_are_korean(capsys, recorded):
 def test_questions_that_merely_mention_service_are_still_questions(monkeypatch):
     asked = []
 
-    async def fake_run_once(prompt, persona="mungchi"):
+    async def fake_run_once(prompt, persona="mungchi", images=None):
         asked.append(prompt)
         return 0
 

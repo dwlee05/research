@@ -17,9 +17,9 @@
  │       └─ 일정 (schedule) ─ 캘린더 일정·날씨 담당
  │            ├─ get_schedule           → Mac 캘린더 앱(EventKit) 또는 ICS 캘린더 (Google·Outlook·iCloud)
  │            ├─ get_weather            → 오늘·내일 날씨와 미세먼지 (Open-Meteo, 키 없음)
- │            └─ propose_calendar_events → 붙여 넣은 메모의 일정을 캘린더 추가 '제안'으로 (추가는 "네" 뒤에 프로그램이)
- ├─ Slack @update (업뎃 봇) · 터미널 --agent update     → 업뎃이 바로 답함 (Dropbox 도구, 메모 → 일정 제안)
- └─ Slack @schedule (일정 봇) · 터미널 --agent schedule → '일정'이 바로 답함 (캘린더·날씨 도구, 메모 → 일정 제안)
+ │            └─ propose_calendar_events → 붙여 넣은 메모의 일정을 캘린더 추가 '제안'으로 (카테고리를 고른 뒤 프로그램이 추가)
+ ├─ Slack @update (업뎃 봇) · 터미널 --agent update     → 업뎃이 바로 답함 (Dropbox 도구, 메모·사진 → 일정 제안)
+ └─ Slack @schedule (일정 봇) · 터미널 --agent schedule → '일정'이 바로 답함 (캘린더·날씨 도구, 메모·사진 → 일정 제안)
 ```
 
 - **고뭉치**는 브리핑을 부탁받으면 업뎃과 '일정'에게 **동시에** 일을 맡기고, 두 보고를 합쳐
@@ -42,8 +42,10 @@
 - 업뎃과 일정은 고뭉치를 거치지 않고 **직접** 부를 수도 있습니다. Slack에서는 각자의 봇(`@update`, `@schedule`)을,
   터미널에서는 `--agent update` / `--agent schedule`을 씁니다. 이때도 자기 도구만 쓰고, 다른 도구나 Agent 도구는 쓸 수 없습니다.
 - 데이터 도구는 프로그램 안에서 도는 SDK MCP 서버(`mungchi`)로 묶여 있고, 모두 **읽기 전용**입니다. 하나뿐인 예외인
-  `propose_calendar_events`도 캘린더 추가 **제안**만 저장하고 캘린더는 건드리지 않습니다. 메모의 일정은 사용자가 미리보기를 보고
-  "네"라고 답한 뒤 **프로그램이** 추가합니다(에이전트가 일정을 추가할 수 있는 도구는 없습니다). 아래 [메모로 일정 추가하기](#메모로-일정-추가하기) 참고.
+  `propose_calendar_events`도 캘린더 추가 **제안**만 저장하고 캘린더는 건드리지 않습니다. 메모(또는 업뎃·일정에게 보낸 사진)의 일정은
+  사용자가 미리보기를 보고 카테고리(Family, Teaching, Research, Event-Outside, Event-KHU)를 고른 뒤 **프로그램이** 추가합니다
+  (에이전트는 카테고리를 추천만 하고, 일정을 추가할 수 있는 도구는 없습니다). 아래 [메모로 일정 추가하기](#메모로-일정-추가하기),
+  [사진으로 일정 등록](#사진으로-일정-등록) 참고.
 - 모델은 `MUNGCHI_MODEL`(기본 `claude-opus-5-5`)이며, 업뎃·일정은 같은 모델을 이어받습니다(`inherit`).
 - 터미널과 Slack은 같은 에이전트를 씁니다. Slack에서 부르는 방법은 아래 [Slack에서 부르기](#slack에서-부르기)를 보세요.
 
@@ -478,7 +480,7 @@ python -m mungchi service --help
 (`✅ Event-KHU 캘린더에 추가했어요 …`)로 바뀌어 두 번 누를 수 없습니다. `SLACK_ALLOWED_USER_IDS`에 없는 사람이 누르면 그 사람에게만
 거절 안내가 보이고 아무것도 하지 않습니다. 이미 처리했거나 24시간이 지났거나 새 미리보기로 바뀐 제안의 버튼은 "이미 처리됐거나 만료된 요청이에요"라고만 답합니다.
 버튼은 앱의 **Interactivity**가 켜져 있어야 동작합니다. 꺼져 있으면 버튼을 눌러도 Slack이 오류를 보여 주지만, 글로 답하는 방법은 그대로 됩니다.
-이미 만든 앱에서 켜는 방법은 [버튼(Interactivity) 켜기](#버튼interactivity-켜기-이미-만든-앱)를 보세요.
+이미 만든 앱에서 켜는 방법은 [이미 만든 앱 고치기](#이미-만든-앱-고치기-버튼사진)를 보세요.
 
 **카테고리를 쓰지 않을 때의 캘린더**(`CALENDAR_CATEGORIES=`): `.env`의 `CALENDAR_WRITE_TARGET`에 캘린더 이름(캘린더 앱 사이드바에 보이는 그대로, 대소문자 무시)을 적으면 그 캘린더에,
 비우면 캘린더 앱의 **기본 캘린더**(캘린더 앱 설정 → 일반 → 기본 캘린더)에 넣습니다. 한 번만 다른 캘린더에 넣으려면 "연구 캘린더에 넣어줘"처럼 말하세요.
@@ -492,6 +494,61 @@ python -m mungchi service --help
 - 봇을 실행하는 앱(백그라운드 서비스면 **비서실 고뭉치**/MungchiBot)에 캘린더 **전체 접근** 권한이 있어야 합니다.
   '쓰기 전용'이면 카테고리 캘린더를 고를 수 없어(`CALENDAR_CATEGORIES=`로 끈 때만 기본 캘린더에 넣을 수 있음) 이미 있는 비슷한 일정도 확인하지 못합니다.
   권한 오류가 나면 [캘린더에 추가하지 못할 때](#캘린더에-추가하지-못할-때) 참고.
+
+## 사진으로 일정 등록
+
+포스터, 이메일·메신저 화면 캡처, 시간표 같은 **사진**을 `@업뎃`이나 `@일정`에게 보내면 사진 속 일정을 읽어
+[메모로 일정 추가하기](#메모로-일정-추가하기)와 똑같이 미리보기와 [카테고리](#카테고리) 질문(Slack에서는 버튼)을 보여 줍니다.
+카테고리를 고르면 추가합니다. 에이전트는 이번에도 제안과 카테고리 추천만 합니다.
+
+**보내는 법**
+
+- **채널**: `@업뎃`(또는 `@일정`)을 멘션하면서 사진을 붙입니다. 글을 함께 쓰면(예: `@업뎃 11월 것만, Research로`) 그 말도 함께 전합니다.
+  글 없이 사진만 보내면 "이 이미지에 있는 일정을 캘린더에 등록해줘"로 알아듣습니다.
+- **DM**: 업뎃·일정 앱의 메시지 탭에 사진을 올리면 됩니다(멘션 필요 없음).
+- **터미널**: `python -m mungchi --agent update --image poster.jpg`는 대화 모드에서 첫 메시지에 사진을 붙입니다(그냥 Enter를 누르면 위 기본 문장).
+  질문과 함께 쓰면(`python -m mungchi --agent schedule --image a.png --image b.png "11월 것만"`) 질문 한 번이라 미리보기만 보여 줍니다.
+  `--image`는 5번까지 쓸 수 있습니다.
+- `@고뭉치`에게 사진을 보내면 모델을 부르지 않고 "사진 속 일정 등록은 @업뎃이나 @일정에게 보내주세요"라고만 답합니다.
+
+**읽는 사진**
+
+- JPG, PNG, GIF(첫 장면), WebP, HEIC/HEIF(아이폰 사진). 한 메시지에 **5장까지**, 한 장 **20MB까지**입니다.
+  넘는 사진이나 PDF 같은 다른 파일은 읽지 않고 한 줄로 알려 줍니다(PDF는 화면을 캡처해 보내 주세요). 사진 없이 글과 다른 파일만 보내면 글은 예전처럼 처리합니다.
+- HEIC는 `pillow-heif`(`pip install -e .`로 함께 설치)가 있어야 읽습니다. 없으면 JPG·PNG로 바꾸거나 캡처해서 보내 달라고 답합니다.
+- 사진에서 날짜·시각·제목·장소·발표자를 한국어와 영어 모두 읽습니다. 흐리거나 잘려서 읽을 수 없는 내용은 짐작하지 않고 묻고,
+  사진에 일정이 없으면 한 줄로 그렇게 답합니다.
+
+**크기와 비용**
+
+- 보내기 전에 사진을 메모리에서 바로 세우고(EXIF 회전), 긴 변을 1568px 이하로 줄이고, JPEG(품질 85, 그래도 크면 더 낮게)로 다시 만들어
+  한 장이 base64로 약 4.5MB를 넘지 않게 합니다. 다시 만들면서 위치(GPS) 같은 EXIF 정보는 빠집니다.
+- 1568×1176 사진 한 장은 입력 토큰 약 2,500개입니다(가로×세로÷750). 사진이 여러 장이면 글 메모보다 비용이 꽤 더 듭니다.
+
+**데이터가 가는 곳**
+
+- 봇은 허용 목록(`SLACK_ALLOWED_USER_IDS`)을 **먼저** 확인합니다. 다른 사람이 보낸 사진은 내려받지 않습니다.
+- 사진은 봇 토큰으로 Slack에서 내려받아(`url_private_download`, 봇이 받은 메시지에 붙은 파일만, `slack.com` 주소에만 토큰을 보냄) 줄인 뒤 에이전트에게 보냅니다.
+  게이트웨이를 쓰면(방법 2) 사진도 **Chat KHU 게이트웨이**를 거쳐 모델로 갑니다.
+- 봇은 사진을 **파일로 저장하지 않습니다**. 내려받기와 줄이기는 메모리에서만 하고, 로그에도 사진 내용·주소·토큰은 남기지 않습니다.
+  단, 스레드에서 대화를 이어 가도록 Claude Code가 `~/.claude/` 아래에 남기는 대화 기록에는 보낸 메시지가 들어가므로,
+  줄인 사진도 거기에 함께 저장될 수 있습니다(확인하지 못했습니다).
+- **Slack에 남는 사진**: 올린 사진은 Slack에 그대로 남습니다. 무료 플랜은 90일이 지난 메시지·파일을 가리고 1년이 지나면 지웁니다.
+  유료 플랜은 관리자가 파일 보존 기간을 정할 수 있습니다. 봇은 사용자가 올린 파일을 지우지 않습니다(지우려면 사용자 토큰이 필요한데, 받지 않았습니다).
+  남기고 싶지 않으면 등록한 뒤 Slack에서 직접 지우세요.
+
+**한 번 해 둘 설정**
+
+1. 이 기능이 들어간 코드를 받은 뒤에는 새 패키지(Pillow, pillow-heif)를 설치합니다. 저장소 폴더에서 가상환경을 켜고
+   ```bash
+   git pull
+   pip install -e .
+   ```
+2. 업뎃·일정 앱에 `files:read` 권한을 줍니다. [이미 만든 앱 고치기](#이미-만든-앱-고치기-버튼사진)대로 매니페스트를 바꾸고 앱을 **다시 설치**합니다.
+   Slack이 새 토큰을 주면 `.env`의 그 앱 토큰을 바꿉니다.
+3. `python -m mungchi service restart`(터미널 탭에서 돌린다면 Ctrl+C로 끄고 다시 실행).
+
+권한이 없으면 사진마다 "봇에 files:read 권한이 없어 사진을 받지 못했어요"라고 답합니다.
 
 ## 아침 브리핑 (매일 자동으로 받기)
 
@@ -627,6 +684,7 @@ Linux에서도 [systemd 서비스](#linux에서는)로 `python -m mungchi slack`
 - **일정** (`@schedule`, 앱 이름 "일정"): 캘린더 일정과 오늘·내일 날씨를 바로 알려 줍니다.
   - 예: `@일정`(멘션만 하면 "오늘과 내일 일정 알려줘"), `@일정 금요일 오후에 비는 시간 있어?`, `@일정 내일 비 오면 야외 미팅 미뤄야 할까?`
 - 업뎃·일정(고뭉치도)에게 날짜가 든 메모를 붙여 넣으면 캘린더 추가를 제안하고, 카테고리를 고르면(버튼, 번호, 이름, 추천대로 "네") 추가합니다([메모로 일정 추가하기](#메모로-일정-추가하기)).
+  업뎃·일정에게는 포스터나 화면 캡처 같은 사진을 보내도 됩니다([사진으로 일정 등록](#사진으로-일정-등록)).
 
 세 봇은 모두 **한 프로세스**(`python -m mungchi slack`)에서 함께 돌아가고, 토큰을 넣은 봇만 켜집니다.
 봇은 내 컴퓨터에서 **Socket Mode**로 돌기 때문에 공개 URL이나 서버가 필요 없습니다.
@@ -651,9 +709,10 @@ Linux에서도 [systemd 서비스](#linux에서는)로 `python -m mungchi slack`
 
 1. <https://api.slack.com/apps> → **Create New App** → **From an app manifest** → 워크스페이스를 고릅니다.
 2. 매니페스트 내용을 **YAML** 탭에 붙여 넣고 **Next** → **Create**.
-   세 앱의 권한(bot scope)은 똑같이 꼭 필요한 다섯 개뿐입니다.
+   세 앱의 권한(bot scope)은 똑같이 꼭 필요한 여섯 개뿐입니다.
    - `app_mentions:read`: 채널에서 멘션 받기
    - `chat:write`: 답 올리기와 고치기
+   - `files:read`: 멘션·DM에 붙인 사진 내려받기([사진으로 일정 등록](#사진으로-일정-등록))
    - `im:history`, `im:read`, `im:write`: 봇과의 DM 읽고 쓰기
 
    이벤트는 `app_mention`, `message.im` 두 가지이고, App Home의 **Messages 탭**(DM 보내기)과
@@ -767,15 +826,18 @@ python -m mungchi --brief --slack
 - 브리핑을 만들지 못하면 제목, 날씨, 실패 안내, 크레딧을 올리고 0이 아닌 종료 코드로 끝납니다(자세한 내용은 표준 오류에 남습니다).
 - `--slack` 없이 `--brief`만 쓰면 같은 브리핑이 터미널(표준 출력)로 나옵니다.
 
-### 버튼(Interactivity) 켜기 (이미 만든 앱)
+### 이미 만든 앱 고치기 (버튼·사진)
 
-예전 매니페스트로 만든 앱은 Interactivity가 꺼져 있어 캘린더 카테고리 버튼이 동작하지 않습니다(글로 답하는 것은 됩니다). 앱마다 둘 중 하나를 하세요.
+예전 매니페스트로 만든 앱은 **Interactivity**가 꺼져 있어 캘린더 카테고리 버튼이 동작하지 않고(글로 답하는 것은 됩니다),
+**`files:read`** 권한이 없어 사진을 받지 못합니다. 앱마다(세 앱 모두) 둘 중 하나를 하세요.
 
-- **매니페스트 붙여 넣기**: <https://api.slack.com/apps> → 앱 → **App Manifest** → 이 저장소의 `slack_manifests/<봇>.yaml` 내용으로
-  바꿔 붙여 넣고 **Save Changes**. 다시 설치하라는 안내가 나오면 **Reinstall to Workspace**를 누릅니다.
-- **직접 켜기**: 앱 → **Interactivity & Shortcuts** → **Interactivity**를 켜고 저장합니다. Socket Mode라서 Request URL은 비워 둡니다.
+- **매니페스트 붙여 넣기 (권장)**: <https://api.slack.com/apps> → 앱 → **App Manifest** → 이 저장소의 `slack_manifests/<봇>.yaml`
+  내용으로 바꿔 붙여 넣고 **Save Changes**. 권한이 바뀌었으니 다시 설치하라는 안내가 나오면 **Reinstall to Workspace** → **허용**을 누릅니다.
+- **직접 고치기**: 앱 → **Interactivity & Shortcuts** → **Interactivity**를 켜고 저장합니다(Socket Mode라서 Request URL은 비워 둡니다).
+  **OAuth & Permissions** → **Bot Token Scopes** → **Add an OAuth Scope** → `files:read`를 더한 뒤 **Reinstall to Workspace**.
 
-그다음 봇을 다시 시작하세요(서비스면 `python -m mungchi service restart`). 다시 설치해 Slack이 새 Bot 토큰을 주면 `.env`의 토큰도 바꿉니다.
+다시 설치한 뒤 **OAuth & Permissions**의 Bot User OAuth Token(`xoxb-`)이 바뀌었으면 `.env`의 그 앱 토큰(`SLACK_BOT_TOKEN`,
+`SLACK_UPDATE_BOT_TOKEN`, `SLACK_SCHEDULE_BOT_TOKEN`)을 바꾸고, 봇을 다시 시작하세요(서비스면 `python -m mungchi service restart`).
 
 ### Slack 문제 해결
 
@@ -789,6 +851,8 @@ python -m mungchi --brief --slack
   그 봇을 초대하세요.
 - 멘션해도 아무 반응이 없으면 봇 프로그램이 켜져 있는지(서비스면 `python -m mungchi service status`),
   그 채널에 봇이 초대되어 있는지 확인하세요. 봇이 꺼져 있을 때 보낸 메시지는 나중에 처리되지 않을 수 있습니다.
+- 사진을 보냈는데 "봇에 files:read 권한이 없어 사진을 받지 못했어요"라고 하면 [이미 만든 앱 고치기](#이미-만든-앱-고치기-버튼사진)대로
+  `files:read`를 주고 앱을 다시 설치하세요. "Pillow가 설치되어 있지 않아요"라고 하면 `pip install -e .` 뒤 `python -m mungchi service restart`.
 - 터미널에서는 되는 기능이 Slack에서 안 되면 봇이 예전 코드로 돌고 있을 수 있습니다.
   [새 기능이 Slack에서 안 될 때](#새-기능이-slack에서-안-될-때)를 보세요.
 - 어떤 멘션은 답하고 어떤 멘션은 답이 없으면 같은 봇이 두 곳에서 돌고 있을 수 있습니다(예: 서비스와 터미널 탭).
@@ -910,9 +974,10 @@ loginctl enable-linger "$USER"             # 로그아웃한 뒤에도 계속 �
 터미널(`python -m mungchi ...`)에서는 되는 기능이 Slack에서 안 되면(예: 고뭉치가 "날씨나 토큰은 확인할 수 없어요"라고 답하면),
 봇이 **코드를 받기 전에 켠 예전 코드**로 돌고 있는 경우가 많습니다. 봇은 켤 때의 코드를 계속 쓰므로 코드를 받은 뒤에는 다시 켜야 합니다.
 
-1. 저장소 폴더에서 코드를 받습니다.
+1. 저장소 폴더에서 코드를 받습니다. 필요한 패키지가 늘었을 수 있으니(예: 사진 기능의 Pillow) 설치도 다시 합니다.
    ```bash
    git pull
+   pip install -e .
    ```
 2. 봇을 다시 켭니다.
    ```bash
@@ -980,7 +1045,7 @@ python -m mungchi --dropbox-check               # 기간 없이 물을 때와 �
   "일정을 추가할 수 있는 캘린더" 가운데 하나로 고치세요(구독·공휴일 캘린더에는 넣을 수 없습니다).
 - "Mac 캘린더에 'Event-KHU' 캘린더가 없어요"가 나오면 캘린더 앱에서 그 이름으로 캘린더를 만들거나(iCloud 계정 아래 권장)
   `.env`의 `CALENDAR_CATEGORIES`를 실제 캘린더 이름에 맞게 고치세요(`이름=캘린더 이름`도 됩니다).
-- 카테고리 버튼을 눌렀는데 Slack이 오류를 보이면 앱의 Interactivity가 꺼져 있는 것입니다([버튼(Interactivity) 켜기](#버튼interactivity-켜기-이미-만든-앱)). 그동안은 번호나 이름으로 답하세요.
+- 카테고리 버튼을 눌렀는데 Slack이 오류를 보이면 앱의 Interactivity가 꺼져 있는 것입니다([이미 만든 앱 고치기](#이미-만든-앱-고치기-버튼사진)). 그동안은 번호나 이름으로 답하세요.
 - 추가한 일정이 다른 기기에 안 보이면 캘린더 앱의 동기화를 기다리세요. 일정은 Mac 캘린더 앱에 먼저 들어갑니다.
 
 ### `zsh: command not found: python`
@@ -1055,6 +1120,8 @@ export SSL_CERT_FILE="$(python -m certifi)"
 - 크레딧 확인(`--credits`, Slack의 크레딧 답, 잔액 알림)은 게이트웨이의 크레딧 조회 주소만 부르고 모델은 부르지 않습니다.
   키는 요청 헤더에만 넣고 출력·Slack·로그에는 남기지 않습니다. Slack에서 묻더라도 허용 목록 확인이 먼저입니다.
   고뭉치의 `get_credits` 도구도 같은 주소만 부르고 키는 결과에 넣지 않지만, 에이전트가 쓰는 도구라 그 답에는 모델 호출이 들어갑니다.
+- 사진([사진으로 일정 등록](#사진으로-일정-등록))은 허용 목록을 확인한 뒤에만 봇 토큰으로 내려받고(`slack.com` 주소에만 토큰을 보냄),
+  메모리에서 줄여 업뎃·일정에게만 보냅니다(고뭉치는 사진을 받지 않음). 봇은 사진을 파일로 저장하거나 로그에 남기지 않습니다.
 - 날씨(`--weather`, 브리핑의 날씨 줄, Slack의 날씨 답)는 Open-Meteo만 부르고 모델은 부르지 않습니다. 키는 없고,
   보내는 것은 설정한 위도·경도와 시간대뿐입니다. Slack에서 묻더라도 허용 목록 확인이 먼저입니다.
   고뭉치와 '일정'의 날씨 도구(`get_weather`)도 Open-Meteo만 부르지만, 에이전트가 쓰는 도구라 그 답에는 모델 호출이 들어갑니다.
@@ -1090,6 +1157,10 @@ export SSL_CERT_FILE="$(python -m certifi)"
 - **메모로 일정 추가하기의 EventKit 쓰기**(`EKEvent` 만들기, `saveEvent:span:commit:error:`, 기본 캘린더, 종일 일정의 끝 날짜,
   '쓰기 전용' 권한일 때의 동작)는 개발 환경에 Mac이 없어 가짜 EventKit 객체로만 테스트했습니다. 처음 쓸 때는 추가된 일정의 날짜·시간·캘린더를
   캘린더 앱에서 한 번 확인하고, 이상하면 `python -m mungchi service logs`와 함께 알려 주세요.
+- **사진으로 일정 등록**은 가짜 Slack 클라이언트·가짜 다운로드·메모리 속 Pillow 이미지로만 테스트했습니다. 실제 Slack 파일 이벤트
+  (DM의 `file_share`, 사진이 붙은 `app_mention`, `files:read` 없이 받는 응답), Chat KHU 게이트웨이가 사진(이미지 블록)을 받는지,
+  아이폰 HEIC 원본은 아직 확인하지 못했습니다. 처음 쓸 때 작은 사진으로 한 번 시험해 보세요.
+- Slack 버튼(Interactivity)은 Block Kit 형식과 Bolt의 처리 순서만 테스트했고, 실제 Slack에서 누르는 것은 확인하지 못했습니다.
 - 고뭉치에게 물으면 고뭉치·업뎃·일정이 모두 모델을 호출하므로 API 비용이 듭니다. 업뎃·일정을 직접 부르면 한 에이전트만
   호출합니다. Slack 멘션·DM도 한 번마다 비용이 듭니다.
 
@@ -1106,6 +1177,7 @@ pytest -q
 확인하므로 실제 Slack이나 Claude에 연결하지 않습니다. 아침 브리핑의 시각 판단과 스케줄러는 가짜 시계로 확인합니다.
 `--list-models`와 크레딧 확인(`--credits`, Slack의 크레딧 답, 잔액 알림), 날씨(`--weather`, 브리핑의 날씨 줄, Slack의 날씨 답, `get_weather`)는
 가짜 httpx 전송(`MockTransport`)과 고정된 시계로 확인합니다. 가짜 전송 없이 나가는 httpx 요청은 테스트에서 연결 실패로 바뀝니다.
+사진은 메모리에서 만든 작은 Pillow 이미지와 가짜 다운로드로 확인하고, 실제 Slack 파일은 내려받지 않습니다.
 백그라운드 서비스(`service`)는 가짜 명령 실행기로 확인하므로 `osacompile`·`codesign`·`launchctl`·`pgrep`·`pkill`을 실제로
 부르지 않습니다(`run-bot.sh`만 bash와 가짜 Python으로 직접 실행해 따옴표 처리를 확인합니다).
 
@@ -1113,7 +1185,7 @@ pytest -q
 slack_manifests/       # Slack 앱 매니페스트, 봇마다 하나 (moongchi.yaml · update.yaml · schedule.yaml)
 src/mungchi/
 ├── __main__.py        # python -m mungchi
-├── main.py            # 페르소나별 ClaudeAgentOptions 구성, 한 턴 실행(run_turn), CLI(--agent 포함), 출력 스트리밍, 오류 문구
+├── main.py            # 페르소나별 ClaudeAgentOptions 구성, 한 턴 실행(run_turn, 사진은 이미지 블록으로), CLI(--agent, --image 포함), 출력 스트리밍, 오류 문구
 ├── briefing.py        # 오늘 브리핑(--brief, --brief --slack, 아침 브리핑 공통): 제목·날씨·고뭉치 답·크레딧 조립, 아침 브리핑 시각 판단
 ├── model_list.py      # --list-models: 모델 목록 확인 (GET /v1/models)
 ├── credits.py         # --credits, Slack의 크레딧 바로 답, 잔액 알림 문구: Chat KHU 크레딧·사용량 조회 (LLM 호출 없음)
@@ -1123,8 +1195,9 @@ src/mungchi/
 ├── calendar_setup.py  # --calendar-setup: Mac 캘린더 앱 접근 허용, 캘린더·오늘 일정 확인
 ├── dropbox_check.py   # --dropbox-check: 업뎃이 Dropbox 변경을 못 찾을 때 원인 확인 (읽기 전용)
 ├── service.py         # service: macOS 백그라운드 서비스 (AppleScript 앱 + LaunchAgent), 상태(실행 중인 코드 버전 포함)·로그 보기
+├── images.py          # 사진 → 일정: Slack 메시지의 사진 고르기(5장, 20MB), 메모리에서 회전·RGB·1568px·JPEG로 줄이기, --image 파일 읽기
 ├── personas.py        # 페르소나 키(mungchi·update·schedule), 한글 이름, Slack 핸들
-├── slack_bot.py       # Slack 봇 세 개(한 프로세스, Socket Mode), 권한 확인, 진행 표시, 크레딧·날씨 바로 답, 잔액 알림, 아침 브리핑, --brief --slack
+├── slack_bot.py       # Slack 봇 세 개(한 프로세스, Socket Mode), 권한 확인, 진행 표시, 크레딧·날씨 바로 답, 카테고리 답·버튼, 사진 받기, 잔액 알림, 아침 브리핑, --brief --slack
 ├── slack_format.py    # Slack용 프롬프트, 봇별 첫 답, 멘션 제거, mrkdwn 변환, 메시지 나누기
 ├── agents.py          # 고뭉치 프롬프트, 업뎃·일정 프롬프트(하위 에이전트용·직접 대화용), AgentDefinition, 도구 권한 훅
 ├── config.py          # 환경변수 읽기(봇별 Slack 토큰 포함), 설정 누락 안내 문구
@@ -1137,6 +1210,6 @@ src/mungchi/
     ├── weather_tool.py    # get_weather: '일정'과 고뭉치의 날씨 도구 (weather.py로 오늘·내일 날씨를 JSON으로)
     ├── credits_tool.py    # get_credits: 고뭉치의 크레딧 도구 (credits.py로 Chat KHU 크레딧·사용량을 JSON으로)
     ├── propose_tool.py    # propose_calendar_events: 메모의 일정을 캘린더 추가 제안으로 (실행마다 대화 키를 묶음, 추가는 안 함)
-    ├── event_proposals.py # 메모 → 일정 제안: 검사·정리, 미리보기, 네/아니요 판별, "네" 뒤 코드로 추가와 결과 문구
+    ├── event_proposals.py # 메모 → 일정 제안: 검사·정리, 카테고리(CALENDAR_CATEGORIES), 미리보기, 답(번호·이름·네·아니요) 판별, 고른 뒤 코드로 추가와 결과 문구
     └── macos_calendar.py  # EventKit 어댑터: 읽기, 추가할 수 있는 캘린더, 일정 추가, 비슷한 일정 찾기 (pyobjc는 Mac에서 필요할 때만 불러옴)
 ```

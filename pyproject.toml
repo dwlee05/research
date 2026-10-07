@@ -19,6 +19,10 @@ dependencies = [
     "slack_bolt>=1.30",
     "slack_sdk>=3.45",
     "aiohttp>=3.9",
+    # Photos -> calendar: shrink images in memory before they go to the agent.
+    "Pillow>=10.0",
+    # HEIC/HEIF (iPhone photos). Imported only when present: without it HEIC gets a Korean note.
+    "pillow-heif>=0.16",
     # Reads the macOS Calendar app (EventKit). Imported lazily, only on a Mac.
     "pyobjc-framework-EventKit>=10.0; sys_platform == 'darwin'",
 ]
