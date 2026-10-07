@@ -48,7 +48,16 @@ from mungchi.main import (
     stamp_prompt,
 )
 from mungchi.slack_format import EXAMPLE_FOLDER_LINK, SLACK_FOLDER_LINE_EXAMPLE, SLACK_FORMAT_PROMPT, to_mrkdwn
-from mungchi.tools import ALL_TOOLS, CALENDAR_TOOL, DATA_TOOLS, DROPBOX_TOOL, SERVER_NAME, UPDATE_TOOLS, dropbox_tool
+from mungchi.tools import (
+    ALL_TOOLS,
+    CALENDAR_TOOL,
+    DATA_TOOLS,
+    DROPBOX_TOOL,
+    SERVER_NAME,
+    UPDATE_TOOLS,
+    WEATHER_TOOL,
+    dropbox_tool,
+)
 from mungchi.tools.dropbox_tool import check_dropbox_updates
 
 NOW = datetime(2026, 10, 5, 8, 0, tzinfo=ZoneInfo("Asia/Seoul"))
@@ -76,7 +85,7 @@ def test_agents_have_ascii_keys_and_own_tools_only():
     update, schedule = opts.agents["update"], opts.agents["schedule"]
     assert isinstance(update, AgentDefinition) and isinstance(schedule, AgentDefinition)
     assert update.tools == [DROPBOX_TOOL]
-    assert schedule.tools == [CALENDAR_TOOL]
+    assert schedule.tools == [CALENDAR_TOOL, WEATHER_TOOL]
     for agent in (update, schedule):
         assert agent.model == "inherit"
         assert all(t.startswith(f"mcp__{SERVER_NAME}__") for t in agent.tools)
@@ -458,14 +467,14 @@ def test_direct_update_gets_only_the_dropbox_tool(server_spy):
     assert set(opts.mcp_servers) == {SERVER_NAME}
 
 
-def test_direct_schedule_gets_only_get_schedule(server_spy):
+def test_direct_schedule_gets_only_its_calendar_and_weather_tools(server_spy):
     opts = build_options(env={}, persona="schedule")
     assert opts.tools == []
-    assert opts.allowed_tools == [CALENDAR_TOOL]
+    assert opts.allowed_tools == [CALENDAR_TOOL, WEATHER_TOOL]
     assert "Agent" in opts.disallowed_tools
     assert not opts.agents
     assert set(BLOCKED_BUILTINS) <= set(opts.disallowed_tools)
-    assert server_spy[-1] == ["get_schedule"]
+    assert server_spy[-1] == ["get_schedule", "get_weather"]
     assert opts.hooks["PreToolUse"][0].hooks == [TOOL_GATES["schedule"]]
 
 
@@ -479,7 +488,7 @@ def test_mungchi_options_are_unchanged_by_personas(server_spy):
     assert explicit.hooks["PreToolUse"][0].hooks == [tool_gate]
     assert TOOL_GATES["mungchi"] is tool_gate
     # 고뭉치's server keeps every data tool for its subagents (built for this run).
-    assert server_spy == [["check_dropbox_updates", "get_schedule"]] * 2
+    assert server_spy == [["check_dropbox_updates", "get_schedule", "get_weather"]] * 2
 
 
 def test_unknown_persona_is_rejected():
@@ -584,9 +593,9 @@ def test_cli_agent_one_shot_and_chat(fake_sdk, capsys, monkeypatch):
     assert main(["--agent", "schedule"]) == 0
     [client] = fake_sdk.instances
     assert [without_now_line(p) for p in client.prompts] == ["내일 일정은?"]
-    assert client.options.allowed_tools == [CALENDAR_TOOL]
+    assert client.options.allowed_tools == [CALENDAR_TOOL, WEATHER_TOOL]
     out = capsys.readouterr().out
-    assert "\n'일정'입니다. 캘린더 일정을 확인해 드릴게요." in out and "일정: 수고하셨습니다!" in out
+    assert "\n'일정'입니다. 캘린더 일정과 오늘·내일 날씨를 확인해 드릴게요." in out and "일정: 수고하셨습니다!" in out
 
 
 def test_cli_agent_argument_rules(capsys):
@@ -607,8 +616,8 @@ def test_cli_agent_argument_rules(capsys):
 def test_update_has_exactly_one_data_tool():
     assert UPDATE_TOOLS == [DROPBOX_TOOL]
     assert PERSONA_TOOLS[UPDATE] == [DROPBOX_TOOL]
-    assert DATA_TOOLS == [DROPBOX_TOOL, CALENDAR_TOOL]
-    assert [t.name for t in ALL_TOOLS] == ["check_dropbox_updates", "get_schedule"]
+    assert DATA_TOOLS == [DROPBOX_TOOL, CALENDAR_TOOL, WEATHER_TOOL]
+    assert [t.name for t in ALL_TOOLS] == ["check_dropbox_updates", "get_schedule", "get_weather"]
 
 
 def test_removed_tool_names_are_unknown_or_denied():
@@ -836,3 +845,75 @@ def test_build_options_binds_briefing_into_its_own_server(server_tools, monkeypa
     for field in (*SAFETY_FIELDS, "system_prompt"):
         assert getattr(briefing, field) == getattr(ad_hoc, field), field
     assert direct.allowed_tools == [DROPBOX_TOOL]
+
+
+# ---------------------------------------------------------------- 일정's get_weather tool
+
+
+def _weather_decision(persona="mungchi", agent_type=None, agent_id=None):
+    out = gate_decision(WEATHER_TOOL, {}, agent_type, agent_id, persona=persona)
+    return out.get("hookSpecificOutput", {}).get("permissionDecision")
+
+
+def test_get_weather_is_an_mcp_tool_owned_by_schedule_only():
+    assert WEATHER_TOOL == "mcp__mungchi__get_weather"
+    assert WEATHER_TOOL in DATA_TOOLS
+    assert PERSONA_TOOLS[SCHEDULE] == [CALENDAR_TOOL, WEATHER_TOOL]
+    assert WEATHER_TOOL not in PERSONA_TOOLS[UPDATE]
+    mungchi = options()
+    assert mungchi.agents["schedule"].tools == [CALENDAR_TOOL, WEATHER_TOOL]
+    assert WEATHER_TOOL not in mungchi.agents["update"].tools
+    assert WEATHER_TOOL not in mungchi.allowed_tools  # 고뭉치 itself: only Agent
+    assert build_options(env={}, persona="update").allowed_tools == [DROPBOX_TOOL]
+
+
+def test_get_weather_gate_allows_only_schedule_direct_and_its_subagent():
+    # 일정 answering directly, and 일정 as 고뭉치's subagent: allowed.
+    assert _weather_decision(persona="schedule") == "allow"
+    assert _weather_decision(agent_type=SCHEDULE, agent_id="a2") == "allow"
+    # 업뎃 directly or as a subagent, 고뭉치's main agent, anyone else: denied.
+    assert _weather_decision(persona="update") == "deny"
+    assert _weather_decision(agent_type=UPDATE, agent_id="a1") == "deny"
+    assert _weather_decision() == "deny"
+    assert _weather_decision(agent_type="general-purpose", agent_id="a3") == "deny"
+    assert _weather_decision(persona="schedule", agent_id="a1") == "deny"  # never from inside a subagent
+    assert _weather_decision(persona="nobody") == "deny"
+
+    async def ask(persona, tool, **extra):
+        out = await TOOL_GATES[persona]({"tool_name": tool, "tool_input": {}, **extra}, "t1", None)
+        return out["hookSpecificOutput"]["permissionDecision"]
+
+    assert asyncio.run(ask("schedule", WEATHER_TOOL)) == "allow"
+    assert asyncio.run(ask("update", WEATHER_TOOL)) == "deny"
+    assert asyncio.run(ask("mungchi", WEATHER_TOOL)) == "deny"
+    assert asyncio.run(ask("mungchi", WEATHER_TOOL, agent_type="schedule", agent_id="a2")) == "allow"
+    assert asyncio.run(ask("mungchi", WEATHER_TOOL, agent_type="update", agent_id="a1")) == "deny"
+
+
+def test_schedule_prompts_call_get_weather_for_weather_questions():
+    from mungchi.agents import SCHEDULE_DESCRIPTION
+
+    direct_system = build_options(env={}, persona="schedule").system_prompt
+    for prompt in (build_schedule_prompt(), build_schedule_prompt(direct=True), direct_system):
+        assert "get_weather" in prompt
+        assert "날씨를 묻거나" in prompt and "야외 일정이나 이동(출퇴근 등)" in prompt
+        assert "일정만 물으면(브리핑 포함) get_weather는 부르지 않는다" in prompt
+        assert "summary 한 줄로 짧게" in prompt
+        for key in ("today", "tomorrow", "current", "fine_dust", "precipitation_probability"):
+            assert key in prompt
+    assert "일정·날씨와 상관없는 요청" in direct_system
+    # 업뎃 sends weather questions to 일정, and never sees the tool.
+    update = build_options(env={}, persona="update").system_prompt
+    assert "일정·약속·날씨는 '일정' 에이전트" in update and "get_weather" not in update
+    # 고뭉치 routes weather to 일정 and leaves it out of the briefing (code adds the line).
+    assert "일정과 날씨에 관한 질문은 '일정' 에이전트에게만 맡긴다" in MUNGCHI_SYSTEM_PROMPT
+    assert "내일 비 오면 일정 바꿔야 할까?" in MUNGCHI_SYSTEM_PROMPT
+    assert "Dropbox, 캘린더, 날씨 같은 데이터 소스를 직접 다루지 않는다" in MUNGCHI_SYSTEM_PROMPT
+    assert "날씨는 맡기지 않는다" in MUNGCHI_SYSTEM_PROMPT
+    assert "날씨 질문" in SCHEDULE_DESCRIPTION and "날씨" in options().agents["schedule"].description
+
+
+def test_help_says_schedule_also_does_weather():
+    help_text = build_parser().format_help()
+    assert "'일정'(캘린더·날씨)" in help_text
+    assert '--agent schedule "내일 비 오면 일정 바꿔야 할까?"' in help_text

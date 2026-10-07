@@ -83,7 +83,7 @@ SERVICE_COMMAND = "service"
 CHAT_GREETINGS = {
     MUNGCHI: "고뭉치 비서실입니다. 무엇을 도와드릴까요? (끝내려면 exit 또는 종료)",
     UPDATE: "업뎃입니다. 공저자 업데이트(Dropbox)를 확인해 드릴게요. (끝내려면 exit 또는 종료)",
-    SCHEDULE: "'일정'입니다. 캘린더 일정을 확인해 드릴게요. (끝내려면 exit 또는 종료)",
+    SCHEDULE: "'일정'입니다. 캘린더 일정과 오늘·내일 날씨를 확인해 드릴게요. (끝내려면 exit 또는 종료)",
 }
 
 ERROR_MESSAGES = {
@@ -520,7 +520,7 @@ class KoreanArgumentParser(argparse.ArgumentParser):
 def build_parser() -> argparse.ArgumentParser:
     parser = KoreanArgumentParser(
         prog="mungchi",
-        description="고뭉치 비서실: 업뎃(공저자 업데이트)과 '일정'(캘린더)에게 일을 맡기는 연구 비서.",
+        description="고뭉치 비서실: 업뎃(공저자 업데이트)과 '일정'(캘린더·날씨)에게 일을 맡기는 연구 비서.",
         epilog=(
             "예시:\n"
             "  python -m mungchi                       # 대화 모드\n"
@@ -529,7 +529,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  python -m mungchi slack                 # Slack 봇 실행 (Socket Mode, BRIEF_TIME이 있으면 아침 브리핑도)\n"
             "  python -m mungchi --brief --slack       # 오늘 브리핑을 지금 바로 Slack에 올리기 (아침 브리핑 시험용)\n"
             '  python -m mungchi --agent update "누가 무슨 파일 고쳤어?"   # 업뎃에게 바로 묻기\n'
-            "  python -m mungchi --agent schedule      # '일정'과 바로 대화\n"
+            "  python -m mungchi --agent schedule      # '일정'과 바로 대화 (일정, 오늘·내일 날씨)\n"
+            '  python -m mungchi --agent schedule "내일 비 오면 일정 바꿔야 할까?"   # 날씨가 걸린 일정 질문\n'
             "  python -m mungchi --list-models         # 쓸 수 있는 모델 ID 확인 (MUNGCHI_MODEL 고르기)\n"
             "  python -m mungchi --credits             # Chat KHU 남은 크레딧과 이번 달 사용량 (LLM 호출 없음)\n"
             "  python -m mungchi --weather             # 오늘 서울 날씨 한 줄 (Open-Meteo, LLM 호출 없음)\n"

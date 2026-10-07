@@ -1874,6 +1874,78 @@ def test_weather_shortcut_failure_is_a_short_korean_note_without_secrets(tmp_pat
     assert SLACK_TOKEN not in caplog.text
 
 
+@pytest.mark.parametrize("persona", ["mungchi", "update", "schedule"])
+@pytest.mark.parametrize(
+    "text",
+    ["날씨는?", "오늘의 날씨", "지금 날씨 어때?", "서울 날씨 좀 알려줘", "날씨 알려줄래?", "오늘 서울 날씨 어떄", "날씨 알려주세요!", "날씨 🙏", "날씨 :pray:"],
+)
+def test_broader_weather_phrasings_use_the_shortcut(tmp_path, persona, text):
+    fake, credit = FakeWeatherText(), FakeCredits()
+    handler, client, run = make_handler(tmp_path, persona=persona, weather_text=fake, credit_text=credit)
+
+    async def scenario():
+        await handler.handle_event(mention(f"<@{BOT}> {text}"), event_id="Ev1", source="mention")
+        await handler.handle_event(dm(text), event_id="Ev2", source="dm")
+
+    asyncio.run(scenario())
+    assert run.calls == []  # never an agent turn, so never an LLM call
+    assert fake.calls == 2 and credit.calls == 0
+    assert [p["text"] for p in client.posts] == [FakeWeatherText.TEXT] * 2
+    assert handler.sessions.threads() == {}
+
+
+@pytest.mark.parametrize("persona", ["mungchi", "update", "schedule"])
+def test_broader_weather_phrasings_still_check_the_allow_list_first(tmp_path, persona, monkeypatch):
+    monkeypatch.setattr(slack_bot.weather, "configured_label", lambda: pytest.fail("the allow-list comes first"))
+    fake = FakeWeatherText()
+    handler, client, run = make_handler(tmp_path, persona=persona, weather_text=fake)
+
+    async def scenario():
+        await handler.handle_event(mention(f"<@{BOT}> 서울 날씨 좀 알려줘", user=STRANGER), event_id="Ev1", source="mention")
+        await handler.handle_event(dm("날씨 🙏", user=STRANGER), event_id="Ev2", source="dm")
+
+    asyncio.run(scenario())
+    assert fake.calls == 0 and run.calls == []
+    assert [p["text"] for p in client.posts] == [REFUSAL_TEXT, REFUSAL_TEXT]
+
+
+def test_the_configured_weather_label_works_in_the_shortcut(tmp_path, monkeypatch):
+    fake = FakeWeatherText()
+    handler, client, run = make_handler(tmp_path, weather_text=fake)
+    asyncio.run(handler.handle_event(dm("부산 날씨 어때?"), event_id="Ev1", source="dm"))
+    assert fake.calls == 0 and [c["prompt"] for c in run.calls] == ["부산 날씨 어때?"]  # 서울 is the default
+    monkeypatch.setenv("WEATHER_LABEL", "부산")
+    asyncio.run(handler.handle_event(dm("부산 날씨 어때?", ts="1700000000.000300"), event_id="Ev2", source="dm"))
+    assert fake.calls == 1 and len(run.calls) == 1
+
+
+@pytest.mark.parametrize("text", ["날씨 좋은 날 야외 미팅 잡아줘", "이번 주말 날씨에 맞춰 일정 정리해줘"])
+def test_weather_questions_that_need_the_agent_still_go_there(tmp_path, text):
+    fake, credit = FakeWeatherText(), FakeCredits()
+    handler, client, run = make_handler(tmp_path, persona="schedule", weather_text=fake, credit_text=credit)
+    asyncio.run(handler.handle_event(mention(f"<@{BOT}> {text}"), event_id="Ev1", source="mention"))
+    assert fake.calls == 0 and credit.calls == 0
+    assert [(c["prompt"], c["persona"]) for c in run.calls] == [(text, "schedule")]
+
+
+def test_a_message_without_a_shortcut_logs_only_its_length_at_debug(tmp_path, caplog):
+    handler, client, run = make_handler(tmp_path, weather_text=FakeWeatherText(), credit_text=FakeCredits())
+    with caplog.at_level(logging.DEBUG, logger="mungchi.slack"):
+        asyncio.run(handler.handle_event(mention(f"<@{BOT}> 날씨 좋은 날 야외 미팅 잡아줘"), event_id="Ev1", source="mention"))
+        asyncio.run(handler.handle_event(dm("크레딧 아끼려면?"), event_id="Ev2", source="dm"))
+    lines = [r for r in caplog.records if "바로 답변에 해당하지 않아" in r.getMessage()]
+    assert [r.levelno for r in lines] == [logging.DEBUG, logging.DEBUG]
+    assert lines[0].getMessage() == "고뭉치: 바로 답변에 해당하지 않아 에이전트에게 넘깁니다 (글자 수 17, 날씨 포함: 예, 크레딧 포함: 아니오)"
+    assert lines[1].getMessage().endswith("(글자 수 9, 날씨 포함: 아니오, 크레딧 포함: 예)")
+    for text in ("야외 미팅", "아끼려면"):
+        assert text not in caplog.text  # never the message itself
+    # A shortcut that matched logs no such line.
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="mungchi.slack"):
+        asyncio.run(handler.handle_event(dm("날씨", ts="1700000000.000300"), event_id="Ev3", source="dm"))
+    assert "바로 답변에 해당하지 않아" not in caplog.text
+
+
 def test_default_weather_text_calls_only_open_meteo(tmp_path, monkeypatch):
     import httpx
 

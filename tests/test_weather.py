@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
+import json
 import logging
 import unicodedata
 
@@ -431,14 +433,60 @@ def test_brief_weather_is_on_unless_turned_off(value, on):
         "날씨 좀",
         "날씨좀",
         "  날씨  ",
+        # The agreed examples.
+        "날씨는?",
+        "오늘의 날씨",
+        "지금 날씨 어때?",
+        "서울 날씨 좀 알려줘",
+        "날씨 알려줄래?",
+        "오늘 서울 날씨 어떄",
+        "날씨 알려주세요!",
+        "날씨 🙏",
+        # More of the same shape.
+        "현재 날씨",
+        "지금 서울의 날씨는 어때요?",
+        "여기 날씨 어때",
+        "서울의 날씨",
+        "날씨가 어떠니",
+        "날씨 어떤가요?",
+        "날씨 알려 줘",
+        "날씨 알려줘요",
+        "날씨 확인해줘",
+        "날씨 보여줘",
+        "날씨 궁금해",
+        "날씨 좀 알려줘~",
+        "날씨은?",
+        "날씨...?!",
+        "날씨 ☀️☔",
+        "날씨 👍🏽",
+        "날씨\t알려줘\n",
+        "날씨 :pray:",  # Slack sends emoji as :shortcodes:
+        "날씨 알려줘 :pray::skin-tone-2:",
     ],
 )
 def test_short_weather_questions_match(text):
     assert is_weather_query(text)
+    assert is_weather_query(text, "서울") and is_weather_query(text, "부산")
 
 
 def test_decomposed_hangul_is_normalized_before_matching():
     assert is_weather_query(unicodedata.normalize("NFD", "오늘 서울 날씨 어때?"))
+    assert is_weather_query(unicodedata.normalize("NFD", "지금 날씨 어떄"))
+
+
+def test_the_configured_label_is_a_place_too():
+    assert not is_weather_query("부산 날씨")
+    assert is_weather_query("부산 날씨", "부산")
+    assert is_weather_query("오늘 부산의 날씨 알려줘", "부산")
+    assert is_weather_query("서울 날씨", "부산")  # 서울 and 여기 always work
+    assert is_weather_query("여기 날씨", "부산")
+    assert not is_weather_query("대구 날씨", "부산")
+    # Labels are matched like the text: spaces optional, case ignored, regex characters literal.
+    assert is_weather_query("우리 동네 날씨", "우리 동네") and is_weather_query("우리동네 날씨", "우리 동네")
+    assert is_weather_query("seoul 날씨 어때?", "Seoul")
+    assert is_weather_query("a.b 날씨", "a.b") and not is_weather_query("axb 날씨", "a.b")
+    assert weather.configured_label({"WEATHER_LABEL": " 부산 "}) == "부산"
+    assert weather.configured_label({}) == "서울"
 
 
 @pytest.mark.parametrize(
@@ -455,10 +503,167 @@ def test_decomposed_hangul_is_normalized_before_matching():
         "날씨 어때 그리고 일정도",
         "크레딧",
         "<@U123> 날씨",
+        # The agreed examples: these need the agent.
+        "날씨 좋은 날 야외 미팅 잡아줘",
+        "이번 주말 날씨에 맞춰 일정 정리해줘",
+        "내일 날씨",
+        "오늘 내일 날씨",
+        "날씨 예보",
+        "날씨 어때 내일은?",
+        "🙏",
+        "?!",
+        ":pray:",
     ],
 )
 def test_longer_or_other_questions_do_not_match(text):
     assert not is_weather_query(text)
+    assert not is_weather_query(text, "대구")
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["크레딧", "크레딧?", "남은 크레딧 얼마나 남았어?", "잔액", "사용량 보여줘", "credits", "Credit 확인해줘"],
+)
+def test_the_credit_question_is_unaffected(text):
+    from mungchi import credits
+
+    assert credits.is_credit_query(text)
+    assert not is_weather_query(text)
+
+
+@pytest.mark.parametrize("text", ["날씨", "날씨 알려줄래?", "서울 날씨 좀 알려줘", "날씨 🙏", "크레딧 아끼려면 어떻게 해?"])
+def test_weather_questions_are_not_credit_questions(text):
+    from mungchi import credits
+
+    assert not credits.is_credit_query(text)
+
+
+# ---------------------------------------------------------------- the get_weather tool (일정)
+
+
+# What Open-Meteo answers with forecast_days=2: today, then tomorrow (rainy).
+FORECAST_2D = {
+    **FORECAST_JSON,
+    "daily": {
+        "time": ["2026-10-08", "2026-10-09"],
+        "weather_code": [1, 63],
+        "temperature_2m_max": [22.6, 17.4],
+        "temperature_2m_min": [11.5, 13.2],
+        "precipitation_probability_max": [10, 80],
+    },
+}
+
+
+def use_transport(monkeypatch, transport):
+    """Make the tool's own ``httpx.Client`` talk to ``transport`` (the tool takes no transport argument)."""
+    real_client = httpx.Client
+    monkeypatch.setattr(weather.httpx, "Client", lambda **kw: real_client(transport=transport, timeout=kw.get("timeout")))
+
+
+def call_get_weather() -> dict:
+    from mungchi.tools.weather_tool import get_weather
+
+    result = asyncio.run(get_weather.handler({}))
+    [content] = result["content"]
+    assert content["type"] == "text"
+    return json.loads(content["text"])
+
+
+def test_get_weather_tool_returns_compact_json_for_today_and_tomorrow(monkeypatch):
+    transport, requests = routes(forecast=httpx.Response(200, json=FORECAST_2D))
+    use_transport(monkeypatch, transport)
+    assert call_get_weather() == {
+        "configured": True,
+        "ok": True,
+        "label": "서울",
+        # Today's line, exactly the briefing's: tomorrow's rain does not change it.
+        "summary": LINE,
+        "today": {"description": "대체로 맑음", "min": 12, "max": 23, "precipitation_probability": 10},
+        "tomorrow": {"description": "비", "min": 13, "max": 17, "precipitation_probability": 80},
+        "current": {"temp": 14, "description": "대체로 맑음"},
+        "fine_dust": "보통",
+    }
+    forecast, air = requests
+    assert forecast.url.params["forecast_days"] == "2"
+    assert (forecast.url.host, air.url.host) == (FORECAST_HOST, AIR_HOST)
+    assert dict(air.url.params) == {"latitude": "37.5665", "longitude": "126.9780", "current": "pm10,pm2_5", "timezone": "Asia/Seoul"}
+
+
+def test_get_weather_tool_without_tomorrow_dust_or_current_leaves_those_parts_out(monkeypatch):
+    payload = {k: v for k, v in FORECAST_JSON.items() if k != "current"}  # one day, no "current"
+    transport, _ = routes(forecast=httpx.Response(200, json=payload), air=httpx.Response(503, text="busy"))
+    use_transport(monkeypatch, transport)
+    data = call_get_weather()
+    assert "tomorrow" not in data
+    assert data["current"] == {"temp": None, "description": None}
+    assert data["fine_dust"] is None and data["fine_dust_error"] == "HTTP 503"
+    assert data["summary"] == "🌤️ 서울 날씨: 대체로 맑음 · 최저 12° / 최고 23° · 강수확률 10%"
+
+
+def test_get_weather_tool_uses_the_configured_place_and_passes_on_warnings(monkeypatch):
+    transport, requests = routes(forecast=httpx.Response(200, json=FORECAST_2D))
+    use_transport(monkeypatch, transport)
+    monkeypatch.setenv("WEATHER_LABEL", "부산")
+    monkeypatch.setenv("WEATHER_LAT", "35.1796")
+    monkeypatch.setenv("WEATHER_LON", "129.0756")
+    data = call_get_weather()
+    assert data["label"] == "부산" and data["summary"].startswith("🌤️ 부산 날씨: ")
+    assert requests[0].url.params["latitude"] == "35.1796" and "warnings" not in data
+    monkeypatch.setenv("WEATHER_LAT", "north")
+    data = call_get_weather()
+    assert data["label"] == "서울"
+    [warning] = data["warnings"]
+    assert warning.startswith("WEATHER_LAT/WEATHER_LON 값('north', '129.0756')을 쓸 수 없어")
+
+
+@pytest.mark.parametrize(
+    "forecast,error",
+    [
+        (broken, "연결 실패: ConnectError"),
+        (httpx.Response(500, text="oops"), "HTTP 500"),
+        (httpx.Response(200, json={"daily": {}, "current": {}}), "응답에 날씨 값이 없음"),
+    ],
+)
+def test_get_weather_tool_failure_shape(monkeypatch, forecast, error):
+    transport, requests = routes(forecast=forecast)
+    use_transport(monkeypatch, transport)
+    assert call_get_weather() == {"configured": True, "ok": False, "label": "서울", "error": error, "summary": FAILED}
+    assert [r.url.host for r in requests] == [FORECAST_HOST]  # no air-quality request after a failed forecast
+
+
+def test_get_weather_tool_offline_and_crashing_never_raise(monkeypatch):
+    from mungchi.tools import weather_tool
+
+    # conftest: a real request fails like a dropped connection.
+    assert call_get_weather() == {
+        "configured": True,
+        "ok": False,
+        "label": "서울",
+        "error": "연결 실패: ConnectError",
+        "summary": FAILED,
+    }
+    token = "-".join(["xoxb", "123456789012", "123456789012", "abcdefghijklmnopqrstuvwx"])
+    monkeypatch.setenv("SLACK_BOT_TOKEN", token)
+
+    def crash():
+        raise RuntimeError(f"boom {token}")
+
+    monkeypatch.setattr(weather_tool, "run_weather", crash)
+    assert call_get_weather() == {"configured": True, "ok": False, "error": "RuntimeError: boom ***"}
+
+
+def test_the_briefing_line_still_uses_today_only():
+    # Even with two days in the answer, the line (briefing, --weather, Slack shortcut) is today's.
+    assert parse_forecast(FORECAST_2D) == parse_forecast(FORECAST_JSON)
+    assert format_line("서울", parse_forecast(FORECAST_2D), parse_air_quality(AIR_JSON)) == LINE
+    assert parse_forecast(FORECAST_2D, day=1) == Forecast(code=63, low=13.2, high=17.4, rain_chance=80)
+    assert parse_forecast(FORECAST_JSON, day=1).empty
+    # Only the tool asks for tomorrow; the line's request stays at one day.
+    transport, requests = routes(forecast=httpx.Response(200, json=FORECAST_2D))
+    assert weather_line({}, transport=transport) == LINE
+    assert requests[0].url.params["forecast_days"] == "1"
+    report = fetch_report(env={}, transport=routes()[0])
+    assert report.tomorrow is None
 
 
 # ---------------------------------------------------------------- --weather

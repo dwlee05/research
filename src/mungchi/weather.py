@@ -2,11 +2,13 @@
 
 The briefing (``--brief``, ``--brief --slack`` and the scheduled morning
 briefing), ``python -m mungchi --weather`` and the Slack shortcut ("@고뭉치
-날씨") all go through here. The data comes from Open-Meteo (free, no key):
+날씨") all go through here, and so does the 일정 agent's ``get_weather`` tool
+(``weather_payload``: today and tomorrow as compact JSON). The data comes
+from Open-Meteo (free, no key):
 
 - ``GET https://api.open-meteo.com/v1/forecast``: today's weather code,
   lowest / highest temperature and highest chance of rain (plus the current
-  temperature and weather code as a fallback);
+  temperature and weather code as a fallback); the tool also asks for tomorrow;
 - ``GET https://air-quality-api.open-meteo.com/v1/air-quality``: the current
   PM10 / PM2.5, graded by the Korean standard (optional: left out when it fails).
 
@@ -18,6 +20,7 @@ Nothing here raises into a caller: a failed forecast becomes the short note
 
 from __future__ import annotations
 
+import functools
 import logging
 import re
 import sys
@@ -86,19 +89,75 @@ DUST_GRADES = ("좋음", "보통", "나쁨", "매우나쁨")
 PM10_LIMITS = (30.0, 80.0, 150.0)
 PM25_LIMITS = (15.0, 35.0, 75.0)
 
-# A short message that only asks for today's weather ("날씨", "오늘 서울 날씨 어때?"),
-# matched after the bot's mention is removed. Longer questions
-# ("내일 비 오면 일정 바꿔야 할까?") do not match and go to the agent as before.
-WEATHER_QUERY_RE = re.compile(
-    r"^(오늘\s*)?(서울\s*)?날씨(\s*(어때(요)?|알려\s*줘|확인(해\s*줘)?|좀))?\s*[?？!.]*$",
-    re.IGNORECASE,
+# ---------------------------------------------------------------- the Slack shortcut's question
+#
+# A short message that only asks for today's weather, matched after the bot's
+# mention is removed:
+#
+#   [오늘 | 오늘의 | 지금 | 현재] [서울 | WEATHER_LABEL | 여기][의] 날씨[는 | 은 | 가 | 좀] [어때 | 알려줘 | ...]
+#
+# with or without spaces, any trailing punctuation and emoji ("날씨 🙏",
+# "날씨 :pray:" as Slack sends it). Anything longer ("내일 비 오면 일정 바꿔야
+# 할까?", "날씨 좋은 날 야외 미팅 잡아줘") does not match and goes to the agent.
+
+WEATHER_TIME_RE = r"(?:오늘의?|지금|현재)"
+WEATHER_PARTICLE_RE = r"(?:는|은|가|좀)"
+WEATHER_TAIL_RE = (
+    r"(?:어때요?|어떄|어떠니|어떤가요"  # 어떄: a common typo of 어때
+    r"|(?:좀 ?)?알려 ?(?:줘요?|줄래|주세요)"
+    r"|확인(?: ?해 ?줘)?|보여 ?줘|궁금해)"
 )
+WEATHER_PLACES = ("서울", "여기")
+# Slack sends emoji as ":name:" (":pray:", ":+1::skin-tone-2:").
+_TRAILING_SHORTCODES_RE = re.compile(r"(?:\s*:[a-z0-9_+'.-]+:)+\s*$")
 
 
-def is_weather_query(text: str | None) -> bool:
-    """True when ``text`` (mention already removed) is just a short weather question."""
-    normalized = unicodedata.normalize("NFC", text or "").strip()
-    return bool(normalized) and WEATHER_QUERY_RE.match(normalized) is not None
+def _is_trailing_noise(char: str) -> bool:
+    """Space, punctuation, symbols (emoji included) and the marks / joiners emoji are built with."""
+    category = unicodedata.category(char)
+    return char.isspace() or category[0] in ("P", "S") or category in ("Mn", "Me", "Cf")
+
+
+def _query_text(text: str) -> str:
+    """NFC, lower case, single spaces, trailing punctuation / emoji / ":shortcode:" removed."""
+    text = " ".join(unicodedata.normalize("NFC", text).lower().split())
+    while True:
+        before = text
+        text = _TRAILING_SHORTCODES_RE.sub("", text)
+        while text and _is_trailing_noise(text[-1]):
+            text = text[:-1]
+        if text == before:
+            return text
+
+
+@functools.lru_cache(maxsize=16)
+def _weather_query_re(label: str) -> re.Pattern[str]:
+    places = list(WEATHER_PLACES)
+    label = " ".join(unicodedata.normalize("NFC", label).lower().split())
+    if label and label not in places:
+        places.append(label)
+    place = "(?:" + "|".join(" ?".join(re.escape(part) for part in name.split()) for name in places) + ")"
+    return re.compile(
+        rf"^(?:{WEATHER_TIME_RE} ?)?(?:{place}(?: ?의)? ?)?날씨(?: ?{WEATHER_PARTICLE_RE})?(?: ?{WEATHER_TAIL_RE})?$"
+    )
+
+
+def is_weather_query(text: str | None, label: str | None = None) -> bool:
+    """True when ``text`` (mention already removed) only asks for today's weather.
+
+    ``label`` is the configured ``WEATHER_LABEL`` (e.g. 부산); 서울 and 여기 are
+    always accepted as the place. Pure: no LLM call, no I/O.
+    """
+    normalized = _query_text(text or "")
+    return bool(normalized) and _weather_query_re(label or "").match(normalized) is not None
+
+
+def configured_label(env: Mapping[str, str] | None = None) -> str:
+    """``WEATHER_LABEL`` as the weather line shows it (서울 when unset or unusable). Never raises."""
+    try:
+        return config.load_weather_config(env).label
+    except Exception:  # noqa: BLE001 - the shortcut still knows 서울
+        return config.DEFAULT_WEATHER_LABEL
 
 
 # ---------------------------------------------------------------- parsing (defensive)
@@ -106,13 +165,17 @@ def is_weather_query(text: str | None) -> bool:
 
 @dataclass(frozen=True)
 class Forecast:
-    """Today's forecast; every field is None when the response did not have it."""
+    """One day's forecast; every field is None when the response did not have it.
 
-    code: int | None = None  # today's weather code (the current one when the daily one is missing)
+    ``current_temp`` / ``current_code`` (the weather right now) are only set for today.
+    """
+
+    code: int | None = None  # the day's weather code (today: the current one when the daily one is missing)
     low: float | None = None
     high: float | None = None
     rain_chance: float | None = None  # precipitation_probability_max, %
     current_temp: float | None = None
+    current_code: int | None = None
 
     @property
     def empty(self) -> bool:
@@ -135,6 +198,8 @@ class WeatherReport:
 
     label: str = config.DEFAULT_WEATHER_LABEL
     forecast: Forecast | None = None
+    # Only when asked for (``fetch_report(days=2)``, the get_weather tool); the line never uses it.
+    tomorrow: Forecast | None = None
     air: AirQuality | None = None
     error: str | None = None
     air_error: str | None = None
@@ -166,11 +231,11 @@ def _number(value: Any) -> float | None:
     return number if number == number and abs(number) != float("inf") else None
 
 
-def _first(value: Any) -> Any:
-    """Today's entry of a daily array (``forecast_days=1``: the only one)."""
+def _nth(value: Any, day: int) -> Any:
+    """Entry ``day`` of a daily array (0: today, 1: tomorrow); a bare value counts as today's."""
     if isinstance(value, list):
-        return value[0] if value else None
-    return value
+        return value[day] if 0 <= day < len(value) else None
+    return value if day == 0 else None
 
 
 def _code(value: Any) -> int | None:
@@ -178,20 +243,26 @@ def _code(value: Any) -> int | None:
     return int(number) if number is not None and number == int(number) and number >= 0 else None
 
 
-def parse_forecast(payload: Any) -> Forecast:
-    """Open-Meteo forecast JSON -> ``Forecast``. Missing or odd fields become None, never an error."""
+def parse_forecast(payload: Any, day: int = 0) -> Forecast:
+    """Open-Meteo forecast JSON -> ``Forecast`` for ``day`` (0: today, 1: tomorrow).
+
+    Missing or odd fields become None, never an error. Only today falls back
+    to the current weather code and carries the current temperature.
+    """
     data = _mapping(payload)
     daily = _mapping(data.get("daily"))
-    current = _mapping(data.get("current"))
-    code = _code(_first(daily.get("weather_code")))
+    current = _mapping(data.get("current")) if day == 0 else {}
+    current_code = _code(current.get("weather_code"))
+    code = _code(_nth(daily.get("weather_code"), day))
     if code is None:
-        code = _code(current.get("weather_code"))
+        code = current_code
     return Forecast(
         code=code,
-        low=_number(_first(daily.get("temperature_2m_min"))),
-        high=_number(_first(daily.get("temperature_2m_max"))),
-        rain_chance=_number(_first(daily.get("precipitation_probability_max"))),
+        low=_number(_nth(daily.get("temperature_2m_min"), day)),
+        high=_number(_nth(daily.get("temperature_2m_max"), day)),
+        rain_chance=_number(_nth(daily.get("precipitation_probability_max"), day)),
         current_temp=_number(current.get("temperature_2m")),
+        current_code=current_code,
     )
 
 
@@ -312,14 +383,15 @@ class _FetchError(Exception):
         self.detail = detail
 
 
-def forecast_params(cfg: config.WeatherConfig) -> dict[str, str]:
+def forecast_params(cfg: config.WeatherConfig, days: int = 1) -> dict[str, str]:
+    """``days`` 1 (today: the line) or 2 (today and tomorrow: the get_weather tool)."""
     return {
         "latitude": f"{cfg.latitude:.4f}",
         "longitude": f"{cfg.longitude:.4f}",
         "current": "temperature_2m,weather_code",
         "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
         "timezone": cfg.timezone_name,
-        "forecast_days": "1",
+        "forecast_days": str(days),
     }
 
 
@@ -366,26 +438,32 @@ def fetch_report(
     env: Mapping[str, str] | None = None,
     transport: httpx.BaseTransport | None = None,
     timeout: float = TIMEOUT_SECONDS,
+    days: int = 1,
 ) -> WeatherReport:
-    """Fetch today's forecast, then the fine dust. Never raises.
+    """Fetch today's forecast (with ``days=2`` tomorrow's too), then the fine dust. Never raises.
 
     A failed forecast leaves ``forecast`` None with ``error`` set (the air
     quality is then not asked for); a failed air-quality request only sets
-    ``air_error``.
+    ``air_error``. A missing tomorrow only leaves ``tomorrow`` None.
     """
     cfg = cfg or config.load_weather_config(env)
+    days = 2 if days >= 2 else 1
     report = WeatherReport(label=cfg.label)
     try:
         with httpx.Client(transport=transport, timeout=timeout) as client:
             try:
-                forecast = parse_forecast(_get_json(client, FORECAST_URL, forecast_params(cfg)))
+                payload = _get_json(client, FORECAST_URL, forecast_params(cfg, days))
             except _FetchError as exc:
                 report.error, report.detail = exc.short, exc.detail or None
                 return report
+            forecast = parse_forecast(payload)
             if forecast.empty:
                 report.error = "응답에 날씨 값이 없음"
                 return report
             report.forecast = forecast
+            if days == 2:
+                tomorrow = parse_forecast(payload, day=1)
+                report.tomorrow = None if tomorrow.empty else tomorrow
             try:
                 air = parse_air_quality(_get_json(client, AIR_QUALITY_URL, air_quality_params(cfg)))
             except _FetchError as exc:
@@ -438,6 +516,70 @@ def slack_weather_text(
 ) -> str:
     """What the Slack shortcut posts: the line in mrkdwn (bold label), or the short failure note."""
     return weather_line(env, transport=transport, slack=True)
+
+
+# ---------------------------------------------------------------- the get_weather tool (일정)
+
+
+def _degrees(value: float | None) -> int | None:
+    return round_half_up(value) if value is not None else None
+
+
+def _description(code: int | None) -> str | None:
+    return describe_code(code)[0] if code is not None else None
+
+
+def _day(forecast: Forecast) -> dict[str, Any]:
+    return {
+        "description": _description(forecast.code),
+        "min": _degrees(forecast.low),
+        "max": _degrees(forecast.high),
+        "precipitation_probability": _degrees(forecast.rain_chance),
+    }
+
+
+def report_payload(report: WeatherReport, warnings: tuple[str, ...] | list[str] = ()) -> dict[str, Any]:
+    """Compact JSON for the get_weather tool. Temperatures in whole °C, chance of rain in %.
+
+    ``summary`` is today's Korean line (the same as the briefing's). On a failed
+    forecast: ``ok: false`` with a short Korean ``error`` and the failure note.
+    """
+    payload: dict[str, Any] = {"configured": True, "ok": report.ok, "label": report.label}
+    if not report.ok or report.forecast is None:
+        payload["error"] = report.error or "응답 없음"
+        payload["summary"] = failed_line(report.label)
+    else:
+        payload["summary"] = report_line(report)
+        payload["today"] = _day(report.forecast)
+        if report.tomorrow is not None:
+            payload["tomorrow"] = _day(report.tomorrow)
+        payload["current"] = {
+            "temp": _degrees(report.forecast.current_temp),
+            "description": _description(report.forecast.current_code),
+        }
+        payload["fine_dust"] = dust_grade(report.air)
+        if report.air_error:
+            payload["fine_dust_error"] = report.air_error
+    if warnings:
+        payload["warnings"] = list(warnings)
+    return payload
+
+
+def weather_payload(
+    env: Mapping[str, str] | None = None, *, transport: httpx.BaseTransport | None = None
+) -> dict[str, Any]:
+    """What the get_weather tool returns: today and tomorrow (``report_payload``). Never raises. Blocking."""
+    label = config.DEFAULT_WEATHER_LABEL
+    try:
+        cfg = load_config(env)
+        label = cfg.label
+        report = fetch_report(cfg, transport=transport, days=2)
+        if not report.ok:
+            log.warning("날씨를 가져오지 못했습니다: %s", scrub(report.error or "응답 없음"))
+        return report_payload(report, cfg.warnings)
+    except Exception as exc:  # noqa: BLE001 - the agent always gets a short Korean reason
+        log.warning("날씨를 가져오지 못했습니다: %s", type(exc).__name__)
+        return report_payload(WeatherReport(label=label, error=f"응답을 읽지 못함: {type(exc).__name__}"))
 
 
 # ---------------------------------------------------------------- CLI

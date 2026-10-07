@@ -8,11 +8,12 @@ from claude_agent_sdk import McpSdkServerConfig, SdkMcpTool, create_sdk_mcp_serv
 
 from .calendar_tool import get_schedule
 from .dropbox_tool import check_dropbox_updates, make_check_dropbox_updates
+from .weather_tool import get_weather
 
 SERVER_NAME = "mungchi"
 SERVER_VERSION = "0.1.0"
 
-ALL_TOOLS = [check_dropbox_updates, get_schedule]
+ALL_TOOLS = [check_dropbox_updates, get_schedule, get_weather]
 
 
 def mcp_tool_name(tool_name: str) -> str:
@@ -22,10 +23,11 @@ def mcp_tool_name(tool_name: str) -> str:
 
 DROPBOX_TOOL = mcp_tool_name(check_dropbox_updates.name)
 CALENDAR_TOOL = mcp_tool_name(get_schedule.name)
+WEATHER_TOOL = mcp_tool_name(get_weather.name)
 
 # 업뎃 (``update``) and 일정 (``schedule``) each own their tools.
 UPDATE_TOOLS = [DROPBOX_TOOL]
-SCHEDULE_TOOLS = [CALENDAR_TOOL]
+SCHEDULE_TOOLS = [CALENDAR_TOOL, WEATHER_TOOL]
 DATA_TOOLS = UPDATE_TOOLS + SCHEDULE_TOOLS
 
 
@@ -35,7 +37,7 @@ def data_tools(*, briefing: bool = False) -> list[SdkMcpTool]:
     ``briefing=True`` only for briefing runs (see ``make_check_dropbox_updates``).
     A fresh Dropbox tool object per call keeps the mode bound to one run.
     """
-    return [make_check_dropbox_updates(briefing=briefing), get_schedule]
+    return [make_check_dropbox_updates(briefing=briefing), get_schedule, get_weather]
 
 
 def tools_named(names: Iterable[str], *, briefing: bool = False) -> list[SdkMcpTool]:
@@ -58,6 +60,7 @@ __all__ = [
     "SCHEDULE_TOOLS",
     "SERVER_NAME",
     "UPDATE_TOOLS",
+    "WEATHER_TOOL",
     "build_server",
     "data_tools",
     "mcp_tool_name",

@@ -425,9 +425,17 @@ class SlackHandler:
         if credits.is_credit_query(request):
             await self._answer_credits(channel, thread_ts)
             return
-        if weather.is_weather_query(request):
+        if weather.is_weather_query(request, weather.configured_label()):
             await self._answer_weather(channel, thread_ts)
             return
+        # Never the text itself: only its length and whether a shortcut word was in it.
+        log.debug(
+            "%s: 바로 답변에 해당하지 않아 에이전트에게 넘깁니다 (글자 수 %d, 날씨 포함: %s, 크레딧 포함: %s)",
+            self.texts.label,
+            len(request),
+            "예" if "날씨" in request else "아니오",
+            "예" if "크레딧" in request else "아니오",
+        )
         await self._answer(channel, thread_ts, request or self.default_prompt())
 
     async def _refuse(self, channel: str, thread_ts: str, user: str) -> None:
