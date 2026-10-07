@@ -602,7 +602,7 @@ def event_summary(event: ProposedEvent, today: date) -> str:
 
 
 def event_line(event: ProposedEvent, calendar_label: str, today: date) -> str:
-    """``• 10/22(목) 12:00–13:00 신임교수모임 (10월) · 메모: 발표: 김평식 교수님 · 캘린더: 연구``.
+    """``• 10/22(목) 12:00–13:00 신임교수모임 (10월) · 메모: 발표: 홍길동 교수님 · 캘린더: 연구``.
 
     With categories there is no calendar label; an event with its own
     category ends with ``· 카테고리: Research``.

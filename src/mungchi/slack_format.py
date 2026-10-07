@@ -26,9 +26,9 @@ BRIEF_TITLE = "오늘의 브리핑 ({date})"
 # One Dropbox subfolder, as the prompts show it: the folder's link exactly
 # once. In the terminal the bare link goes on the line under the folder name;
 # in Slack the folder name is bold and the link follows on the same line.
-EXAMPLE_FOLDER_LINK = "https://www.dropbox.com/home/20_%EC%97%B0%EA%B5%AC-%EC%A7%84%ED%96%89/01_Youn"
+EXAMPLE_FOLDER_LINK = "https://www.dropbox.com/home/20_%EC%97%B0%EA%B5%AC-%EC%A7%84%ED%96%89/01_ProjectA"
 SLACK_FOLDER_LINK_LABEL = "📂 열기"
-SLACK_FOLDER_LINE_EXAMPLE = f"• *01_Youn* <{EXAMPLE_FOLDER_LINK}|{SLACK_FOLDER_LINK_LABEL}>"
+SLACK_FOLDER_LINE_EXAMPLE = f"• *01_ProjectA* <{EXAMPLE_FOLDER_LINK}|{SLACK_FOLDER_LINK_LABEL}>"
 
 SLACK_FORMAT_PROMPT = (
     """\
@@ -128,7 +128,7 @@ _BOLD_RE = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*")
 _STRIKE_RE = re.compile(r"~~(?=\S)(.+?)(?<=\S)~~")
 _LINK_RE = re.compile(r"\[([^\[\]\n]+)\]\(((?:https?://|mailto:)[^\s()<>]+)\)")
 # "폴더 열기: <url|폴더 열기>", possibly in parentheses, shows the same label twice in Slack
-# ("01_Youn (폴더 열기: 폴더 열기)"). The label in front of the link is dropped.
+# ("01_ProjectA (폴더 열기: 폴더 열기)"). The label in front of the link is dropped.
 _DUPLICATE_LABEL_RE = re.compile(
     r"(\(\s*)?(?<![^\s(])([^\s()<>|:：][^()<>|:：\n]{0,40}?)\s*[:：]\s*"
     r"<((?:https?://|mailto:)[^|>\s]+)\|\2>(\s*\))?"

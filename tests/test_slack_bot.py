@@ -2459,7 +2459,7 @@ from mungchi.tools.event_proposals import create_proposal_events, normalize_even
 ROOT = "1700000000.000200"  # the DM (or channel message) the proposal was shown under
 # Far in the future, so the real clock never makes them past; the year is shown since it is not this one.
 NOTE_EVENTS = [
-    {"title": "신임교수모임 (10월)", "date": "2099-10-22", "start_time": "12:00", "notes": "발표: 김평식 교수님"},
+    {"title": "신임교수모임 (10월)", "date": "2099-10-22", "start_time": "12:00", "notes": "발표: 홍길동 교수님"},
     {"title": "신임교수모임 (11월)", "date": "2099-11-19", "start_time": "12:00"},
 ]
 

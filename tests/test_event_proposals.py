@@ -69,7 +69,7 @@ OTHER_KEY = slack_conversation_key("schedule", "D0123ABCD", "1700000000.000900")
 # The user's example note, as the model is told to extract it.
 NOTE = (
     "문 결과, 가장 많은 교수님께서 참석 가능하신 날짜를 기준으로 10월과 11월 신임교수모임 일정을 아래와 같이 정하였습니다.\n\n"
-    "* 10월 모임: 10월 22일(목) 오후 12시\n발표: 김평식 교수님"
+    "* 10월 모임: 10월 22일(목) 오후 12시\n발표: 홍길동 교수님"
 )
 EXAMPLE = {
     "title": "신임교수모임 (10월)",
@@ -77,10 +77,10 @@ EXAMPLE = {
     "start_time": "12:00",
     "end_time": None,
     "all_day": False,
-    "notes": "발표: 김평식 교수님",
+    "notes": "발표: 홍길동 교수님",
     "weekday_in_text": "목",
 }
-EXAMPLE_LINE = "• 10/22(목) 12:00–13:00 신임교수모임 (10월) · 메모: 발표: 김평식 교수님 · 캘린더: 연구"
+EXAMPLE_LINE = "• 10/22(목) 12:00–13:00 신임교수모임 (10월) · 메모: 발표: 홍길동 교수님 · 캘린더: 연구"
 WRITABLE = [
     {"name": "연구", "source": "iCloud", "is_default": True},
     {"name": "Work", "source": "Exchange", "is_default": False},
@@ -174,7 +174,7 @@ def test_the_example_note_becomes_thursday_october_22_noon_to_one():
     assert event.title == "신임교수모임 (10월)"
     assert (event.start, event.end) == (at(10, 22, 12), at(10, 22, 13))
     assert event.day == date(2026, 10, 22) and event.to_payload()["weekday"] == "목"
-    assert event.notes == "발표: 김평식 교수님" and event.location == ""
+    assert event.notes == "발표: 홍길동 교수님" and event.location == ""
     assert event.end_defaulted and not event.needs_time and not event.all_day
     assert event.warnings == []  # (목) matches, not past, not midnight
     assert preview_text([event], "연구", TODAY) == EXAMPLE_LINE
@@ -277,13 +277,13 @@ def test_preview_lines_carry_location_notes_and_warnings():
             **EXAMPLE,
             "date": "2026-10-21",
             "location": "  본관 302호 ",
-            "notes": "발표: 김평식 교수님\n\n  준비물: 노트북  ",
+            "notes": "발표: 홍길동 교수님\n\n  준비물: 노트북  ",
         }
     )
-    assert event.notes == "발표: 김평식 교수님\n준비물: 노트북"  # lines kept, blanks dropped
+    assert event.notes == "발표: 홍길동 교수님\n준비물: 노트북"  # lines kept, blanks dropped
     lines = preview_text([event], "연구", TODAY, ["전체 안내"]).splitlines()
     assert lines == [
-        "• 10/21(수) 12:00–13:00 신임교수모임 (10월) · 장소: 본관 302호 · 메모: 발표: 김평식 교수님 / 준비물: 노트북 · 캘린더: 연구",
+        "• 10/21(수) 12:00–13:00 신임교수모임 (10월) · 장소: 본관 302호 · 메모: 발표: 홍길동 교수님 / 준비물: 노트북 · 캘린더: 연구",
         "  ⚠️ 요일 불일치: 본문은 (목)인데 날짜는 수요일",
         "⚠️ 전체 안내",
     ]
@@ -380,7 +380,7 @@ def test_propose_stores_the_proposal_under_the_bound_key_and_returns_a_preview()
         "end_time": "13:00",
         "all_day": False,
         "location": "",
-        "notes": "발표: 김평식 교수님",
+        "notes": "발표: 홍길동 교수님",
         "needs_time": False,
         "end_defaulted": True,
         "warnings": [],
@@ -395,7 +395,7 @@ def test_propose_stores_the_proposal_under_the_bound_key_and_returns_a_preview()
             "end": "2026-10-22T13:00:00+09:00",
             "all_day": False,
             "location": "",
-            "notes": "발표: 김평식 교수님",
+            "notes": "발표: 홍길동 교수님",
             "needs_time": False,
         }
     ]
@@ -564,7 +564,7 @@ def test_creating_a_confirmed_proposal_calls_the_adapter_per_event():
         "end": at(10, 22, 13),
         "all_day": False,
         "location": None,
-        "notes": "발표: 김평식 교수님",
+        "notes": "발표: 홍길동 교수님",
         "calendar_name": "연구",
     }
     assert outcome.created == 2 and not outcome.fatal
@@ -882,7 +882,7 @@ def test_writable_calendars_and_the_default():
 def test_create_event_sets_every_field_and_saves_once():
     world, research, work = calendars_world()
     result = adapter(world).create_event(
-        "신임교수모임 (10월)", at(10, 22, 12), at(10, 22, 13), False, location="본관 302호", notes="발표: 김평식 교수님"
+        "신임교수모임 (10월)", at(10, 22, 12), at(10, 22, 13), False, location="본관 302호", notes="발표: 홍길동 교수님"
     )
     assert result == {"ok": True, "id": "EV-1", "calendar": "연구", "error": None}
     [event] = world.built
@@ -892,7 +892,7 @@ def test_create_event_sets_every_field_and_saves_once():
         "end": at(10, 22, 13).timestamp(),
         "all_day": False,
         "location": "본관 302호",
-        "notes": "발표: 김평식 교수님",
+        "notes": "발표: 홍길동 교수님",
         "calendar": research,
     }
     [(saved, span, commit, error)] = world.saves
@@ -1177,7 +1177,7 @@ def test_category_proposal_is_stored_with_the_suggestion_and_asks_for_a_category
     assert payload["confirm_question"] == QUESTION_KHU
     assert "calendar" not in payload and payload["warnings"] == []
     # No calendar in the preview line: the user picks it.
-    assert payload["preview"] == "• 10/22(목) 12:00–13:00 신임교수모임 (10월) · 메모: 발표: 김평식 교수님"
+    assert payload["preview"] == "• 10/22(목) 12:00–13:00 신임교수모임 (10월) · 메모: 발표: 홍길동 교수님"
     pending = store.pending_proposal(KEY, NOW)
     assert pending["suggested_category"] == "Event-KHU" and pending["calendar"] is None
     assert [(c["label"], c["calendar"]) for c in pending["categories"]] == [(n, n) for n in CATEGORY_NAMES]

@@ -476,12 +476,12 @@ def test_a_briefing_in_conversation_has_all_four_parts():
 
 def test_folder_link_example_line_is_in_every_prompt_that_writes_one():
     """One link per subfolder: never "(폴더 열기: 폴더 열기)" again."""
-    terminal_example = f"- 01_Youn\n  {EXAMPLE_FOLDER_LINK}\n  - 김공저: draft.tex (<modified>)"
+    terminal_example = f"- 01_ProjectA\n  {EXAMPLE_FOLDER_LINK}\n  - 김공저: draft.tex (<modified>)"
     assert terminal_example in build_update_prompt()  # 업뎃 reporting to 고뭉치
     assert terminal_example in build_options(env={}, persona="update").system_prompt  # 업뎃 answering directly
     assert terminal_example.replace("\n", "\n  ") in MUNGCHI_SYSTEM_PROMPT  # 고뭉치 relaying it, indented
     assert SLACK_FOLDER_LINE_EXAMPLE == (
-        "• *01_Youn* <https://www.dropbox.com/home/20_%EC%97%B0%EA%B5%AC-%EC%A7%84%ED%96%89/01_Youn|📂 열기>"
+        "• *01_ProjectA* <https://www.dropbox.com/home/20_%EC%97%B0%EA%B5%AC-%EC%A7%84%ED%96%89/01_ProjectA|📂 열기>"
     )
     for persona in ("mungchi", "update"):  # in Slack, the one-line form overrides the layout above
         slack_prompt = build_options(env={}, persona=persona, extra_system_prompt=SLACK_FORMAT_PROMPT).system_prompt
@@ -1113,7 +1113,7 @@ from mungchi.state import StateStore, utcnow  # noqa: E402
 from mungchi.tools import event_proposals, macos_calendar  # noqa: E402
 from mungchi.tools.event_proposals import CONFIRM_QUESTION, CreationOutcome, CreationResult  # noqa: E402
 
-NOTE_EVENT = {"title": "신임교수모임 (10월)", "date": "2099-10-22", "start_time": "12:00", "notes": "발표: 김평식 교수님"}
+NOTE_EVENT = {"title": "신임교수모임 (10월)", "date": "2099-10-22", "start_time": "12:00", "notes": "발표: 홍길동 교수님"}
 
 
 def _propose_decision(persona="mungchi", agent_type=None, agent_id=None):
@@ -1216,7 +1216,7 @@ def test_prompts_propose_and_end_with_the_exact_question():
             f'마지막 줄은 결과의 confirm_question(카테고리를 고르라는 질문, 또는 "{CONFIRM_QUESTION}")을 '
             "한 글자도 바꾸지 말고 그대로 쓴다"
         ) in prompt
-        assert '예: "신임교수모임 (10월)"' in prompt and '"발표: 김평식 교수님"' in prompt
+        assert '예: "신임교수모임 (10월)"' in prompt and '"발표: 홍길동 교수님"' in prompt
         assert '"오후 12시"는 12:00(정오)이다. "오전 12시"는 00:00(자정)으로 넣고' in prompt
         assert "weekday_in_text" in prompt and "오늘이거나 오늘 뒤에 오는 가장 가까운 그 날짜" in prompt
         assert "시작 시각이 없으면 짐작하지 않는다" in prompt and "몇 시인지 묻는다" in prompt

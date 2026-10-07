@@ -60,7 +60,7 @@ INPUT_SCHEMA: dict[str, Any] = {
                     "end_time": {"type": ["string", "null"], "description": "24시간제 HH:MM. 없으면 null."},
                     "all_day": {"type": "boolean", "default": False, "description": "종일 일정이면 true."},
                     "location": {"type": ["string", "null"], "description": "장소(있으면)."},
-                    "notes": {"type": ["string", "null"], "description": "발표자·준비물 등 메모(있으면). 예: 발표: 김평식 교수님"},
+                    "notes": {"type": ["string", "null"], "description": "발표자·준비물 등 메모(있으면). 예: 발표: 홍길동 교수님"},
                     "weekday_in_text": {
                         "type": ["string", "null"],
                         "description": "본문에 적힌 요일 한 글자(월·화·수·목·금·토·일, 예: (목) → 목). 없으면 넣지 않는다.",
