@@ -524,7 +524,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "예시:\n"
             "  python -m mungchi                       # 대화 모드\n"
-            "  python -m mungchi --brief               # 오늘 브리핑 (일정, Dropbox 업데이트, 크레딧)\n"
+            "  python -m mungchi --brief               # 오늘 브리핑 (날씨, 일정, Dropbox 업데이트, 크레딧)\n"
             '  python -m mungchi "어제 공저자들이 뭐 고쳤어?"   # 질문 한 번\n'
             "  python -m mungchi slack                 # Slack 봇 실행 (Socket Mode, BRIEF_TIME이 있으면 아침 브리핑도)\n"
             "  python -m mungchi --brief --slack       # 오늘 브리핑을 지금 바로 Slack에 올리기 (아침 브리핑 시험용)\n"
@@ -532,6 +532,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  python -m mungchi --agent schedule      # '일정'과 바로 대화\n"
             "  python -m mungchi --list-models         # 쓸 수 있는 모델 ID 확인 (MUNGCHI_MODEL 고르기)\n"
             "  python -m mungchi --credits             # Chat KHU 남은 크레딧과 이번 달 사용량 (LLM 호출 없음)\n"
+            "  python -m mungchi --weather             # 오늘 서울 날씨 한 줄 (Open-Meteo, LLM 호출 없음)\n"
             "  python -m mungchi --calendar-setup      # Mac 캘린더 앱 연결 (처음 한 번, 터미널에서)\n"
             "  python -m mungchi --dropbox-check --hours 72   # 업뎃이 Dropbox 변경을 못 찾을 때 원인 확인 (최근 72시간)\n"
             "  python -m mungchi service install       # (macOS) Slack 봇을 백그라운드 서비스로 설치 (로그인하면 자동 시작)\n"
@@ -563,7 +564,7 @@ def build_parser() -> argparse.ArgumentParser:
     opts.add_argument(
         "--brief",
         action="store_true",
-        help="오늘 브리핑(오늘의 일정, Dropbox 업데이트, Chat KHU 크레딧)을 한 번 받고 끝냅니다",
+        help="오늘 브리핑(날씨, 오늘의 일정, Dropbox 업데이트, Chat KHU 크레딧)을 한 번 받고 끝냅니다",
     )
     opts.add_argument(
         "--slack",
@@ -593,6 +594,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Chat KHU(Mindlogic 게이트웨이)의 남은 크레딧, 이번 달 사용량과 모델별 사용량을 보여 주고 끝냅니다 "
             "(에이전트는 실행하지 않음, LLM 호출 없음)"
+        ),
+    )
+    opts.add_argument(
+        "--weather",
+        action="store_true",
+        help=(
+            "오늘 날씨(WEATHER_LABEL, 기본 서울)를 한 줄로 보여 주고 끝냅니다: 날씨, 최저·최고 기온, 강수확률, 미세먼지 "
+            "(Open-Meteo, 에이전트는 실행하지 않음, LLM 호출 없음)"
         ),
     )
     opts.add_argument(
@@ -677,6 +686,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--credits는 질문이나 다른 옵션(--brief, --slack, --agent, --list-models, --calendar-setup, "
             "--dropbox-check, slack)과 함께 쓸 수 없습니다."
         )
+    if args.weather and (
+        args.question
+        or args.brief
+        or args.slack
+        or args.agent
+        or args.list_models
+        or args.credits
+        or args.calendar_setup
+        or args.dropbox_check
+    ):
+        parser.error(
+            "--weather는 질문이나 다른 옵션(--brief, --slack, --agent, --list-models, --credits, --calendar-setup, "
+            "--dropbox-check, slack)과 함께 쓸 수 없습니다."
+        )
     if args.calendar_setup and (args.question or args.brief or args.slack or args.agent or args.list_models):
         parser.error(
             "--calendar-setup은 질문이나 다른 옵션(--brief, --slack, --agent, --list-models, slack)과 함께 쓸 수 없습니다."
@@ -717,6 +740,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             from .credits import run_credits_cli
 
             return run_credits_cli()
+        if args.weather:
+            from .weather import run_weather_cli
+
+            return run_weather_cli()
         if args.calendar_setup:
             from .calendar_setup import run_calendar_setup
 

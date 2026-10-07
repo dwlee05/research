@@ -118,6 +118,66 @@ def get_credit_alert_percent(env: Mapping[str, str] | None = None) -> float:
     return min(max(value, 0.0), 100.0)
 
 
+# ---------------------------------------------------------------- weather (Open-Meteo, no key)
+
+DEFAULT_WEATHER_LABEL = "서울"
+DEFAULT_WEATHER_LAT = 37.5665
+DEFAULT_WEATHER_LON = 126.9780
+MAX_WEATHER_LABEL_CHARS = 20
+# BRIEF_WEATHER values that leave the weather line out of the briefing (any case).
+BRIEF_WEATHER_OFF_VALUES = frozenset({"off", "0", "false"})
+
+
+@dataclass(frozen=True)
+class WeatherConfig:
+    """Where the weather line is for: ``label`` (e.g. 서울), coordinates and the IANA time zone.
+
+    ``warnings`` are Korean lines about values that could not be used.
+    """
+
+    label: str = DEFAULT_WEATHER_LABEL
+    latitude: float = DEFAULT_WEATHER_LAT
+    longitude: float = DEFAULT_WEATHER_LON
+    timezone_name: str = DEFAULT_TIMEZONE
+    warnings: tuple[str, ...] = ()
+
+
+def _coordinate(raw: str, limit: float) -> float | None:
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if value == value and -limit <= value <= limit else None  # NaN fails value == value
+
+
+def load_weather_config(env: Mapping[str, str] | None = None) -> WeatherConfig:
+    """``WEATHER_LABEL``, ``WEATHER_LAT``, ``WEATHER_LON`` (default: Seoul) and ``TIMEZONE``; never raises.
+
+    Coordinates that are not numbers, out of range, or only half set fall
+    back to Seoul (label included, so the line never names a place it does
+    not describe), with a Korean warning.
+    """
+    label = " ".join(_get(env, "WEATHER_LABEL").split())[:MAX_WEATHER_LABEL_CHARS] or DEFAULT_WEATHER_LABEL
+    timezone_name = getattr(get_timezone(env), "key", "") or DEFAULT_TIMEZONE
+    raw_lat, raw_lon = _get(env, "WEATHER_LAT"), _get(env, "WEATHER_LON")
+    if not raw_lat and not raw_lon:
+        return WeatherConfig(label=label, timezone_name=timezone_name)
+    lat = _coordinate(raw_lat, 90.0) if raw_lat else None
+    lon = _coordinate(raw_lon, 180.0) if raw_lon else None
+    if lat is None or lon is None:
+        warning = (
+            f"WEATHER_LAT/WEATHER_LON 값('{raw_lat}', '{raw_lon}')을 쓸 수 없어 서울 날씨를 보여 줍니다. "
+            "위도(-90~90)와 경도(-180~180)를 둘 다 숫자로 적으세요. 예: WEATHER_LAT=37.5665, WEATHER_LON=126.9780"
+        )
+        return WeatherConfig(timezone_name=timezone_name, warnings=(warning,))
+    return WeatherConfig(label=label, latitude=lat, longitude=lon, timezone_name=timezone_name)
+
+
+def get_brief_weather(env: Mapping[str, str] | None = None) -> bool:
+    """``BRIEF_WEATHER``: the weather line in the briefing, on unless ``off``, ``0`` or ``false``."""
+    return _get(env, "BRIEF_WEATHER").lower() not in BRIEF_WEATHER_OFF_VALUES
+
+
 def get_timezone_name(env: Mapping[str, str] | None = None) -> str:
     return _get(env, "TIMEZONE") or DEFAULT_TIMEZONE
 

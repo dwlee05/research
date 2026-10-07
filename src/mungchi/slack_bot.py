@@ -1,6 +1,7 @@
 """Slack front end: the Socket Mode bots (``python -m mungchi slack``), the
 scheduled morning briefing they send (``BRIEF_TIME``) and briefing delivery
-(``python -m mungchi --brief --slack``).
+(``python -m mungchi --brief --slack``). Short credit and weather questions
+are answered by code, without an agent turn.
 
 One process runs up to three Slack apps, one per persona: 고뭉치 (@moongchi,
 the orchestrator), 업뎃 (@update) and 일정 (@schedule), each with its own
@@ -28,7 +29,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Mapping, S
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 
-from . import briefing, config, credits
+from . import briefing, config, credits, weather
 from .briefing import BRIEF_CRASH_TEXT, build_briefing
 from .main import TurnResult, briefing_prompt, run_turn
 from .personas import MUNGCHI, PERSONA_LABELS, PERSONAS, SCHEDULE, SLACK_HANDLES, UPDATE, josa
@@ -48,10 +49,13 @@ log = logging.getLogger("mungchi.slack")
 RunTurn = Callable[..., Awaitable[TurnResult]]
 # Returns the Slack text for the credit shortcut (blocking: run in a worker thread).
 CreditText = Callable[[], str]
+# Returns the Slack text for the weather shortcut (blocking: run in a worker thread).
+WeatherText = Callable[[], str]
 
 REFUSAL_TEXT = "죄송하지만 이 봇은 소유자만 사용할 수 있어요."
 FRESH_SESSION_NOTE = "이 스레드의 이전 대화는 이어 갈 수 없어서, 다음 메시지부터는 새 대화로 시작해요."
 CREDIT_CRASH_TEXT = "⚠️ 크레딧을 확인하지 못했어요 ({kind}). 잠시 후 다시 시도해 주세요."
+WEATHER_CRASH_TEXT = "⚠️ 날씨를 가져오지 못했어요 ({kind}). 잠시 후 다시 시도해 주세요."
 
 # Low-credit alert inside the running bots: first check shortly after start, then hourly.
 CREDIT_CHECK_FIRST_DELAY_SECONDS = 60.0
@@ -341,6 +345,7 @@ class SlackHandler:
         our_bot_user_ids: set[str] | None = None,
         status_interval: float = STATUS_INTERVAL_SECONDS,
         credit_text: CreditText | None = None,
+        weather_text: WeatherText | None = None,
     ):
         self.allowed_user_ids = frozenset(allowed_user_ids)
         if not self.allowed_user_ids:
@@ -359,6 +364,8 @@ class SlackHandler:
         self.status_interval = status_interval
         # The credit shortcut: gateway endpoints only, never an agent turn.
         self.credit_text = credit_text or credits.slack_credit_text
+        # The weather shortcut: Open-Meteo only, never an agent turn.
+        self.weather_text = weather_text or weather.slack_weather_text
         self._semaphore = semaphore or asyncio.Semaphore(max(1, max_concurrent))
         self._locks: dict[str, list[Any]] = {}
         self._seen = RecentKeys()
@@ -418,6 +425,9 @@ class SlackHandler:
         if credits.is_credit_query(request):
             await self._answer_credits(channel, thread_ts)
             return
+        if weather.is_weather_query(request):
+            await self._answer_weather(channel, thread_ts)
+            return
         await self._answer(channel, thread_ts, request or self.default_prompt())
 
     async def _refuse(self, channel: str, thread_ts: str, user: str) -> None:
@@ -437,6 +447,19 @@ class SlackHandler:
             _log_exception("크레딧을 확인하지 못했습니다.", exc)
             text = CREDIT_CRASH_TEXT.format(kind=type(exc).__name__)
         for chunk in to_slack_chunks(text) or [CREDIT_CRASH_TEXT.format(kind="빈 응답")]:
+            await self._post(channel, thread_ts, chunk)
+
+    # -- weather shortcut (no agent turn, no LLM call, no session)
+
+    async def _answer_weather(self, channel: str, thread_ts: str) -> None:
+        """Reply in the thread with today's weather line; the thread -> session map is not touched."""
+        log.info("%s: 스레드 %s:%s 날씨 바로 답변 (에이전트 실행 없음)", self.texts.label, channel, thread_ts)
+        try:
+            text = await asyncio.to_thread(self.weather_text)
+        except Exception as exc:  # noqa: BLE001 - reported in Slack without details
+            _log_exception("날씨를 가져오지 못했습니다.", exc)
+            text = WEATHER_CRASH_TEXT.format(kind=type(exc).__name__)
+        for chunk in to_slack_chunks(text) or [WEATHER_CRASH_TEXT.format(kind="빈 응답")]:
             await self._post(channel, thread_ts, chunk)
 
     # -- running a turn
@@ -750,6 +773,7 @@ async def morning_brief_tick(
     run: RunTurn | None = None,
     sessions: ThreadSessions | None = None,
     credit_fetch: Callable[[], credits.CreditReport] | None = None,
+    weather_fetch: Callable[[], weather.WeatherReport] | None = None,
     semaphore: asyncio.Semaphore | None = None,
     run_timeout: float | None = BRIEF_RUN_TIMEOUT_SECONDS,
 ) -> str:
@@ -793,6 +817,7 @@ async def morning_brief_tick(
                 now=now,
                 env=env,
                 credit_fetch=credit_fetch,
+                weather_fetch=weather_fetch,
                 run_timeout=run_timeout,
             )
     except Exception as exc:  # noqa: BLE001 - one scrubbed line, the bots keep running
@@ -995,15 +1020,17 @@ async def post_briefing(
     env: Mapping[str, str] | None = None,
     on_status: Callable[[str], Any] | None = None,
     credit_fetch: Callable[[], credits.CreditReport] | None = None,
+    weather_fetch: Callable[[], weather.WeatherReport] | None = None,
     run_timeout: float | None = None,
 ) -> int:
     """Run today's briefing once and post it to ``channel`` (a channel id, or several, e.g. one DM per user).
 
-    The briefing is ``briefing.build_briefing``'s: header, 고뭉치's
-    ① 오늘의 일정 and ② Dropbox 업데이트, then the credits appended by code.
-    If the run fails, the header, a short failure line and the credits still
-    go out. The first message reads without opening anything; longer
-    briefings continue in that message's thread. Each thread is mapped to
+    The briefing is ``briefing.build_briefing``'s: header with the weather
+    line under it (by code), 고뭉치's ① 오늘의 일정 and ② Dropbox 업데이트,
+    then the credits appended by code. If the run fails, the header, the
+    weather line, a short failure line and the credits still go out. The
+    first message reads without opening anything; longer briefings continue
+    in that message's thread. Each thread is mapped to
     고뭉치's briefing session, so replying to @moongchi there continues it.
 
     This is a briefing run (``briefing=True``): its Dropbox check looks at the
@@ -1019,6 +1046,7 @@ async def post_briefing(
         slack=True,
         on_status=on_status,
         credit_fetch=credit_fetch,
+        weather_fetch=weather_fetch,
         run_timeout=run_timeout,
     )
     if result.crash is not None:

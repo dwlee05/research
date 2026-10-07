@@ -560,7 +560,8 @@ def test_post_briefing_posts_header_and_threads_overflow(tmp_path):
     assert run.calls[0]["briefing"] is True  # --brief --slack is the scheduled briefing
     first, *rest = client.posts
     assert first["channel"] == CHANNEL and "thread_ts" not in first
-    assert first["text"].startswith("☀️ *오늘의 브리핑 (10/05 월)*\n\n*섹션 0*")
+    # This env has no BRIEF_WEATHER=off, so the weather line is there; tests are offline, so it is the failure note.
+    assert first["text"].startswith("☀️ *오늘의 브리핑 (10/05 월)*\n🌤️ *서울 날씨*: 가져오지 못했어요\n\n*섹션 0*")
     assert rest and all(p["thread_ts"] == first["_ts"] for p in rest)
     # The credits come last, appended by code (no gateway configured here: a one-line note).
     assert rest[-1]["text"].endswith("\n\n💳 *Chat KHU 크레딧*: 확인 안 함 (Chat KHU 게이트웨이를 쓰지 않아요)")
@@ -1782,3 +1783,226 @@ def test_run_bots_turns_off_a_briefing_to_a_channel_name(tmp_path, monkeypatch, 
         _built, started = _run_bots_with_fake_scheduler(monkeypatch, tmp_path, {**ALL_BOTS_ENV, "SLACK_BRIEF_CHANNEL": "#general"})
     assert started == []
     assert "아침 브리핑을 보낼 수 없어 끕니다" in caplog.text and "채널 ID" in caplog.text
+
+
+# ---------------------------------------------------------------- weather shortcut (no LLM)
+
+
+class FakeWeatherText:
+    """Stands in for ``weather.slack_weather_text``: counts calls, returns a canned line."""
+
+    TEXT = "🌤️ *서울 날씨*: 대체로 맑음 · 최저 12° / 최고 23° · 강수확률 10% · 미세먼지 보통"
+
+    def __init__(self, result=None):
+        self.result = result if result is not None else self.TEXT
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        if isinstance(self.result, BaseException):
+            raise self.result
+        return self.result
+
+
+@pytest.mark.parametrize("persona", ["mungchi", "update", "schedule"])
+@pytest.mark.parametrize(
+    "event,source",
+    [
+        (mention(f"<@{BOT}> 날씨"), "mention"),
+        (mention(f"<@{BOT}>  오늘 서울 날씨 어때?"), "mention"),
+        (dm("날씨 알려줘"), "dm"),
+        (dm("오늘 날씨"), "dm"),
+    ],
+)
+def test_weather_shortcut_answers_without_an_agent_turn(tmp_path, persona, event, source):
+    fake, credit = FakeWeatherText(), FakeCredits()
+    handler, client, run = make_handler(tmp_path, persona=persona, weather_text=fake, credit_text=credit)
+    asyncio.run(handler.handle_event(event, event_id="Ev1", source=source))
+    assert run.calls == []  # run_turn is never called: no LLM
+    assert fake.calls == 1 and credit.calls == 0
+    [post] = client.posts
+    assert post["text"] == FakeWeatherText.TEXT
+    assert post["thread_ts"] == event["ts"] and post["channel"] == event["channel"]
+    assert client.updates == []  # no placeholder to edit
+    # No session / thread-map entry for a shortcut reply.
+    assert not (tmp_path / "threads.json").exists()
+    assert handler.sessions.threads() == {}
+
+
+def test_weather_shortcut_in_a_thread_replies_there_and_keeps_the_threads_session(tmp_path):
+    root = "1700000000.000100"
+    handler, client, run = make_handler(tmp_path, weather_text=FakeWeatherText())
+    handler.sessions.set(CHANNEL, root, SESSION_1, persona="mungchi")
+    asyncio.run(handler.handle_event(mention(f"<@{BOT}> 날씨?", ts="1700000000.000500", thread_ts=root), event_id="E", source="mention"))
+    assert run.calls == []
+    assert client.posts[0]["thread_ts"] == root
+    assert handler.sessions.threads() == {f"mungchi:{CHANNEL}:{root}": SESSION_1}
+
+
+@pytest.mark.parametrize("persona", ["mungchi", "update", "schedule"])
+def test_weather_shortcut_still_refuses_strangers(tmp_path, persona):
+    fake = FakeWeatherText()
+    handler, client, run = make_handler(tmp_path, persona=persona, weather_text=fake)
+
+    async def scenario():
+        await handler.handle_event(mention(f"<@{BOT}> 날씨", user=STRANGER), event_id="Ev1", source="mention")
+        await handler.handle_event(dm("오늘 날씨 어때?", user=STRANGER), event_id="Ev2", source="dm")
+
+    asyncio.run(scenario())
+    assert fake.calls == 0 and run.calls == []
+    assert [p["text"] for p in client.posts] == [REFUSAL_TEXT, REFUSAL_TEXT]
+
+
+@pytest.mark.parametrize("text", ["내일 비 오면 일정 바꿔야 할까?", "내일 날씨 어때?", "날씨 좋으면 산책 갈 시간 있어?"])
+def test_longer_weather_questions_go_to_the_agent(tmp_path, text):
+    fake = FakeWeatherText()
+    handler, client, run = make_handler(tmp_path, weather_text=fake)
+    asyncio.run(handler.handle_event(mention(f"<@{BOT}> {text}"), event_id="Ev1", source="mention"))
+    assert fake.calls == 0
+    assert [c["prompt"] for c in run.calls] == [text]
+
+
+def test_weather_shortcut_failure_is_a_short_korean_note_without_secrets(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    fake = FakeWeatherText(RuntimeError(f"boom {SLACK_TOKEN}"))
+    handler, client, run = make_handler(tmp_path, weather_text=fake)
+    with caplog.at_level(logging.ERROR, logger="mungchi.slack"):
+        asyncio.run(handler.handle_event(mention(f"<@{BOT}> 날씨"), event_id="Ev1", source="mention"))
+    assert run.calls == []
+    assert [p["text"] for p in client.posts] == [slack_bot.WEATHER_CRASH_TEXT.format(kind="RuntimeError")]
+    assert slack_bot.WEATHER_CRASH_TEXT.format(kind="RuntimeError") == "⚠️ 날씨를 가져오지 못했어요 (RuntimeError). 잠시 후 다시 시도해 주세요."
+    assert SLACK_TOKEN not in caplog.text
+
+
+def test_default_weather_text_calls_only_open_meteo(tmp_path, monkeypatch):
+    import httpx
+
+    from mungchi import weather
+
+    hosts = []
+
+    def handle(request):
+        hosts.append(request.url.host)
+        if request.url.host == "api.open-meteo.com":
+            return httpx.Response(200, json={"daily": {"weather_code": [0], "temperature_2m_min": [9.6], "temperature_2m_max": [21.4], "precipitation_probability_max": [0]}})
+        return httpx.Response(200, json={"current": {"pm10": 12, "pm2_5": 5}})
+
+    real_client = httpx.Client
+    monkeypatch.setattr(weather.httpx, "Client", lambda **kw: real_client(transport=httpx.MockTransport(handle), timeout=kw.get("timeout")))
+    handler, client, run = make_handler(tmp_path)  # default weather_text
+    asyncio.run(handler.handle_event(dm("날씨"), event_id="Ev1", source="dm"))
+    assert run.calls == []
+    assert hosts == ["api.open-meteo.com", "air-quality-api.open-meteo.com"]
+    assert [p["text"] for p in client.posts] == ["☀️ *서울 날씨*: 맑음 · 최저 10° / 최고 21° · 강수확률 0% · 미세먼지 좋음"]
+
+
+def test_default_weather_text_offline_is_the_short_note(tmp_path):
+    handler, client, run = make_handler(tmp_path)  # conftest: no network
+    asyncio.run(handler.handle_event(dm("날씨"), event_id="Ev1", source="dm"))
+    assert run.calls == []
+    assert [p["text"] for p in client.posts] == ["🌤️ *서울 날씨*: 가져오지 못했어요"]
+
+
+# ---------------------------------------------------------------- the weather line in --brief --slack and the scheduled briefing
+
+
+def _sunny():
+    from mungchi import weather
+
+    return weather.WeatherReport(
+        label="서울",
+        forecast=weather.Forecast(code=1, low=11.5, high=22.6, rain_chance=10),
+        air=weather.AirQuality(pm10=42.3, pm2_5=12.0),
+    )
+
+
+SLACK_WEATHER_LINE = "🌤️ *서울 날씨*: 대체로 맑음 · 최저 12° / 최고 23° · 강수확률 10% · 미세먼지 보통"
+
+
+def test_post_briefing_puts_the_weather_right_under_the_header(tmp_path):
+    client = FakeSlackClient()
+    run = FakeRun(TurnResult(text="*① 오늘의 일정*\n• 일정 없음", session_id=SESSION_1), statuses=())
+    code = asyncio.run(
+        post_briefing(client, CHANNEL, run=run, now=at(8, 7), env={}, credit_fetch=lambda: low_report(9050.5), weather_fetch=_sunny)
+    )
+    assert code == 0
+    [post] = client.posts
+    assert post["text"].startswith(f"☀️ *오늘의 브리핑 (10/08 목)*\n{SLACK_WEATHER_LINE}\n\n*① 오늘의 일정*\n• 일정 없음\n\n💳 ")
+    assert "날씨" not in run.calls[0]["prompt"] and "날씨" not in run.calls[0]["extra_system_prompt"]
+
+
+def test_brief_slack_cli_adds_the_weather_by_default(tmp_path, monkeypatch, capsys):
+    import httpx
+
+    from mungchi import weather
+
+    monkeypatch.delenv("BRIEF_WEATHER")  # conftest turns it off; the default is on
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    monkeypatch.setenv("SLACK_BRIEF_CHANNEL", CHANNEL)
+    client = FakeSlackClient()
+    monkeypatch.setattr(slack_bot, "AsyncWebClient", lambda token: client)
+    monkeypatch.setattr(slack_bot, "run_turn", FakeRun(TurnResult(text="본문", session_id=SESSION_1), statuses=()))
+    monkeypatch.setattr(slack_bot, "setup_logging", lambda: None)
+
+    def handle(request):
+        if request.url.host == "api.open-meteo.com":
+            return httpx.Response(200, json={"daily": {"weather_code": [3], "temperature_2m_min": [8], "temperature_2m_max": [15], "precipitation_probability_max": [30]}})
+        return httpx.Response(500)
+
+    real_client = httpx.Client
+    monkeypatch.setattr(weather.httpx, "Client", lambda **kw: real_client(transport=httpx.MockTransport(handle), timeout=kw.get("timeout")))
+    assert main(["--brief", "--slack"]) == 0
+    [post] = client.posts
+    header, line = post["text"].split("\n\n")[0].splitlines()
+    assert header.startswith("☀️ *오늘의 브리핑 (")
+    assert line == "☁️ *서울 날씨*: 흐림 · 최저 8° / 최고 15° · 강수확률 30%"  # the dust request failed: left out
+
+
+def test_scheduled_briefing_has_the_weather_under_the_header_even_when_the_agent_fails(tmp_path):
+    def scheduled(run, store):
+        return asyncio.run(
+            slack_bot.morning_brief_tick(
+                client,
+                [OWNER],
+                schedule=MORNING,
+                state=slack_bot.BriefLoopState(),
+                env={"BRIEF_TIME": "07:00"},
+                store=store,
+                clock=FakeClock(at(8, 7, 0)),
+                run=run,
+                credit_fetch=lambda: low_report(9050.5),
+                weather_fetch=_sunny,
+            )
+        )
+
+    client = FakeSlackClient()
+    ok = FakeRun(TurnResult(text="*① 오늘의 일정*\n• 일정 없음", session_id=SESSION_1), statuses=())
+    assert scheduled(ok, StateStore(tmp_path / "a.json")) == "sent"
+    assert client.posts[0]["text"].startswith(f"☀️ *오늘의 브리핑 (10/08 목)*\n{SLACK_WEATHER_LINE}\n\n*① 오늘의 일정*")
+
+    assert scheduled(FakeRun(RuntimeError("agent exploded"), statuses=()), StateStore(tmp_path / "b.json")) == "failed"
+    head, failure, credit_part = client.posts[1]["text"].split("\n\n")
+    assert head == f"☀️ *오늘의 브리핑 (10/08 목)*\n{SLACK_WEATHER_LINE}"
+    assert failure == "⚠️ 오늘 브리핑을 만들지 못했어요 (RuntimeError). 실행 로그를 확인해 주세요."
+    assert credit_part.startswith("💳 *Chat KHU 크레딧*: 9,050.5 남음")
+
+
+def test_scheduled_briefing_with_brief_weather_off_has_no_weather_line(tmp_path):
+    client = FakeSlackClient()
+    fetched = []
+    code = asyncio.run(
+        slack_bot.morning_brief_tick(
+            client,
+            [OWNER],
+            schedule=MORNING,
+            state=slack_bot.BriefLoopState(),
+            env={"BRIEF_TIME": "07:00", "BRIEF_WEATHER": "off"},
+            store=StateStore(tmp_path / "state.json"),
+            clock=FakeClock(at(8, 7, 0)),
+            run=FakeRun(TurnResult(text="*① 오늘의 일정*\n• 일정 없음", session_id=SESSION_1), statuses=()),
+            credit_fetch=lambda: low_report(9050.5),
+            weather_fetch=lambda: fetched.append(1) or _sunny(),
+        )
+    )
+    assert code == "sent" and fetched == []
+    assert client.posts[0]["text"].startswith("☀️ *오늘의 브리핑 (10/08 목)*\n\n*① 오늘의 일정*")

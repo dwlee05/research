@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import httpx
 import pytest
 
 from mungchi import config
@@ -35,7 +36,15 @@ MUNGCHI_ENV_VARS = (
     "BRIEF_TIME",
     "BRIEF_DAYS",
     "BRIEF_CATCHUP_UNTIL",
+    "BRIEF_WEATHER",
+    "WEATHER_LABEL",
+    "WEATHER_LAT",
+    "WEATHER_LON",
 )
+
+
+def _no_network(self, request):
+    raise httpx.ConnectError("tests never use the network", request=request)
 
 
 @pytest.fixture(autouse=True)
@@ -45,9 +54,16 @@ def isolated_env(monkeypatch: pytest.MonkeyPatch, tmp_path):
     Tests also behave the same on a Mac: unless a test passes ``platform``
     itself, the platform is not macOS, so the real Calendar app (EventKit) is
     never touched.
+
+    The briefing's weather line (on by default) is off here so the briefing
+    tests see the header, the answer and the credits only; the weather tests
+    turn it on themselves. A real httpx request (one not given a
+    ``MockTransport``) fails as if offline instead of reaching the internet.
     """
     for name in MUNGCHI_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("BRIEF_WEATHER", "off")
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _no_network)
     monkeypatch.setattr(config, "current_platform", lambda: "linux")
     monkeypatch.chdir(tmp_path)
     yield

@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from mungchi import briefing, config, credits
+from mungchi import briefing, config, credits, weather
 from mungchi.briefing import (
     ALREADY,
     DAY_OFF,
@@ -264,3 +264,148 @@ def test_main_brief_goes_through_the_shared_briefing(monkeypatch, capsys):
     assert ANSWER in out
     assert out.rstrip().endswith("💳 Chat KHU 크레딧: 확인 안 함 (Chat KHU 게이트웨이를 쓰지 않아요)")
     assert run.calls[0]["briefing"] is True
+
+
+# ---------------------------------------------------------------- the weather line (by code, never through the model)
+
+SUNNY = weather.WeatherReport(
+    label="서울",
+    forecast=weather.Forecast(code=1, low=11.5, high=22.6, rain_chance=10),
+    air=weather.AirQuality(pm10=42.3, pm2_5=12.0),
+)
+WEATHER_LINE = "🌤️ 서울 날씨: 대체로 맑음 · 최저 12° / 최고 23° · 강수확률 10% · 미세먼지 보통"
+WEATHER_ON: dict[str, str] = {}  # an explicit env without BRIEF_WEATHER: the default, on
+
+
+class FakeWeather:
+    def __init__(self, result=SUNNY):
+        self.result = result
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        if isinstance(self.result, BaseException):
+            raise self.result
+        return self.result
+
+
+@pytest.mark.parametrize("slack", [False, True])
+def test_weather_line_sits_right_under_the_header(slack):
+    run, fetch = FakeRun(), FakeWeather()
+    result = asyncio.run(
+        build_briefing(run=run, now=seoul(8, 7), env=WEATHER_ON, credit_fetch=report, weather_fetch=fetch, slack=slack)
+    )
+    header = "☀️ *오늘의 브리핑 (10/08 목)*" if slack else "☀️ 오늘의 브리핑 (10/08 목)"
+    line = WEATHER_LINE.replace("서울 날씨", "*서울 날씨*") if slack else WEATHER_LINE
+    assert result.weather == line and fetch.calls == 1
+    assert result.text.startswith(f"{header}\n{line}\n\n*① 오늘의 일정*")
+    head, *middle, credit_part = result.text.split("\n\n")
+    assert head.splitlines() == [header, line] and middle == ANSWER.split("\n\n")
+    assert credit_part.startswith("💳 ")
+    # The model is never asked about (or told) the weather.
+    prompt = run.calls[0]["prompt"] + run.calls[0]["extra_system_prompt"]
+    assert "날씨" not in prompt and "미세먼지" not in prompt
+
+
+def test_agent_failure_still_gives_header_weather_failure_line_and_credits():
+    result = asyncio.run(
+        build_briefing(
+            run=FakeRun(RuntimeError("boom")), now=seoul(8, 7), env=WEATHER_ON, credit_fetch=report, weather_fetch=FakeWeather(), slack=True
+        )
+    )
+    assert result.failed
+    head, body, credit_part = result.text.split("\n\n")
+    assert head == "☀️ *오늘의 브리핑 (10/08 목)*\n🌤️ *서울 날씨*: 대체로 맑음 · 최저 12° / 최고 23° · 강수확률 10% · 미세먼지 보통"
+    assert body == "⚠️ 오늘 브리핑을 만들지 못했어요 (RuntimeError). 실행 로그를 확인해 주세요."
+    assert credit_part.startswith("💳 *Chat KHU 크레딧*: 9,050.5 남음")
+
+
+@pytest.mark.parametrize(
+    "fetch",
+    [
+        FakeWeather(weather.WeatherReport(label="서울", error="연결 실패: ConnectError")),
+        FakeWeather(RuntimeError("weather exploded")),
+    ],
+)
+def test_a_weather_failure_is_a_short_note_and_the_briefing_goes_out(fetch):
+    result = asyncio.run(build_briefing(run=FakeRun(), now=seoul(8, 7), env=WEATHER_ON, credit_fetch=report, weather_fetch=fetch))
+    assert not result.failed
+    assert result.text.startswith("☀️ 오늘의 브리핑 (10/08 목)\n🌤️ 서울 날씨: 가져오지 못했어요\n\n*① 오늘의 일정*")
+    assert "💳 Chat KHU 크레딧: 9,050.5 남음" in result.text
+
+
+@pytest.mark.parametrize("value", ["off", "0", "false", "OFF"])
+def test_brief_weather_off_leaves_the_line_out_and_fetches_nothing(value):
+    fetch = FakeWeather()
+    result = asyncio.run(
+        build_briefing(run=FakeRun(), now=seoul(8, 7), env={"BRIEF_WEATHER": value}, credit_fetch=report, weather_fetch=fetch)
+    )
+    assert fetch.calls == 0 and result.weather == ""
+    assert result.text.startswith("☀️ 오늘의 브리핑 (10/08 목)\n\n*① 오늘의 일정*")
+    assert "날씨" not in result.text
+
+
+def test_weather_and_credits_are_fetched_while_the_agent_runs():
+    import threading
+
+    fetched = {"weather": threading.Event(), "credits": threading.Event()}
+
+    def weather_fetch():
+        fetched["weather"].set()
+        return SUNNY
+
+    def credit_fetch():
+        fetched["credits"].set()
+        return report()
+
+    seen_during_run = {}
+
+    async def slow_run(prompt, **kwargs):
+        for _ in range(200):  # up to 2 s: the fetches run in worker threads meanwhile
+            if all(event.is_set() for event in fetched.values()):
+                break
+            await asyncio.sleep(0.01)
+        seen_during_run.update({name: event.is_set() for name, event in fetched.items()})
+        return TurnResult(text=ANSWER, session_id=SESSION)
+
+    result = asyncio.run(
+        build_briefing(run=slow_run, now=seoul(8, 7), env=WEATHER_ON, credit_fetch=credit_fetch, weather_fetch=weather_fetch)
+    )
+    assert seen_during_run == {"weather": True, "credits": True}
+    assert result.text.startswith(f"☀️ 오늘의 브리핑 (10/08 목)\n{WEATHER_LINE}\n\n")
+
+
+def test_brief_cli_prints_the_weather_under_the_header():
+    out, err = io.StringIO(), io.StringIO()
+    code = run_brief_cli(env=WEATHER_ON, run=FakeRun(), now=seoul(8, 7), credit_fetch=report, weather_fetch=FakeWeather(), out=out, err=err)
+    assert code == 0
+    assert out.getvalue().startswith(f"☀️ 오늘의 브리핑 (10/08 목)\n{WEATHER_LINE}\n\n*① 오늘의 일정*")
+
+    out = io.StringIO()
+    code = run_brief_cli(env=WEATHER_ON, run=FakeRun(RuntimeError("boom")), now=seoul(8, 7), credit_fetch=report, weather_fetch=FakeWeather(), out=out, err=io.StringIO())
+    assert code == 1
+    assert out.getvalue().startswith(f"☀️ 오늘의 브리핑 (10/08 목)\n{WEATHER_LINE}\n\n⚠️ 오늘 브리핑을 만들지 못했어요 (RuntimeError)")
+
+
+def test_main_brief_adds_the_open_meteo_line_by_default(monkeypatch, capsys):
+    import httpx
+
+    monkeypatch.delenv("BRIEF_WEATHER")  # conftest turns it off; the default is on
+    hosts = []
+
+    def handle(request):
+        hosts.append(request.url.host)
+        if request.url.host == "api.open-meteo.com":
+            return httpx.Response(200, json={"daily": {"weather_code": [63], "temperature_2m_min": [14.2], "temperature_2m_max": [19.8], "precipitation_probability_max": [80]}})
+        return httpx.Response(200, json={"current": {"pm10": 20, "pm2_5": 40}})
+
+    real_client = httpx.Client
+    monkeypatch.setattr(weather.httpx, "Client", lambda **kw: real_client(transport=httpx.MockTransport(handle), timeout=kw.get("timeout")))
+    run = FakeRun()
+    monkeypatch.setattr(briefing, "run_turn", run)
+    assert main(["--brief"]) == 0
+    first, second, *_ = capsys.readouterr().out.splitlines()
+    assert first.startswith("☀️ 오늘의 브리핑 (")
+    assert second == "🌧️ 서울 날씨: 비 · 최저 14° / 최고 20° · 강수확률 80% · 미세먼지 나쁨 · ☔ 우산 챙기세요"
+    assert hosts == ["api.open-meteo.com", "air-quality-api.open-meteo.com"]
+    assert "날씨" not in run.calls[0]["prompt"]

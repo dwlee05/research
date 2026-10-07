@@ -5,12 +5,15 @@ scheduled morning briefing of the running Slack bots (``BRIEF_TIME``) all go
 through ``build_briefing``, so they share one structure:
 
     ☀️ 오늘의 브리핑 (10/08 목)
+    🌤️ 서울 날씨: 대체로 맑음 · ...           ← added by code (Open-Meteo), no LLM; BRIEF_WEATHER=off drops it
     ① 오늘의 일정 · ② Dropbox 업데이트      ← 고뭉치's answer (one briefing run)
     💳 Chat KHU 크레딧: ...                 ← appended by code, no LLM
 
-The agent run is a briefing run (``briefing=True``): its Dropbox check looks
-at the time since the last briefing and moves that checkpoint. If the run
-fails, the header, a short Korean failure line and the credits still go out.
+The weather and the credits are fetched in worker threads while the agent
+runs; the model never sees them. The agent run is a briefing run
+(``briefing=True``): its Dropbox check looks at the time since the last
+briefing and moves that checkpoint. If the run fails, the header, the
+weather line, a short Korean failure line and the credits still go out.
 
 ``brief_due`` is the pure "is the morning briefing due now?" check used by
 the scheduler in ``slack_bot``.
@@ -25,7 +28,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Mapping, TextIO
 
-from . import config, credits
+from . import config, credits, weather
 from .main import TurnResult, briefing_prompt, run_turn
 from .personas import MUNGCHI
 from .slack_format import SLACK_FORMAT_PROMPT, brief_header
@@ -33,6 +36,7 @@ from .tools.common import safe_error, scrub
 
 RunTurn = Callable[..., Awaitable[TurnResult]]
 CreditFetch = Callable[[], credits.CreditReport]
+WeatherFetch = Callable[[], weather.WeatherReport]
 
 BRIEF_CRASH_TEXT = "⚠️ 오늘 브리핑을 만들지 못했어요 ({kind}). 실행 로그를 확인해 주세요."
 BRIEF_FAILED_TEXT = "⚠️ 고뭉치가 브리핑을 끝내지 못했어요."
@@ -93,13 +97,14 @@ def brief_due(schedule: config.BriefSchedule, now: datetime, last_brief_date: st
 
 @dataclass
 class Briefing:
-    """One briefing: the header, 고뭉치's part (or a failure line) and the credit section."""
+    """One briefing: the header, the weather line, 고뭉치's part (or a failure line) and the credit section."""
 
     header: str
     body: str
     credits: str
     result: TurnResult | None = None
     crash: BaseException | None = None
+    weather: str = ""  # empty with BRIEF_WEATHER=off
 
     @property
     def failed(self) -> bool:
@@ -111,12 +116,13 @@ class Briefing:
 
     @property
     def text(self) -> str:
-        return compose_briefing(self.header, self.body, self.credits)
+        return compose_briefing(self.header, self.body, self.credits, self.weather)
 
 
-def compose_briefing(header: str, body: str, credit_text: str) -> str:
-    """Header, body and credit section, separated by blank lines."""
-    return "\n\n".join(part.strip() for part in (header, body, credit_text) if part and part.strip())
+def compose_briefing(header: str, body: str, credit_text: str, weather_text: str = "") -> str:
+    """Header (with the weather line right under it), body and credit section, separated by blank lines."""
+    head = "\n".join(part.strip() for part in (header, weather_text) if part and part.strip())
+    return "\n\n".join(part.strip() for part in (head, body, credit_text) if part and part.strip())
 
 
 def crash_kind(exc: BaseException) -> str:
@@ -163,6 +169,38 @@ def credit_section(
         return f"💳 {label}: " + CREDIT_FAILED_NOTE.format(reason=type(exc).__name__)
 
 
+def weather_section(
+    env: Mapping[str, str] | None = None,
+    *,
+    fetch: WeatherFetch | None = None,
+    slack: bool = False,
+) -> str:
+    """Today's weather line (``weather.report_line``), or the short failure note. Never raises.
+
+    Only Open-Meteo is called, never a model. Blocking: run it in a worker
+    thread from async code.
+    """
+    label = config.DEFAULT_WEATHER_LABEL
+    try:
+        if fetch is None:
+            cfg = weather.load_config(env)  # logs a warning for unusable coordinates
+            label = cfg.label
+            report = weather.fetch_report(cfg)
+        else:
+            report = fetch()
+            label = report.label
+        if not report.ok:
+            weather.log.warning("브리핑의 날씨를 가져오지 못했습니다: %s", scrub(report.error or "응답 없음"))
+        return weather.report_line(report, slack=slack)
+    except Exception as exc:  # noqa: BLE001 - the briefing goes out anyway
+        weather.log.warning("브리핑의 날씨를 가져오지 못했습니다: %s", type(exc).__name__)
+        return weather.failed_line(label, slack=slack)
+
+
+async def _no_weather() -> str:
+    return ""
+
+
 async def build_briefing(
     *,
     run: RunTurn | None = None,
@@ -171,36 +209,52 @@ async def build_briefing(
     slack: bool = False,
     on_status: Callable[[str], Any] | None = None,
     credit_fetch: CreditFetch | None = None,
+    weather_fetch: WeatherFetch | None = None,
     run_timeout: float | None = None,
 ) -> Briefing:
-    """Run today's briefing and append the credits. Never raises for a failed run or credit check.
+    """Run today's briefing, with the weather under the header and the credits at the end.
 
+    Never raises for a failed run, weather or credit check. The weather
+    (unless ``BRIEF_WEATHER=off``) and the credits are fetched by code in
+    worker threads while the agent runs; they never go through the model.
     ``slack`` picks Slack formatting (the Slack prompt rules, a bold header,
-    mrkdwn credits). ``run_timeout`` (seconds) bounds the agent run.
+    mrkdwn credits and weather label). ``run_timeout`` (seconds) bounds the agent run.
     """
     tz = config.get_timezone(env)
     now = (now or datetime.now(tz)).astimezone(tz)
     run = run or run_turn
     result: TurnResult | None = None
     crash: BaseException | None = None
+    extras = asyncio.gather(
+        asyncio.to_thread(credit_section, env, fetch=credit_fetch, now=now, slack=slack),
+        (
+            asyncio.to_thread(weather_section, env, fetch=weather_fetch, slack=slack)
+            if config.get_brief_weather(env)
+            else _no_weather()
+        ),
+    )
     try:
-        turn = run(
-            briefing_prompt(now, env),
-            on_status=on_status,
-            extra_system_prompt=SLACK_FORMAT_PROMPT if slack else "",
-            persona=MUNGCHI,
-            briefing=True,
-        )
-        result = await (asyncio.wait_for(turn, run_timeout) if run_timeout else turn)
-    except Exception as exc:  # noqa: BLE001 - reported in the briefing without details
-        crash = exc
-    credit_text = await asyncio.to_thread(credit_section, env, fetch=credit_fetch, now=now, slack=slack)
+        try:
+            turn = run(
+                briefing_prompt(now, env),
+                on_status=on_status,
+                extra_system_prompt=SLACK_FORMAT_PROMPT if slack else "",
+                persona=MUNGCHI,
+                briefing=True,
+            )
+            result = await (asyncio.wait_for(turn, run_timeout) if run_timeout else turn)
+        except Exception as exc:  # noqa: BLE001 - reported in the briefing without details
+            crash = exc
+        credit_text, weather_text = await extras
+    finally:
+        extras.cancel()  # only matters when the run itself was cancelled; a no-op once done
     return Briefing(
         header=brief_header(now, slack=slack),
         body=briefing_body(result, crash),
         credits=credit_text,
         result=result,
         crash=crash,
+        weather=weather_text,
     )
 
 
@@ -213,6 +267,7 @@ def run_brief_cli(
     run: RunTurn | None = None,
     now: datetime | None = None,
     credit_fetch: CreditFetch | None = None,
+    weather_fetch: WeatherFetch | None = None,
     out: TextIO | None = None,
     err: TextIO | None = None,
 ) -> int:
@@ -224,7 +279,15 @@ def run_brief_cli(
         print(line, file=err, flush=True)
 
     briefing = asyncio.run(
-        build_briefing(run=run, now=now, env=env, slack=False, on_status=status, credit_fetch=credit_fetch)
+        build_briefing(
+            run=run,
+            now=now,
+            env=env,
+            slack=False,
+            on_status=status,
+            credit_fetch=credit_fetch,
+            weather_fetch=weather_fetch,
+        )
     )
     if briefing.crash is not None:
         print(f"[오류] 고뭉치를 실행하지 못했습니다: {safe_error(briefing.crash)}", file=err)
