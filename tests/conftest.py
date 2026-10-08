@@ -3,7 +3,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from mungchi import config, version
+from mungchi import briefing, config, version
 
 MUNGCHI_ENV_VARS = (
     "MUNGCHI_MODEL",
@@ -47,6 +47,10 @@ MUNGCHI_ENV_VARS = (
 )
 
 
+async def _no_model_greeting(prompt, env=None):
+    raise RuntimeError("tests never call the model for the greeting")
+
+
 def _no_network(self, request):
     raise httpx.ConnectError("tests never use the network", request=request)
 
@@ -68,7 +72,9 @@ def isolated_env(monkeypatch: pytest.MonkeyPatch, tmp_path):
     turn it on themselves. A real httpx request, sync or async (one not given
     a ``MockTransport``), fails as if offline instead of reaching the internet.
     git is never run either: the running-version lookup sees no git (the
-    package version) unless a test gives it a fake git.
+    package version) unless a test gives it a fake git. The morning
+    briefing's greeting never reaches a model: without a ``greeting_generate``
+    of its own a test gets a template greeting.
     """
     for name in MUNGCHI_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
@@ -77,5 +83,6 @@ def isolated_env(monkeypatch: pytest.MonkeyPatch, tmp_path):
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", _no_network_async)
     monkeypatch.setattr(version, "run_git", lambda args, **kwargs: None)
     monkeypatch.setattr(config, "current_platform", lambda: "linux")
+    monkeypatch.setattr(briefing, "generate_greeting", _no_model_greeting)
     monkeypatch.chdir(tmp_path)
     yield

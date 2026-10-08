@@ -182,3 +182,17 @@ def test_slack_threads_file_sits_next_to_state_file(tmp_path):
     env = {"MUNGCHI_STATE_FILE": str(tmp_path / "x" / "state.json")}
     assert config.get_slack_threads_path(env) == tmp_path / "x" / ".mungchi_slack_threads.json"
     assert config.get_slack_threads_path({}).name == ".mungchi_slack_threads.json"
+
+
+def test_last_greeting_round_trip_keeps_other_keys_and_ignores_junk(tmp_path):
+    store = StateStore(tmp_path / "state.json")
+    assert store.last_greeting() is None
+    store.mark_brief_date("2026-10-07")
+    store.mark_greeting("2026-10-08", "똑똑! 🚪 2026년 10월 8일(목) 아침 브리핑입니다~")
+    assert store.last_greeting() == ("2026-10-08", "똑똑! 🚪 2026년 10월 8일(목) 아침 브리핑입니다~")
+    assert store.last_brief_date() == "2026-10-07"
+    for junk in ({"date": "어제", "text": "안녕"}, {"date": "2026-10-08", "text": "  "}, "인사", None):
+        data = store.load()
+        data["last_greeting"] = junk
+        (tmp_path / "state.json").write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        assert store.last_greeting() is None

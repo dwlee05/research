@@ -234,8 +234,9 @@ def build_options(
     ``resume`` continues an earlier session by id; ``extra_system_prompt`` is
     appended to the system prompt (e.g. Slack formatting rules).
 
-    ``briefing=True`` (only ``briefing.build_briefing``: ``--brief``, the morning
-    briefing, a briefing asked for in Slack) builds this run's Dropbox
+    ``briefing=True`` (only 업뎃's report run in the relay briefing,
+    ``briefing.run_report``: ``--brief``, the morning briefing, a briefing
+    asked for in Slack) builds this run's Dropbox
     tool in briefing mode: it looks at the time since the last briefing and
     moves that checkpoint. The mode is bound to the tool objects of these
     options, so it is fixed per run, never chosen by the model, and never
@@ -533,6 +534,33 @@ async def run_turn(
         return await stream_turn(client, stamp_prompt(prompt, clock), renderer, on_status, images=images)
 
 
+def build_plain_options(system_prompt: str, env: Mapping[str, str] | None = None) -> ClaudeAgentOptions:
+    """Options for one small turn with no tools at all (e.g. 고뭉치's morning greeting).
+
+    No built-in tools, no MCP server, no subagents, no settings files, one
+    turn; the model is ``MUNGCHI_MODEL`` like every other run.
+    """
+    return ClaudeAgentOptions(
+        model=config.get_model(env),
+        system_prompt=system_prompt,
+        tools=[],
+        allowed_tools=[],
+        disallowed_tools=[*BLOCKED_BUILTINS, SUBAGENT_TOOL],
+        permission_mode="dontAsk",
+        mcp_servers={},
+        setting_sources=[],
+        max_turns=1,
+        env=dict(CLI_ENV),
+    )
+
+
+async def run_plain_turn(prompt: str, *, system_prompt: str, env: Mapping[str, str] | None = None) -> TurnResult:
+    """One tool-less turn with ``system_prompt`` (``build_plain_options``); the prompt is sent as it is."""
+    renderer = Renderer(echo=False)
+    async with ClaudeSDKClient(options=build_plain_options(system_prompt, env)) as client:
+        return await stream_turn(client, prompt, renderer)
+
+
 async def run_once(
     prompt: str, persona: str = MUNGCHI, images: Sequence[image_prep.ImageInput] | None = None
 ) -> int:
@@ -677,7 +705,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "예시:\n"
             "  python -m mungchi                       # 대화 모드\n"
-            "  python -m mungchi --brief               # 오늘 브리핑 (날씨, 일정, Dropbox 업데이트, 크레딧)\n"
+            "  python -m mungchi --brief               # 오늘 브리핑: [고뭉치] 인사·날씨·크레딧, [업뎃] Dropbox, [일정] 오늘 일정\n"
             '  python -m mungchi "어제 공저자들이 뭐 고쳤어?"   # 질문 한 번\n'
             '  python -m mungchi "날씨랑 토큰 좀 알려줘"      # 고뭉치가 날씨와 Chat KHU 크레딧을 직접 확인\n'
             "  python -m mungchi slack                 # Slack 봇 실행 (Socket Mode, BRIEF_TIME이 있으면 아침 브리핑도)\n"
@@ -722,14 +750,17 @@ def build_parser() -> argparse.ArgumentParser:
     opts.add_argument(
         "--brief",
         action="store_true",
-        help="오늘 브리핑(날씨, 오늘의 일정, Dropbox 업데이트, Chat KHU 크레딧)을 한 번 받고 끝냅니다",
+        help=(
+            "오늘 브리핑을 한 번 받고 끝냅니다: 고뭉치(인사, 날씨, Chat KHU 크레딧), 업뎃(Dropbox 업데이트), "
+            "일정(오늘의 일정)이 차례로 자기 몫을 보고합니다"
+        ),
     )
     opts.add_argument(
         "--slack",
         action="store_true",
         help=(
             "--brief와 함께 쓰면 브리핑을 터미널 대신 Slack에 올립니다 "
-            "(SLACK_BRIEF_CHANNEL, 비어 있으면 SLACK_ALLOWED_USER_IDS의 사람에게 고뭉치 봇 DM)"
+            "(SLACK_BRIEF_CHANNEL에 세 봇이 차례로, 비어 있으면 SLACK_ALLOWED_USER_IDS의 사람에게 봇마다 자기 DM으로)"
         ),
     )
     opts.add_argument(
@@ -950,8 +981,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             return post_briefing_cli()
         if args.brief:
-            # The only briefing run in the terminal: it alone moves the Dropbox checkpoint.
-            # Same structure as --brief --slack and the morning briefing (header, answer, credits).
+            # The only briefing run in the terminal: 업뎃's report alone moves the Dropbox checkpoint.
+            # The same relay as --brief --slack and the morning briefing: [고뭉치], [업뎃], [일정].
             from .briefing import run_brief_cli
 
             return run_brief_cli()

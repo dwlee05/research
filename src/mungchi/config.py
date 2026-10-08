@@ -671,7 +671,7 @@ def slack_brief_problems(cfg: SlackConfig) -> list[str]:
     if no_destination:
         problems.append(
             "브리핑을 보낼 곳이 없습니다. SLACK_BRIEF_CHANNEL에 채널 ID를 넣거나, 비워 두고 SLACK_ALLOWED_USER_IDS에 "
-            "내 멤버 ID를 넣으면 고뭉치 봇이 DM으로 보냅니다."
+            "내 멤버 ID를 넣으면 봇들이 각자 DM으로 보냅니다."
         )
     problems += _bot_token_problems(cfg)
     if cfg.brief_channel and not _SLACK_CHANNEL_ID_RE.match(cfg.brief_channel):

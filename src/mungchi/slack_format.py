@@ -4,7 +4,6 @@ Markdown -> Slack mrkdwn safety net and message chunking. No Slack I/O here."""
 from __future__ import annotations
 
 import re
-from datetime import datetime
 from typing import Callable
 
 from .personas import MUNGCHI
@@ -18,8 +17,6 @@ MAX_CHUNK_CHARS = 3_500
 # ``slack_bot.StatusUpdater``.
 PLACEHOLDER_TEXT = PLACEHOLDER_POOLS[MUNGCHI][0]
 WEEKDAYS_KO = ("월", "화", "수", "목", "금", "토", "일")
-# First line of every briefing: "☀️ 오늘의 브리핑 (10/08 목)", bold in Slack.
-BRIEF_TITLE = "오늘의 브리핑 ({date})"
 
 # One Dropbox subfolder, as the prompts show it: the folder's link exactly
 # once. In the terminal the bare link goes on the line under the folder name;
@@ -65,12 +62,6 @@ def strip_mention(text: str, bot_user_id: str | None = None) -> str:
     text = text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
     text = re.sub(r"[ \t]{2,}", " ", text)
     return text.strip()
-
-
-def brief_header(now: datetime, *, slack: bool = True) -> str:
-    """``☀️ *오늘의 브리핑 (10/08 목)*`` (``now`` already in TIMEZONE); without the bold outside Slack."""
-    title = BRIEF_TITLE.format(date=f"{now:%m/%d} {WEEKDAYS_KO[now.weekday()]}")
-    return f"☀️ *{title}*" if slack else f"☀️ {title}"
 
 
 # ---------------------------------------------------------------- code fences

@@ -68,6 +68,7 @@ class StateStore:
     ``{"last_checked": {"<source>": "<iso8601>"},
     "credit_alert": {"renewal_date": "<renewal_date>", "alerted_at": "<iso8601>"},
     "last_brief_date": "<YYYY-MM-DD>",
+    "last_greeting": {"date": "<YYYY-MM-DD>", "text": "<고뭉치's morning greeting>"},
     "running_version": "<abc1234>", "running_since": "<iso8601>",
     "pending_events": {"<conversation key>": {..., "created_at": "<iso8601>", "expires_at": "<iso8601>"}}}``.
     Every write keeps the other keys as they are.
@@ -108,6 +109,23 @@ class StateStore:
         with _LOCK:
             data = self.load()
             data["last_brief_date"] = day
+            _write_json(self.path, data)
+
+    def last_greeting(self) -> tuple[str, str] | None:
+        """``(local date, text)`` of the last morning-briefing greeting 고뭉치 used, if any."""
+        record = self.load().get("last_greeting")
+        if not isinstance(record, dict):
+            return None
+        day, text = record.get("date"), record.get("text")
+        if not (isinstance(day, str) and _DATE_RE.match(day) and isinstance(text, str) and text.strip()):
+            return None
+        return day, text.strip()
+
+    def mark_greeting(self, day: str, text: str) -> None:
+        """Remember today's greeting, so tomorrow's is told not to repeat it."""
+        with _LOCK:
+            data = self.load()
+            data["last_greeting"] = {"date": day, "text": text}
             _write_json(self.path, data)
 
     def running(self) -> tuple[str, datetime | None] | None:

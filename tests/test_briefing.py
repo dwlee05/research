@@ -1,19 +1,24 @@
-"""The shared briefing (terminal, --brief --slack, scheduled) and the "is it due?" check.
+"""The relay morning briefing's pieces (greeting, reports, relay order, terminal) and the "is it due?" check.
 
-No network, no real Slack or LLM: the agent run is a fake ``run_turn`` and the
-credits come from a fake fetch (or the gateway is simply not configured).
+No network, no real Slack or LLM: the 업뎃 / 일정 runs are a fake ``run_turn``,
+the greeting a fake generator (conftest makes the real one fail, so the
+template is used), and the credits and weather come from fake fetches.
+Slack delivery is tested in ``test_relay_briefing.py``.
 """
 
 from __future__ import annotations
 
 import asyncio
 import io
-from datetime import datetime, time, timezone
+import random
+import re
+from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from mungchi import briefing, config, credits, weather
+from mungchi import briefing, config, credits, phrases, weather
+from mungchi.agents import ACCURACY_RULE, VOICES
 from mungchi.briefing import (
     ALREADY,
     DAY_OFF,
@@ -21,17 +26,27 @@ from mungchi.briefing import (
     EARLY,
     MISSED,
     OFF,
+    GREETING_SYSTEM_PROMPT,
     brief_due,
-    build_briefing,
     credit_section,
+    fallback_greeting,
+    greeting_prompt,
+    make_greeting,
+    report_prompt,
     run_brief_cli,
+    start_relay,
+    valid_greeting,
 )
 from mungchi.main import TurnResult, main
 from mungchi.slack_format import SLACK_FORMAT_PROMPT
+from mungchi.state import StateStore
 
 SEOUL = ZoneInfo("Asia/Seoul")
-SESSION = "11111111-1111-1111-1111-111111111111"
-ANSWER = "*① 오늘의 일정*\n• 10:00–11:00 랩 미팅\n\n*② Dropbox 업데이트*\n• 공저자 변경 없음 (Dropbox)"
+UPDATE_SESSION = "22222222-2222-2222-2222-222222222222"
+SCHEDULE_SESSION = "33333333-3333-3333-3333-333333333333"
+UPDATE_REPORT = "업뎃 보고드립니다!\n공저자 변경 없음 (Dropbox): 지난 브리핑(10/07 07:00) 이후 바뀐 파일이 없어요"
+SCHEDULE_REPORT = "좋은 아침이에요! 오늘은 여유로운 편이에요 😊\n10/08 (목)\n• 10:00–11:00 랩 미팅 (302호)"
+GREETING = "똑똑! 🚪 10월 8일(목) 아침이에요. 오늘도 같이 챙겨 볼게요!"
 
 
 def seoul(day: int, hour: int, minute: int = 0) -> datetime:
@@ -43,20 +58,49 @@ def schedule(**env: str) -> config.BriefSchedule:
     return config.load_brief_schedule({"BRIEF_TIME": "07:00", **env})
 
 
-class FakeRun:
-    def __init__(self, result=None):
-        self.result = result if result is not None else TurnResult(text=ANSWER, session_id=SESSION)
+class PersonaRun:
+    """Stands in for ``run_turn``: one scripted result (or exception, or delay) per persona; records calls."""
+
+    def __init__(self, **results):
+        self.results = {
+            "update": TurnResult(text=UPDATE_REPORT, session_id=UPDATE_SESSION),
+            "schedule": TurnResult(text=SCHEDULE_REPORT, session_id=SCHEDULE_SESSION),
+            **results,
+        }
+        self.delays: dict[str, float] = {}
         self.calls: list[dict] = []
 
-    async def __call__(self, prompt, *, resume=None, on_status=None, extra_system_prompt="", persona="mungchi", briefing=False):
+    async def __call__(self, prompt, *, resume=None, on_status=None, extra_system_prompt="", persona="mungchi", briefing=False, conversation_key=None, images=None):
         self.calls.append(
-            {"prompt": prompt, "extra_system_prompt": extra_system_prompt, "persona": persona, "briefing": briefing}
+            {"prompt": prompt, "extra_system_prompt": extra_system_prompt, "persona": persona, "briefing": briefing, "resume": resume}
         )
-        if on_status is not None:
-            on_status("→ 일정에게 맡기는 중...")
-        if isinstance(self.result, BaseException):
-            raise self.result
-        return self.result
+        if self.delays.get(persona):
+            await asyncio.sleep(self.delays[persona])
+        result = self.results[persona]
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    def call(self, persona: str) -> dict:
+        [call] = [c for c in self.calls if c["persona"] == persona]
+        return call
+
+
+class FakeGreeting:
+    """Stands in for the greeting's LLM call: records prompts, returns ``reply`` (or raises / sleeps)."""
+
+    def __init__(self, reply=GREETING, delay=0.0):
+        self.reply = reply
+        self.delay = delay
+        self.prompts: list[str] = []
+
+    async def __call__(self, prompt):
+        self.prompts.append(prompt)
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        if isinstance(self.reply, BaseException):
+            raise self.reply
+        return self.reply
 
 
 def report(remaining=9050.5):
@@ -65,6 +109,16 @@ def report(remaining=9050.5):
         "total": {"quota": 10000, "used": 10000 - remaining, "remaining": remaining},
     }
     return credits.CreditReport(balance=credits.parse_balance(payload))
+
+
+SUNNY = weather.WeatherReport(
+    label="서울",
+    forecast=weather.Forecast(code=1, low=11.5, high=22.6, rain_chance=10),
+    air=weather.AirQuality(pm10=42.3, pm2_5=12.0),
+)
+WEATHER_LINE = "🌤️ 서울 날씨: 대체로 맑음 · 최저 12° / 최고 23° · 강수확률 10% · 미세먼지 보통"
+CREDIT_LINE = "💳 Chat KHU 크레딧: 9,050.5 남음 / 10,000 (90.5%) · 11/01 갱신"
+WEATHER_ON: dict[str, str] = {}  # an explicit env without BRIEF_WEATHER: the default, on
 
 
 # ---------------------------------------------------------------- the schedule (BRIEF_TIME, BRIEF_DAYS, ...)
@@ -153,71 +207,325 @@ def test_brief_due_reads_the_wall_clock_in_timezone_from_any_aware_clock():
     assert brief_due(berlin, datetime(2026, 10, 26, 6, 0, tzinfo=timezone.utc), None) == DUE  # 07:00 CET
 
 
-# ---------------------------------------------------------------- what goes in a briefing
+# ---------------------------------------------------------------- 고뭉치's greeting
 
 
-def test_briefing_prompt_asks_for_todays_schedule_only_and_a_briefing_mode_run():
-    run = FakeRun()
-    result = asyncio.run(build_briefing(run=run, now=seoul(8, 7), credit_fetch=report))
-    [call] = run.calls
-    assert call["briefing"] is True  # the Dropbox tool looks at the time since the last briefing
-    assert call["persona"] == "mungchi" and call["extra_system_prompt"] == ""
-    prompt = call["prompt"]
-    assert "오늘(2026-10-08 (목요일))" in prompt and "일정은 오늘 하루만(days=1)" in prompt
-    assert "공저자 업데이트는 기간 없이" in prompt  # no since_hours: the briefing checkpoint decides
-    assert result.session_id == SESSION and not result.failed
+def test_a_valid_llm_greeting_is_used_and_stored_for_tomorrow():
+    store = StateStore(config.get_state_path())
+    generate = FakeGreeting()
+    greeting = asyncio.run(make_greeting(seoul(8, 7), weather_text=WEATHER_LINE, store=store, generate=generate))
+    assert (greeting.text, greeting.source) == (GREETING, "llm")
+    assert store.last_greeting() == ("2026-10-08", GREETING)
+    [prompt] = generate.prompts
+    # The date comes from code; the weather goes in as words only (no numbers to copy).
+    assert "- 오늘 날짜: 2026년 10월 8일 목요일 (짧게 쓰면 10월 8일(목))" in prompt
+    assert "- 오늘은 평일이에요." in prompt
+    assert "- 날씨 요약: 대체로 맑음 · 미세먼지 보통" in prompt
+    assert not re.search(r"\d+°|\d+%", prompt)
+    assert "이전 인사" not in prompt  # nothing stored yet
 
 
-def test_briefing_prompt_says_the_weather_and_credits_are_appended_by_code():
-    run = FakeRun()
-    asyncio.run(build_briefing(run=run, now=seoul(8, 7), credit_fetch=report, slack=True))
-    prompt = run.calls[0]["prompt"]
-    assert prompt == briefing.briefing_prompt(seoul(8, 7))
-    # 고뭉치's system prompt asks for all four parts in a briefing; this run's prompt overrides that.
-    assert "제목, 날씨, Chat KHU 크레딧은 프로그램이 따로 붙이니" in prompt
-    assert "get_weather와 get_credits는 부르지 말고" in prompt
-    assert "날씨와 크레딧 없이 ① 오늘의 일정과 ② Dropbox 업데이트만 써" in prompt
-    # Same text whatever the delivery: only the date changes.
-    assert briefing.briefing_prompt(seoul(9, 7)) == prompt.replace("2026-10-08 (목요일)", "2026-10-09 (금요일)")
+def test_yesterdays_greeting_is_passed_and_todays_is_stored():
+    store = StateStore(config.get_state_path())
+    yesterday = "좋은 아침이에요! 10월 7일 수요일 브리핑 시작할게요 🙂"
+    store.mark_greeting("2026-10-07", yesterday)
+    generate = FakeGreeting()
+    greeting = asyncio.run(make_greeting(seoul(8, 7), store=store, generate=generate))
+    assert f'- 이전 인사: "{yesterday}" (이 인사와 다르게 시작하고, 같은 표현은 쓰지 마)' in generate.prompts[0]
+    assert greeting.source == "llm" and store.last_greeting() == ("2026-10-08", GREETING)
 
 
-def test_credits_are_appended_by_code_after_the_answer():
-    run = FakeRun()
-    result = asyncio.run(build_briefing(run=run, now=seoul(8, 7), credit_fetch=report, slack=True))
-    assert run.calls[0]["extra_system_prompt"] == SLACK_FORMAT_PROMPT
-    # The model never sees the credit figures; it is only told that code appends them.
-    assert "9,050.5" not in run.calls[0]["prompt"] and "남음" not in run.calls[0]["prompt"]
-    assert result.text.startswith("☀️ *오늘의 브리핑 (10/08 목)*\n\n*① 오늘의 일정*")
-    head, credit_part = result.text.split("\n\n💳 ", 1)
-    assert head.endswith("• 공저자 변경 없음 (Dropbox)")
-    assert credit_part.startswith("*Chat KHU 크레딧*: 9,050.5 남음 / 10,000 (90.5%) · 11/01 갱신")
-    assert result.credits == credits.summary_text(report(), now=seoul(8, 7), slack=True)
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "좋은 아침이에요! 10월 9일(금) 브리핑입니다.",  # wrong day
+        "좋은 아침이에요! 10월 8일(금) 브리핑입니다.",  # wrong weekday
+        "2025년 10월 8일 아침 브리핑입니다.",  # wrong year
+        "좋은 아침이에요! 오늘도 힘내요.",  # no date at all
+        "10월 8일(목), 오늘 최고 23도예요!",  # a number that is not the date
+        "<@U123> 10월 8일(목) 아침이에요",  # a mention
+        "똑똑! 10월 8일(목) " + "아주 " * 40 + "좋은 아침이에요",  # far too long
+        "10월 8일(목)\n아침\n브리핑",  # three lines
+        "",
+        RuntimeError("gateway down"),
+    ],
+)
+def test_an_invalid_or_failed_greeting_falls_back_to_a_template(reply):
+    store = StateStore(config.get_state_path())
+    greeting = asyncio.run(make_greeting(seoul(8, 7), store=store, generate=FakeGreeting(reply)))
+    assert greeting.source == "template"
+    assert greeting.text in [t.format(**briefing.date_fields(seoul(8, 7))) for t in phrases.GREETING_TEMPLATES]
+    assert "10월 8일" in greeting.text and valid_greeting(greeting.text, seoul(8, 7))
+    assert store.last_greeting() == ("2026-10-08", greeting.text)
 
 
-def test_agent_failure_still_gives_header_failure_line_and_credits(monkeypatch):
-    token = "sk-ant-" + "a" * 30
-    run = FakeRun(RuntimeError(f"boom {token}"))
-    result = asyncio.run(build_briefing(run=run, now=seoul(8, 7), credit_fetch=report, slack=True))
-    assert result.failed and result.session_id is None
-    header, body, credit_part = result.text.split("\n\n")
-    assert header == "☀️ *오늘의 브리핑 (10/08 목)*"
-    assert body == "⚠️ 오늘 브리핑을 만들지 못했어요 (RuntimeError). 실행 로그를 확인해 주세요."
-    assert credit_part.startswith("💳 *Chat KHU 크레딧*: 9,050.5 남음")
-    assert token not in result.text
-
-    failed = TurnResult(text="", failed=True, error=f"요청 한도에 걸렸습니다. {token}")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", token)
-    result = asyncio.run(build_briefing(run=FakeRun(failed), now=seoul(8, 7), credit_fetch=report))
-    assert result.body == "⚠️ 요청 한도에 걸렸습니다. ***" and result.failed
-    assert result.text.startswith("☀️ 오늘의 브리핑 (10/08 목)\n\n⚠️ 요청 한도에 걸렸습니다. ***\n\n💳 Chat KHU 크레딧: 9,050.5 남음")
+def test_a_slow_greeting_times_out_into_a_template():
+    greeting = asyncio.run(make_greeting(seoul(8, 7), generate=FakeGreeting(delay=5), timeout=0.01))
+    assert greeting.source == "template" and "10월 8일" in greeting.text
 
 
-def test_a_slow_agent_run_times_out_into_a_failure_line():
-    async def stuck(prompt, **kwargs):
-        await asyncio.sleep(10)
+def test_the_same_greeting_as_last_time_is_not_used_again():
+    store = StateStore(config.get_state_path())
+    store.mark_greeting("2026-10-08", GREETING)  # e.g. an earlier briefing on request today
+    greeting = asyncio.run(make_greeting(seoul(8, 9), store=store, generate=FakeGreeting(GREETING)))
+    assert greeting.source == "template" and greeting.text != GREETING
 
-    result = asyncio.run(build_briefing(run=stuck, now=seoul(8, 7), credit_fetch=report, run_timeout=0.01))
-    assert result.failed and "(시간 초과)" in result.body and "💳" in result.text
+
+def test_conftest_keeps_the_real_greeting_call_away_from_any_model():
+    greeting = asyncio.run(make_greeting(seoul(8, 7)))  # no generator: the (patched) default fails
+    assert greeting.source == "template"
+
+
+def test_valid_greeting_accepts_todays_date_in_any_usual_form():
+    now = seoul(8, 7)
+    for text in (
+        "똑똑! 🚪 2026년 10월 8일(목) 아침 브리핑입니다~",
+        "좋은 아침이에요! 10월 8일 목요일 브리핑 시작할게요 ☀️",
+        "10/8(목) 아침이에요. 오늘도 화이팅!",
+        "좋은 아침이에요.\n10월 8일 아침 브리핑입니다.",
+    ):
+        assert valid_greeting(text, now), text
+
+
+def test_every_fallback_template_is_a_valid_greeting_on_every_day():
+    day = date(2026, 1, 1)
+    while day.year == 2026:
+        now = datetime.combine(day, time(7), tzinfo=SEOUL)
+        for template in briefing.greeting_templates(now):
+            text = template.format(**briefing.date_fields(now))
+            assert valid_greeting(text, now), text
+        day += timedelta(days=1)
+    # Weekend and Monday get their own touch as well.
+    assert set(phrases.WEEKEND_GREETING_TEMPLATES) <= set(briefing.greeting_templates(seoul(10, 7)))
+    assert set(phrases.MONDAY_GREETING_TEMPLATES) <= set(briefing.greeting_templates(seoul(12, 7)))
+    assert not set(phrases.WEEKEND_GREETING_TEMPLATES) & set(briefing.greeting_templates(seoul(8, 7)))
+
+
+def test_the_fallback_avoids_yesterdays_template_and_is_seedable():
+    first = phrases.GREETING_TEMPLATES[0]
+    yesterday = ("2026-10-07", first.format(**briefing.date_fields(date(2026, 10, 7))))
+    picks = {fallback_greeting(seoul(8, 7), rng=random.Random(seed), previous=yesterday) for seed in range(50)}
+    assert first.format(**briefing.date_fields(seoul(8, 7))) not in picks and len(picks) >= 3
+    assert fallback_greeting(seoul(8, 7), rng=random.Random(4)) == fallback_greeting(seoul(8, 7), rng=random.Random(4))
+
+
+def test_the_greeting_system_prompt_is_constant_and_in_mungchis_voice():
+    assert VOICES["mungchi"] in GREETING_SYSTEM_PROMPT and ACCURACY_RULE in GREETING_SYSTEM_PROMPT
+    assert "1~2문장" in GREETING_SYSTEM_PROMPT and "숫자는 날짜에만 쓴다" in GREETING_SYSTEM_PROMPT
+    assert not re.search(r"\d{4}-\d{2}-\d{2}|\d{1,2}월 \d{1,2}일", GREETING_SYSTEM_PROMPT)  # no date: cache-stable
+    # The date is only ever in the per-day user prompt.
+    assert greeting_prompt(seoul(8, 7)) != greeting_prompt(seoul(9, 7))
+    assert "주말(토요일)" in greeting_prompt(seoul(10, 7)) and "월요일" in greeting_prompt(seoul(12, 7))
+
+
+def test_the_real_greeting_call_is_one_tool_less_turn(monkeypatch):
+    from mungchi import main as main_module
+    from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+
+    seen = {}
+
+    class OneTurnClient:
+        def __init__(self, options=None):
+            seen["options"] = options
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def query(self, prompt, session_id="default"):
+            seen["prompt"] = prompt
+
+        async def receive_response(self):
+            yield AssistantMessage(content=[TextBlock(text=GREETING)], model="m")
+            yield ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1, is_error=False, num_turns=1, session_id="s")
+
+    monkeypatch.setattr(main_module, "ClaudeSDKClient", OneTurnClient)
+    assert asyncio.run(briefing.llm_greeting("인사 써 줘")) == GREETING
+    options = seen["options"]
+    assert options.system_prompt == GREETING_SYSTEM_PROMPT and seen["prompt"] == "인사 써 줘"
+    assert options.tools == [] and options.allowed_tools == [] and options.mcp_servers == {} and not options.agents
+    assert options.max_turns == 1 and options.setting_sources == [] and options.model == config.get_model()
+
+
+# ---------------------------------------------------------------- 업뎃's and 일정's own reports
+
+
+def test_report_prompts_ask_for_their_own_part_only():
+    update, schedule_ = report_prompt("update", seoul(8, 7)), report_prompt("schedule", seoul(8, 7))
+    assert "since_hours 없이(0)" in update and "지난 브리핑 이후" in update and "since_basis" in update
+    assert '"업뎃 보고드립니다!"' in update
+    assert 'date="2026-10-08", days=1' in schedule_ and "오늘(2026-10-08 (목요일))" in schedule_
+    assert "get_weather는 부르지 마" in schedule_
+    for prompt in (update, schedule_):
+        assert "날씨, 크레딧" in prompt and "멘션하지 마" in prompt and "고뭉치가 인사와 날씨, Chat KHU 크레딧을 이미 전했고" in prompt
+
+
+def _relay(run, **kwargs):
+    async def go():
+        async with start_relay(
+            run=run,
+            now=seoul(8, 7),
+            env=WEATHER_ON,
+            credit_fetch=report,
+            weather_fetch=lambda: SUNNY,
+            greeting_generate=FakeGreeting(),
+            rng=random.Random(2),
+            **kwargs,
+        ) as relay:
+            head = await relay.head()
+            return head, {persona: await relay.report(persona) for persona in relay.personas}
+
+    return asyncio.run(go())
+
+
+@pytest.mark.parametrize("slack", [False, True])
+def test_the_relay_runs_update_in_briefing_mode_and_schedule_for_today(slack):
+    run = PersonaRun()
+    head, reports = _relay(run, slack=slack)
+    update, schedule_ = run.call("update"), run.call("schedule")
+    assert update["briefing"] is True and schedule_["briefing"] is False  # only 업뎃's Dropbox checkpoint moves
+    assert update["prompt"] == report_prompt("update", seoul(8, 7)) and schedule_["prompt"] == report_prompt("schedule", seoul(8, 7))
+    assert update["extra_system_prompt"] == schedule_["extra_system_prompt"] == (SLACK_FORMAT_PROMPT if slack else "")
+    assert update["resume"] is None and schedule_["resume"] is None
+    assert reports["update"].text == UPDATE_REPORT and reports["schedule"].text == SCHEDULE_REPORT
+    assert reports["update"].session_id == UPDATE_SESSION and not reports["update"].failed
+    # Weather and credits: only in 고뭉치's part, never sent to a model.
+    assert head.greeting.text == GREETING
+    assert head.weather.endswith("대체로 맑음 · 최저 12° / 최고 23° · 강수확률 10% · 미세먼지 보통")
+    assert "9,050.5 남음" in head.credits
+    for call in run.calls:
+        assert "대체로 맑음" not in call["prompt"] + call["extra_system_prompt"] and "9,050.5" not in call["prompt"]
+
+
+def test_reports_run_concurrently_and_greeting_does_not_wait_for_them():
+    started = []
+
+    async def run(prompt, *, persona, **kwargs):
+        started.append(persona)
+        await asyncio.sleep(0.2)
+        return TurnResult(text=f"{persona} 보고", session_id=UPDATE_SESSION)
+
+    async def go():
+        loop = asyncio.get_running_loop()
+        t0 = loop.time()
+        async with start_relay(run=run, now=seoul(8, 7), credit_fetch=report, greeting_generate=FakeGreeting()) as relay:
+            await relay.head()
+            head_at = loop.time() - t0
+            for persona in relay.personas:
+                await relay.report(persona)
+            return head_at, loop.time() - t0
+
+    head_at, total = asyncio.run(go())
+    assert sorted(started) == ["schedule", "update"]
+    assert head_at < 0.15  # 고뭉치's part is ready before the reports
+    assert total < 0.35  # the two 0.2 s runs overlap
+
+
+@pytest.mark.parametrize(
+    "result,expected",
+    [
+        (RuntimeError("boom sk-ant-aaaaaaaaaaaaaaaaaaaa"), "(사유: RuntimeError)"),
+        (TurnResult(text="", failed=True, error="요청 한도에 걸렸습니다. 잠시 후 다시 시도하세요.\n→ 힌트"), "(사유: 요청 한도에 걸렸습니다. 잠시 후 다시 시도하세요.)"),
+        (TurnResult(text="  ", session_id=UPDATE_SESSION), "(사유: 빈 응답)"),
+    ],
+)
+def test_a_failed_report_becomes_a_short_apology_in_that_bots_voice(result, expected):
+    run = PersonaRun(update=result, schedule=result)
+    _head, reports = _relay(run)
+    update, schedule_ = reports["update"], reports["schedule"]
+    assert update.failed and schedule_.failed
+    assert update.text.startswith("업뎃입니다.") and "Dropbox" in update.text and update.text.endswith(expected)
+    assert schedule_.text.startswith("일정이에요.") and "😥" in schedule_.text and schedule_.text.endswith(expected)
+    for text in (update.text, schedule_.text):
+        assert "sk-ant-" not in text and "\n" not in text
+        assert text.split(" (사유: ")[0] in [t.split(" (사유: ")[0] for pool in phrases.APOLOGY_TEMPLATES.values() for t in pool]
+
+
+def test_a_report_that_times_out_says_so():
+    run = PersonaRun()
+    run.delays["update"] = 5
+    _head, reports = _relay(run, run_timeout=0.05)
+    assert reports["update"].failed and reports["update"].text.endswith("(사유: 시간 초과)")
+    assert reports["schedule"].text == SCHEDULE_REPORT  # the other one is unaffected
+
+
+def test_a_run_that_failed_after_writing_keeps_its_text_with_a_note():
+    run = PersonaRun(update=TurnResult(text=UPDATE_REPORT, failed=True, error="응답을 마치지 못했습니다."))
+    _head, reports = _relay(run)
+    assert reports["update"].text == f"{UPDATE_REPORT}\n\n⚠️ 응답을 마치지 못했습니다." and reports["update"].failed
+
+
+def test_the_update_run_moves_the_dropbox_checkpoint(monkeypatch):
+    """업뎃's report run gets the briefing-mode Dropbox tool, which writes the checkpoint."""
+    from mungchi.agents import PERSONA_TOOLS
+    from mungchi.tools import dropbox_tool, tools_named
+
+    monkeypatch.setenv("DROPBOX_ACCESS_TOKEN", "sl." + "a" * 30)
+    monkeypatch.setattr(dropbox_tool, "make_client", lambda cfg: object())
+    monkeypatch.setattr(dropbox_tool, "collect_updates", lambda dbx, root, since, tz: {"configured": True, "total_files": 0, "groups": []})
+    seen_basis = []
+
+    async def run(prompt, *, persona, briefing=False, **kwargs):
+        # What run_turn does: build this run's own tools with this run's mode, and the model calls the tool once.
+        for tool in tools_named(PERSONA_TOOLS[persona], briefing=briefing):
+            if tool.name == "check_dropbox_updates":
+                result = await tool.handler({})
+                seen_basis.append(result["content"][0]["text"])
+        return TurnResult(text=f"{persona} 보고", session_id=UPDATE_SESSION)
+
+    store = StateStore(config.get_state_path())
+    assert store.last_checked("dropbox") is None
+    _relay(run)
+    assert len(seen_basis) == 1 and "lookback_default" in seen_basis[0]  # a briefing run, first time
+    assert store.last_checked("dropbox") is not None  # the checkpoint was written
+    assert store.last_brief_date() is None  # never touched here
+
+
+# ---------------------------------------------------------------- 고뭉치's part: weather and credits by code
+
+
+def test_mungchis_part_is_greeting_then_weather_and_credits_then_closing_lines():
+    head, _reports = _relay(PersonaRun())
+    text = head.text(["업뎃이, 일정이 아침 보고 부탁해요!"])
+    greeting, data, closing = text.split("\n\n")
+    assert greeting == GREETING
+    assert data.splitlines()[0] == WEATHER_LINE and data.splitlines()[1] == CREDIT_LINE
+    assert closing == "업뎃이, 일정이 아침 보고 부탁해요!"
+
+
+@pytest.mark.parametrize("value", ["off", "0", "false", "OFF"])
+def test_brief_weather_off_leaves_the_line_out_and_fetches_nothing(value):
+    fetched = []
+
+    async def go():
+        async with start_relay(
+            personas=(),
+            now=seoul(8, 7),
+            env={"BRIEF_WEATHER": value},
+            credit_fetch=report,
+            weather_fetch=lambda: fetched.append(1) or SUNNY,
+            greeting_generate=FakeGreeting(),
+        ) as relay:
+            return await relay.head()
+
+    head = asyncio.run(go())
+    assert fetched == [] and head.weather == ""
+    assert "날씨" not in head.text() and head.text().startswith(f"{GREETING}\n\n💳 ")
+
+
+@pytest.mark.parametrize(
+    "fetch",
+    [lambda: weather.WeatherReport(label="서울", error="연결 실패: ConnectError"), lambda: (_ for _ in ()).throw(RuntimeError("down"))],
+)
+def test_a_weather_failure_is_a_short_note(fetch):
+    async def go():
+        async with start_relay(personas=(), now=seoul(8, 7), env=WEATHER_ON, credit_fetch=report, weather_fetch=fetch, greeting_generate=FakeGreeting()) as relay:
+            return await relay.head()
+
+    head = asyncio.run(go())
+    assert head.weather == "🌤️ 서울 날씨: 가져오지 못했어요" and head.credits.startswith(CREDIT_LINE)
 
 
 @pytest.mark.parametrize(
@@ -232,8 +540,12 @@ def test_a_slow_agent_run_times_out_into_a_failure_line():
 def test_credit_failures_become_a_one_line_note(fetch, note):
     assert credit_section(fetch=fetch) == f"💳 Chat KHU 크레딧: {note}"
     assert credit_section(fetch=fetch, slack=True) == f"💳 *Chat KHU 크레딧*: {note}"
-    result = asyncio.run(build_briefing(run=FakeRun(), now=seoul(8, 7), credit_fetch=fetch))
-    assert result.text.endswith(f"\n\n💳 Chat KHU 크레딧: {note}") and not result.failed
+
+    async def go():
+        async with start_relay(personas=(), now=seoul(8, 7), credit_fetch=fetch, greeting_generate=FakeGreeting()) as relay:
+            return await relay.head()
+
+    assert asyncio.run(go()).text().endswith(f"\n\n💳 Chat KHU 크레딧: {note}")
 
 
 def test_credit_section_without_a_gateway_never_touches_the_network():
@@ -241,165 +553,84 @@ def test_credit_section_without_a_gateway_never_touches_the_network():
     assert credit_section() == "💳 Chat KHU 크레딧: 확인 안 함 (Chat KHU 게이트웨이를 쓰지 않아요)"
 
 
-# ---------------------------------------------------------------- --brief (terminal) has the same structure
-
-
-def test_brief_cli_prints_the_same_structure_as_slack():
-    out, err = io.StringIO(), io.StringIO()
-    code = run_brief_cli(run=FakeRun(), now=seoul(8, 7), credit_fetch=report, out=out, err=err)
-    assert code == 0
-    terminal = out.getvalue().rstrip("\n")
-    slack = asyncio.run(build_briefing(run=FakeRun(), now=seoul(8, 7), credit_fetch=report, slack=True)).text
-    # Same parts in the same order; only the Slack bold differs.
-    assert terminal.split("\n\n")[0] == "☀️ 오늘의 브리핑 (10/08 목)"
-    assert slack.split("\n\n")[0] == "☀️ *오늘의 브리핑 (10/08 목)*"
-    assert terminal.split("\n\n")[1:-1] == slack.split("\n\n")[1:-1] == ANSWER.split("\n\n")
-    assert terminal.split("\n\n")[-1].startswith("💳 Chat KHU 크레딧: 9,050.5 남음")
-    assert slack.split("\n\n")[-1].startswith("💳 *Chat KHU 크레딧*: 9,050.5 남음")
-    assert err.getvalue() == "→ 일정에게 맡기는 중...\n"  # progress on stderr, the briefing alone on stdout
-
-
-def test_brief_cli_failure_exits_nonzero_but_still_prints_header_and_credits():
-    out, err = io.StringIO(), io.StringIO()
-    code = run_brief_cli(run=FakeRun(RuntimeError("boom")), now=seoul(8, 7), credit_fetch=report, out=out, err=err)
-    assert code == 1
-    text = out.getvalue()
-    assert text.startswith("☀️ 오늘의 브리핑 (10/08 목)\n\n⚠️ 오늘 브리핑을 만들지 못했어요 (RuntimeError)")
-    assert "\n\n💳 Chat KHU 크레딧: 9,050.5 남음" in text
-    assert "[오류] 고뭉치를 실행하지 못했습니다: RuntimeError: boom" in err.getvalue()
-
-
-def test_main_brief_goes_through_the_shared_briefing(monkeypatch, capsys):
-    run = FakeRun()
-    monkeypatch.setattr(briefing, "run_turn", run)
-    assert main(["--brief"]) == 0
-    out = capsys.readouterr().out
-    assert out.startswith("☀️ 오늘의 브리핑 (")
-    assert ANSWER in out
-    assert out.rstrip().endswith("💳 Chat KHU 크레딧: 확인 안 함 (Chat KHU 게이트웨이를 쓰지 않아요)")
-    assert run.calls[0]["briefing"] is True
-
-
-# ---------------------------------------------------------------- the weather line (by code, never through the model)
-
-SUNNY = weather.WeatherReport(
-    label="서울",
-    forecast=weather.Forecast(code=1, low=11.5, high=22.6, rain_chance=10),
-    air=weather.AirQuality(pm10=42.3, pm2_5=12.0),
-)
-WEATHER_LINE = "🌤️ 서울 날씨: 대체로 맑음 · 최저 12° / 최고 23° · 강수확률 10% · 미세먼지 보통"
-WEATHER_ON: dict[str, str] = {}  # an explicit env without BRIEF_WEATHER: the default, on
-
-
-class FakeWeather:
-    def __init__(self, result=SUNNY):
-        self.result = result
-        self.calls = 0
-
-    def __call__(self):
-        self.calls += 1
-        if isinstance(self.result, BaseException):
-            raise self.result
-        return self.result
-
-
-@pytest.mark.parametrize("slack", [False, True])
-def test_weather_line_sits_right_under_the_header(slack):
-    run, fetch = FakeRun(), FakeWeather()
-    result = asyncio.run(
-        build_briefing(run=run, now=seoul(8, 7), env=WEATHER_ON, credit_fetch=report, weather_fetch=fetch, slack=slack)
-    )
-    header = "☀️ *오늘의 브리핑 (10/08 목)*" if slack else "☀️ 오늘의 브리핑 (10/08 목)"
-    line = WEATHER_LINE.replace("서울 날씨", "*서울 날씨*") if slack else WEATHER_LINE
-    assert result.weather == line and fetch.calls == 1
-    assert result.text.startswith(f"{header}\n{line}\n\n*① 오늘의 일정*")
-    head, *middle, credit_part = result.text.split("\n\n")
-    assert head.splitlines() == [header, line] and middle == ANSWER.split("\n\n")
-    assert credit_part.startswith("💳 ")
-    # The model is never told the weather; it is only told that code adds it.
-    prompt = run.calls[0]["prompt"] + run.calls[0]["extra_system_prompt"]
-    assert "대체로 맑음" not in prompt and "미세먼지" not in prompt and "강수확률" not in prompt
-    assert "날씨" not in run.calls[0]["extra_system_prompt"]
-
-
-def test_agent_failure_still_gives_header_weather_failure_line_and_credits():
-    result = asyncio.run(
-        build_briefing(
-            run=FakeRun(RuntimeError("boom")), now=seoul(8, 7), env=WEATHER_ON, credit_fetch=report, weather_fetch=FakeWeather(), slack=True
-        )
-    )
-    assert result.failed
-    head, body, credit_part = result.text.split("\n\n")
-    assert head == "☀️ *오늘의 브리핑 (10/08 목)*\n🌤️ *서울 날씨*: 대체로 맑음 · 최저 12° / 최고 23° · 강수확률 10% · 미세먼지 보통"
-    assert body == "⚠️ 오늘 브리핑을 만들지 못했어요 (RuntimeError). 실행 로그를 확인해 주세요."
-    assert credit_part.startswith("💳 *Chat KHU 크레딧*: 9,050.5 남음")
-
-
-@pytest.mark.parametrize(
-    "fetch",
-    [
-        FakeWeather(weather.WeatherReport(label="서울", error="연결 실패: ConnectError")),
-        FakeWeather(RuntimeError("weather exploded")),
-    ],
-)
-def test_a_weather_failure_is_a_short_note_and_the_briefing_goes_out(fetch):
-    result = asyncio.run(build_briefing(run=FakeRun(), now=seoul(8, 7), env=WEATHER_ON, credit_fetch=report, weather_fetch=fetch))
-    assert not result.failed
-    assert result.text.startswith("☀️ 오늘의 브리핑 (10/08 목)\n🌤️ 서울 날씨: 가져오지 못했어요\n\n*① 오늘의 일정*")
-    assert "💳 Chat KHU 크레딧: 9,050.5 남음" in result.text
-
-
-@pytest.mark.parametrize("value", ["off", "0", "false", "OFF"])
-def test_brief_weather_off_leaves_the_line_out_and_fetches_nothing(value):
-    fetch = FakeWeather()
-    result = asyncio.run(
-        build_briefing(run=FakeRun(), now=seoul(8, 7), env={"BRIEF_WEATHER": value}, credit_fetch=report, weather_fetch=fetch)
-    )
-    assert fetch.calls == 0 and result.weather == ""
-    assert result.text.startswith("☀️ 오늘의 브리핑 (10/08 목)\n\n*① 오늘의 일정*")
-    assert "날씨" not in result.text
-
-
-def test_weather_and_credits_are_fetched_while_the_agent_runs():
+def test_weather_and_credits_are_fetched_while_the_reports_run():
     import threading
 
     fetched = {"weather": threading.Event(), "credits": threading.Event()}
-
-    def weather_fetch():
-        fetched["weather"].set()
-        return SUNNY
-
-    def credit_fetch():
-        fetched["credits"].set()
-        return report()
-
     seen_during_run = {}
 
-    async def slow_run(prompt, **kwargs):
+    async def slow_run(prompt, *, persona, **kwargs):
         for _ in range(200):  # up to 2 s: the fetches run in worker threads meanwhile
             if all(event.is_set() for event in fetched.values()):
                 break
             await asyncio.sleep(0.01)
-        seen_during_run.update({name: event.is_set() for name, event in fetched.items()})
-        return TurnResult(text=ANSWER, session_id=SESSION)
+        seen_during_run[persona] = {name: event.is_set() for name, event in fetched.items()}
+        return TurnResult(text="보고", session_id=UPDATE_SESSION)
 
-    result = asyncio.run(
-        build_briefing(run=slow_run, now=seoul(8, 7), env=WEATHER_ON, credit_fetch=credit_fetch, weather_fetch=weather_fetch)
-    )
-    assert seen_during_run == {"weather": True, "credits": True}
-    assert result.text.startswith(f"☀️ 오늘의 브리핑 (10/08 목)\n{WEATHER_LINE}\n\n")
+    async def go():
+        async with start_relay(
+            run=slow_run,
+            now=seoul(8, 7),
+            env=WEATHER_ON,
+            credit_fetch=lambda: fetched["credits"].set() or report(),
+            weather_fetch=lambda: fetched["weather"].set() or SUNNY,
+            greeting_generate=FakeGreeting(),
+        ) as relay:
+            for persona in relay.personas:
+                await relay.report(persona)
+
+    asyncio.run(go())
+    assert seen_during_run == {p: {"weather": True, "credits": True} for p in ("update", "schedule")}
 
 
-def test_brief_cli_prints_the_weather_under_the_header():
+# ---------------------------------------------------------------- --brief (terminal): three headed parts
+
+
+def test_brief_cli_prints_three_headed_parts_in_order():
     out, err = io.StringIO(), io.StringIO()
-    code = run_brief_cli(env=WEATHER_ON, run=FakeRun(), now=seoul(8, 7), credit_fetch=report, weather_fetch=FakeWeather(), out=out, err=err)
+    code = run_brief_cli(
+        env=WEATHER_ON,
+        run=PersonaRun(),
+        now=seoul(8, 7),
+        credit_fetch=report,
+        weather_fetch=lambda: SUNNY,
+        greeting_generate=FakeGreeting(),
+        rng=random.Random(0),
+        out=out,
+        err=err,
+    )
     assert code == 0
-    assert out.getvalue().startswith(f"☀️ 오늘의 브리핑 (10/08 목)\n{WEATHER_LINE}\n\n*① 오늘의 일정*")
+    text = out.getvalue()
+    assert text.index("[고뭉치]\n") < text.index("[업뎃]\n") < text.index("[일정]\n")
+    mungchi, update, schedule_ = (part.strip() for part in re.split(r"^\[(?:고뭉치|업뎃|일정)\]\n", text, flags=re.M)[1:])
+    assert mungchi.startswith(f"{GREETING}\n\n{WEATHER_LINE}\n{CREDIT_LINE}")
+    handoff = mungchi.splitlines()[-1]
+    assert handoff in [t.format(bots="업뎃이, 일정이") for t in phrases.HANDOFF_TEMPLATES]
+    assert update == UPDATE_REPORT and schedule_ == SCHEDULE_REPORT
+    for part in (update, schedule_):  # weather and credits only in 고뭉치's part
+        assert "날씨" not in part and "크레딧" not in part
+    assert err.getvalue() == ""
 
-    out = io.StringIO()
-    code = run_brief_cli(env=WEATHER_ON, run=FakeRun(RuntimeError("boom")), now=seoul(8, 7), credit_fetch=report, weather_fetch=FakeWeather(), out=out, err=io.StringIO())
+
+def test_brief_cli_with_a_failed_report_still_prints_every_part_and_exits_nonzero():
+    out, err = io.StringIO(), io.StringIO()
+    code = run_brief_cli(run=PersonaRun(update=RuntimeError("boom")), now=seoul(8, 7), credit_fetch=report, greeting_generate=FakeGreeting(), out=out, err=err)
     assert code == 1
-    assert out.getvalue().startswith(f"☀️ 오늘의 브리핑 (10/08 목)\n{WEATHER_LINE}\n\n⚠️ 오늘 브리핑을 만들지 못했어요 (RuntimeError)")
+    text = out.getvalue()
+    assert "[고뭉치]\n" in text and "[업뎃]\n업뎃입니다." in text and f"[일정]\n{SCHEDULE_REPORT}" in text
+    assert "[오류] 업뎃을 실행하지 못했습니다: RuntimeError: boom" in err.getvalue()
+
+
+def test_main_brief_goes_through_the_relay(monkeypatch, capsys):
+    run = PersonaRun()
+    monkeypatch.setattr(briefing, "run_turn", run)
+    assert main(["--brief"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("[고뭉치]\n")
+    assert f"[업뎃]\n{UPDATE_REPORT}\n" in out and f"[일정]\n{SCHEDULE_REPORT}\n" in out
+    assert "💳 Chat KHU 크레딧: 확인 안 함 (Chat KHU 게이트웨이를 쓰지 않아요)" in out
+    assert run.call("update")["briefing"] is True
+    assert StateStore(config.get_state_path()).last_brief_date() is None
 
 
 def test_main_brief_adds_the_open_meteo_line_by_default(monkeypatch, capsys):
@@ -416,11 +647,10 @@ def test_main_brief_adds_the_open_meteo_line_by_default(monkeypatch, capsys):
 
     real_client = httpx.Client
     monkeypatch.setattr(weather.httpx, "Client", lambda **kw: real_client(transport=httpx.MockTransport(handle), timeout=kw.get("timeout")))
-    run = FakeRun()
+    run = PersonaRun()
     monkeypatch.setattr(briefing, "run_turn", run)
     assert main(["--brief"]) == 0
-    first, second, *_ = capsys.readouterr().out.splitlines()
-    assert first.startswith("☀️ 오늘의 브리핑 (")
-    assert second == "🌧️ 서울 날씨: 비 · 최저 14° / 최고 20° · 강수확률 80% · 미세먼지 나쁨 · ☔ 우산 챙기세요"
+    out = capsys.readouterr().out
+    assert "\n🌧️ 서울 날씨: 비 · 최저 14° / 최고 20° · 강수확률 80% · 미세먼지 나쁨 · ☔ 우산 챙기세요\n" in out
     assert hosts == ["api.open-meteo.com", "air-quality-api.open-meteo.com"]
-    assert "최저 14°" not in run.calls[0]["prompt"] and "우산" not in run.calls[0]["prompt"]  # never through the model
+    assert all("최저 14°" not in c["prompt"] and "우산" not in c["prompt"] for c in run.calls)  # never through the model

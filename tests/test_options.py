@@ -461,18 +461,18 @@ def test_a_briefing_in_conversation_has_all_four_parts():
     # The format, in the order of the code-driven briefing: weather, ①, ②, credits.
     lines = ["  🌤️ 날씨: get_weather의 summary 한 줄", "  ① 오늘의 일정: 아래 규칙대로", "  ② Dropbox 업데이트: 아래 규칙대로", "  💳 크레딧: get_credits의 summary를 짧게"]
     assert "\n".join(lines) in section
-    # The blanket "never in a briefing" rule is gone; only a run whose prompt says code adds them leaves them out.
+    # No blanket "never in a briefing" rule; and since the morning briefing became a relay (each bot
+    # reports its own part), 고뭉치 has no program-made briefing run left to special-case.
     assert "브리핑에서는 get_weather와 get_credits를 부르지 않는다" not in prompt
     assert "Chat KHU 크레딧은 쓰지 않고" not in prompt
-    assert "사용자 메시지가 제목, 날씨, 크레딧은 프로그램이 따로 붙인다고 하면(프로그램이 만드는 브리핑) 그 말을 따른다." in section
-    assert "그때는 get_weather와 get_credits를 부르지 않고, 날짜 제목 줄, 날씨, 크레딧 없이 ①과 ②만 쓴다." in section
-    # ... and the code-driven briefing's prompt is exactly such a message.
+    assert "프로그램이 따로 붙인다" not in prompt and "프로그램이 만드는 브리핑" not in prompt
+    # The morning reports' prompts are per run (with the date), never in a cached system prompt.
     from mungchi import briefing
 
-    code_prompt = briefing.briefing_prompt(NOW)
-    assert "제목, 날씨, Chat KHU 크레딧은 프로그램이 따로 붙이니 get_weather와 get_credits는 부르지 말고" in code_prompt
-    assert "① 오늘의 일정과 ② Dropbox 업데이트만 써" in code_prompt
-    assert code_prompt not in prompt and "2026-10-05" not in prompt  # per run, never in the cached system prompt
+    for persona in ("update", "schedule"):
+        report = briefing.report_prompt(persona, NOW)
+        assert report not in prompt and report not in build_options(env={}, persona=persona).system_prompt
+    assert "2026-10-05" in briefing.report_prompt("schedule", NOW) and "2026-10-05" not in prompt
 
 
 def test_folder_link_example_line_is_in_every_prompt_that_writes_one():
@@ -901,11 +901,13 @@ def _dropbox_mode(tools, monkeypatch) -> bool:
 
 
 def test_only_the_brief_run_gets_a_briefing_dropbox_tool(fake_sdk, server_tools, monkeypatch, capsys):
-    assert main(["--brief"]) == 0
+    assert main(["--brief"]) == 0  # the relay: 업뎃's report run (briefing mode) and 일정's (no Dropbox tool at all)
+    assert len(server_tools) == 2 and not any(t.name == "check_dropbox_updates" for t in server_tools[1])
     assert main(["어제 공저자들이 뭐 고쳤어?"]) == 0
     assert main(["--agent", "update", "누가 무슨 파일 고쳤어?"]) == 0
     asyncio.run(run_turn("업데이트 알려줘", extra_system_prompt=SLACK_FORMAT_PROMPT))  # a Slack turn
-    assert [_dropbox_mode(tools, monkeypatch) for tools in server_tools] == [True, False, False, False]
+    with_dropbox = [tools for tools in server_tools if any(t.name == "check_dropbox_updates" for t in tools)]
+    assert [_dropbox_mode(tools, monkeypatch) for tools in with_dropbox] == [True, False, False, False]
     # Every run builds its own tool object, so a flag can never leak from one run to another.
     dropbox_tools = [t for tools in server_tools for t in tools if t.name == "check_dropbox_updates"]
     assert len({id(t) for t in dropbox_tools}) == 4

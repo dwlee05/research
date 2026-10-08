@@ -6,9 +6,9 @@ to a few tokens per file. The user opens the files themselves.
 
 Which window a check looks at is fixed per run, never by the model:
 
-* a briefing run (``build_options(briefing=True)``, only from
-  ``briefing.build_briefing``: ``--brief``, the morning briefing, a briefing
-  asked for in Slack) looks at the time since the stored briefing checkpoint
+* a briefing run (``build_options(briefing=True)``, only 업뎃's report run
+  in the relay briefing, ``briefing.run_report``: ``--brief``, the morning
+  briefing, a briefing asked for in Slack) looks at the time since the stored briefing checkpoint
   (``LOOKBACK_DAYS`` without one) and moves the checkpoint after a successful
   check;
 * every other run (Slack questions, ``--agent update``, one-shot questions)
@@ -406,7 +406,7 @@ TOOL_DESCRIPTION = (
 def make_check_dropbox_updates(*, briefing: bool = False) -> SdkMcpTool[Any]:
     """A ``check_dropbox_updates`` tool whose run mode is fixed when it is built.
 
-    ``build_options(briefing=True)`` (only ``briefing.build_briefing``) builds a
+    ``build_options(briefing=True)`` (only 업뎃's report in ``briefing.run_report``) builds a
     briefing tool: it reads and moves the briefing checkpoint. Every other
     run gets an ad-hoc tool (last 24 hours, state untouched). Each run's
     options build their own tool object, so concurrent turns in one process
