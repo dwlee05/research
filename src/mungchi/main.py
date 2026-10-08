@@ -719,6 +719,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  python -m mungchi --credits             # Chat KHU 남은 크레딧과 이번 달 사용량 (LLM 호출 없음)\n"
             "  python -m mungchi --weather             # 오늘 서울 날씨 한 줄 (Open-Meteo, LLM 호출 없음)\n"
             "  python -m mungchi --calendar-setup      # Mac 캘린더 앱 연결 (처음 한 번, 터미널에서)\n"
+            "  python -m mungchi --calendars           # 캘린더 목록: 계정·종류·쓰기 가능·CALENDAR_EXCLUDE 여부·7일 일정 수\n"
             "  python -m mungchi --dropbox-check --hours 72   # 업뎃이 Dropbox 변경을 못 찾을 때 원인 확인 (최근 72시간)\n"
             "  python -m mungchi service install       # (macOS) Slack 봇을 백그라운드 서비스로 설치 (로그인하면 자동 시작)\n"
             "  python -m mungchi service status        # (macOS) 서비스 상태(실행 중인 코드 버전 포함)와 최근 로그\n"
@@ -809,6 +810,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Mac 캘린더 앱 접근을 허용하고, 읽을 캘린더와 오늘·내일 일정, 메모로 일정을 추가할 캘린더를 확인합니다 "
             "(macOS 터미널에서 한 번 실행, Claude API는 쓰지 않음)"
+        ),
+    )
+    opts.add_argument(
+        "--calendars",
+        action="store_true",
+        help=(
+            "Mac 캘린더 앱의 캘린더를 모두 보여 주고 끝냅니다: 계정, 종류, 일정을 넣을 수 있는지, CALENDAR_EXCLUDE로 "
+            "뺐는지, 앞으로 7일 일정 수 (읽기 전용, 권한을 묻지 않고 Claude API도 쓰지 않음)"
         ),
     )
     opts.add_argument(
@@ -903,6 +912,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(
             "--calendar-setup은 질문이나 다른 옵션(--brief, --slack, --agent, --list-models, slack)과 함께 쓸 수 없습니다."
         )
+    if args.calendars and (
+        args.question
+        or args.brief
+        or args.slack
+        or args.agent
+        or args.list_models
+        or args.credits
+        or args.weather
+        or args.calendar_setup
+        or args.dropbox_check
+        or args.image
+    ):
+        parser.error(
+            "--calendars는 질문이나 다른 옵션(--brief, --slack, --agent, --image, --list-models, --credits, --weather, "
+            "--calendar-setup, --dropbox-check, slack)과 함께 쓸 수 없습니다."
+        )
     if args.dropbox_check and (
         args.question or args.brief or args.slack or args.agent or args.list_models or args.calendar_setup
     ):
@@ -968,6 +993,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             from .calendar_setup import run_calendar_setup
 
             return run_calendar_setup()
+        if args.calendars:
+            from .calendar_setup import run_calendar_list
+
+            return run_calendar_list()
         if args.dropbox_check:
             from .dropbox_check import run_dropbox_check
 

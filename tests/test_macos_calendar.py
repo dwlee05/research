@@ -112,12 +112,13 @@ class FakeAdapter:
     """Stands in for the Calendar app. ``fetch_events`` ignores ``names`` on
     purpose: the tool must keep only the selected calendars itself."""
 
-    def __init__(self, status=GRANTED, calendars=CALENDARS, records=RECORDS, series=SERIES, grant=True):
+    def __init__(self, status=GRANTED, calendars=CALENDARS, records=RECORDS, series=SERIES, grant=True, overview=()):
         self.status = status
         self.calendars = calendars
         self.records = records
         self.series = series
         self.grant = grant
+        self.overview = overview
         self.calls: list[str] = []
         self.fetches: list[tuple] = []
         self.threads: set[str] = set()
@@ -140,6 +141,11 @@ class FakeAdapter:
     def list_writable_calendars(self):
         self.calls.append("writable")
         return [{**c, "is_default": i == 0} for i, c in enumerate(self.calendars) if c["name"] != "생일"]
+
+    def calendar_overview(self, start, end):
+        self.calls.append("overview")
+        self.fetches.append((start, end, "overview"))
+        return [dict(c) for c in self.overview]
 
     def fetch_events(self, start, end, names=None):
         self.calls.append("fetch")
@@ -342,6 +348,77 @@ def test_select_calendars():
     assert select_calendars(["  업무  일정 "], ["업무 일정"]) == (["업무 일정"], [])
 
 
+# ---------------------------------------------------------------- CALENDAR_EXCLUDE
+
+CHINA = "중국 공휴일"
+# 한로 is one of the 24 solar terms (절기) a Chinese holiday calendar carries.
+EXCLUDE_CALENDARS = [*CALENDARS[:2], {"name": CHINA, "source": "기타"}]
+EXCLUDE_RECORDS = [
+    record("지도교수 면담", at(5, 13), at(5, 14, 30)),
+    record("Standup", at(5, 9), at(5, 9, 15), calendar="Work"),
+    record("한로", at(5), at(6), calendar=CHINA, all_day=True),
+]
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (None, []),
+        ("", []),
+        ("  ,  , ", []),
+        ("중국 공휴일", ["중국 공휴일"]),
+        (" 중국   공휴일 ,Birthdays,, 대한민국 공휴일 ", ["중국 공휴일", "Birthdays", "대한민국 공휴일"]),
+    ],
+)
+def test_calendar_exclude_parsing(raw, expected):
+    env = {} if raw is None else {"CALENDAR_EXCLUDE": raw}
+    assert config.get_calendar_exclude(env) == expected
+    assert config.load_calendar_config(env, platform="darwin").excluded_calendars == expected
+
+
+def test_exclusion_matching_is_trimmed_nfc_and_case_insensitive():
+    keys = macos_calendar.exclusion_keys([" CHINA  holidays ", unicodedata.normalize("NFD", CHINA), "", "  "])
+    assert keys == {"china holidays", CHINA}
+    assert macos_calendar.is_excluded("China Holidays", keys) and macos_calendar.is_excluded(f" {CHINA} ", keys)
+    assert not macos_calendar.is_excluded("대한민국 공휴일", keys) and not macos_calendar.is_excluded("", keys)
+    assert macos_calendar.exclusion_keys([]) == frozenset()
+
+
+def test_excluded_calendars_are_never_read_by_the_tool():
+    adapter = FakeAdapter(calendars=EXCLUDE_CALENDARS, records=EXCLUDE_RECORDS, series=[])
+    payload = run_mac(adapter, {"CALENDAR_EXCLUDE": " 중국  공휴일 "})
+    assert [(e["title"], e["calendar"]) for e in payload["events"]] == [("Standup", "Work"), ("지도교수 면담", "연구")]
+    assert "한로" not in json.dumps(payload, ensure_ascii=False)
+    # The other calendars are named explicitly (nil would read every calendar, the excluded one too).
+    assert adapter.fetches == [(at(5), at(7), ["연구", "Work"])]
+    assert "warnings" not in payload
+
+    # Without the setting the same calendar is read, with its name on every event.
+    everything = run_mac(FakeAdapter(calendars=EXCLUDE_CALENDARS, records=EXCLUDE_RECORDS, series=[]))
+    assert ("한로", CHINA) in [(e["title"], e["calendar"]) for e in everything["events"]]
+
+
+def test_calendar_exclude_wins_over_macos_calendars():
+    adapter = FakeAdapter(calendars=EXCLUDE_CALENDARS, records=EXCLUDE_RECORDS, series=[])
+    payload = run_mac(adapter, {"MACOS_CALENDARS": f"연구,{CHINA}", "CALENDAR_EXCLUDE": CHINA})
+    assert [e["title"] for e in payload["events"]] == ["지도교수 면담"]
+    assert adapter.fetches[0][2] == ["연구"]
+
+    every = FakeAdapter(calendars=EXCLUDE_CALENDARS, records=EXCLUDE_RECORDS, series=[])
+    payload = run_mac(every, {"CALENDAR_EXCLUDE": f"연구,work,{CHINA}"})
+    assert payload["ok"] is True and payload["events"] == [] and every.fetches == []  # nothing left to read
+
+
+def test_tool_handler_and_briefing_run_honour_calendar_exclude_from_the_environment(monkeypatch):
+    # The morning briefing's 일정 report calls this same tool.
+    adapter = FakeAdapter(calendars=EXCLUDE_CALENDARS, records=EXCLUDE_RECORDS, series=[])
+    monkeypatch.setattr(config, "current_platform", lambda: "darwin")
+    monkeypatch.setattr(macos_calendar, "default_adapter", lambda tz: adapter)
+    monkeypatch.setenv("CALENDAR_EXCLUDE", CHINA)
+    asyncio.run(get_schedule.handler({"date": "2026-10-05", "days": 1}))
+    assert adapter.fetches[0][2] == ["연구", "Work"]
+
+
 # ---------------------------------------------------------------- pure EventKit helpers
 
 
@@ -432,14 +509,23 @@ class FakeSource:
 
 
 class FakeCalendar:
-    def __init__(self, title, source):
-        self._title, self._source = title, FakeSource(source)
+    def __init__(self, title, source, kind=1, writable=True):
+        self._title, self._source, self._kind, self._writable = title, FakeSource(source), kind, writable
 
     def title(self):
         return self._title
 
     def source(self):
         return self._source
+
+    def type(self):
+        return self._kind
+
+    def allowsContentModifications(self):
+        return self._writable
+
+    def calendarIdentifier(self):
+        return f"id-{self._title}-{self._source.title()}"
 
 
 class FakeEvent:
@@ -472,11 +558,13 @@ class FakeEvent:
 class World:
     """What macOS knows: the permission, the calendars, the events."""
 
-    def __init__(self, status=0, modern=True, answer=True, respond=True):
+    def __init__(self, status=0, modern=True, answer=True, respond=True, refresh_fails=False):
         self.status, self.modern, self.answer, self.respond = status, modern, answer, respond
+        self.refresh_fails = refresh_fails
         self.stores: list = []
         self.requests: list = []
         self.predicates: list = []
+        self.refreshes: list = []
         self.calendars: list = []
         self.events: list = []
 
@@ -490,8 +578,15 @@ def fake_eventkit(world: World) -> SimpleNamespace:
         def init(self):
             # Like EventKit: a store created before access was granted sees no calendars.
             self.sees_calendars = world.status == 3
+            # Like EventKit without a run loop: a store keeps what it saw when it was made.
+            self.calendars, self.events = list(world.calendars), list(world.events)
             world.stores.append(self)
             return self
+
+        def refreshSourcesIfNecessary(self):
+            world.refreshes.append(self)
+            if world.refresh_fails:
+                raise RuntimeError("daemon busy")
 
         @classmethod
         def authorizationStatusForEntityType_(cls, entity_type):
@@ -521,7 +616,7 @@ def fake_eventkit(world: World) -> SimpleNamespace:
 
         def calendarsForEntityType_(self, entity_type):
             assert entity_type == 0
-            return list(world.calendars) if self.sees_calendars else []
+            return list(self.calendars) if self.sees_calendars else []
 
         def predicateForEventsWithStartDate_endDate_calendars_(self, start, end, calendars):
             return (start, end, calendars)
@@ -530,7 +625,7 @@ def fake_eventkit(world: World) -> SimpleNamespace:
             world.predicates.append(predicate)
             start, end, calendars = predicate
             return [
-                e for e in world.events
+                e for e in self.events
                 if (calendars is None or e.calendar() in calendars)
                 and e.startDate().ts < end.ts and e.endDate().ts > start.ts
             ]
@@ -546,6 +641,11 @@ def fake_eventkit(world: World) -> SimpleNamespace:
         EKAuthorizationStatusWriteOnly=4,
         EKEventStatusConfirmed=1,
         EKEventStatusCanceled=3,
+        EKCalendarTypeLocal=0,
+        EKCalendarTypeCalDAV=1,
+        EKCalendarTypeExchange=2,
+        EKCalendarTypeSubscription=3,
+        EKCalendarTypeBirthday=4,
     )
 
 
@@ -563,9 +663,10 @@ def test_request_access_waits_for_the_answer_and_renews_the_store(modern, expect
     adapter = real_adapter(world)
     assert adapter.authorization_status() == NOT_DETERMINED
     assert adapter.list_calendars() == []  # no access yet
+    before = len(world.stores)
     assert adapter.request_access(timeout=5) is True
     assert world.requests == [expected_request]  # macOS 14+ API when the store has it, else the older one
-    assert len(world.stores) == 2  # a fresh store after access was granted
+    assert len(world.stores) == before + 1  # a fresh store after access was granted
     assert adapter.authorization_status() == GRANTED
     assert adapter.list_calendars() == [{"name": "연구", "source": "iCloud"}]
 
@@ -638,6 +739,86 @@ def test_real_adapter_through_the_calendar_tool():
     )
     assert payload["source"] == "macos" and payload["ok"] is True
     assert [e["title"] for e in payload["now"]] == ["주간 랩미팅"]
+
+
+def china_world(**kwargs):
+    world = World(status=3, **kwargs)
+    research = FakeCalendar("연구", "iCloud")
+    china = FakeCalendar(CHINA, "기타", kind=3, writable=False)
+    world.calendars = [research, china]
+    world.events = [
+        FakeEvent("주간 랩미팅", at(5, 10), at(5, 11), research),
+        FakeEvent("한로", at(5), at(5, 23, 59), china, all_day=True),
+    ]
+    return world, research, china
+
+
+def test_every_read_starts_on_a_new_store_so_a_removed_calendar_disappears():
+    """The bot is one long-lived process without a run loop: a store would never notice the removal."""
+    world, research, china = china_world()
+    adapter = real_adapter(world)
+    assert {r["title"] for r in adapter.fetch_events(at(5), at(6))} == {"주간 랩미팅", "한로"}
+    first = world.stores[-1]
+
+    # The user removes the Chinese calendar in the Calendar app.
+    world.calendars = [research]
+    world.events = [e for e in world.events if e.calendar() is research]
+    assert china in first.calendarsForEntityType_(0)  # an old store still has it (the bug)
+
+    stores = len(world.stores)
+    assert [r["title"] for r in adapter.fetch_events(at(5), at(6))] == ["주간 랩미팅"]
+    assert adapter.list_calendars() == [{"name": "연구", "source": "iCloud"}]
+    assert [c["name"] for c in adapter.calendar_overview(at(5), at(12))] == ["연구"]
+    assert len(world.stores) == stores + 3  # one new store per read
+    assert world.refreshes == world.stores[1:]  # each new store is asked to sync its accounts (not the initial one)
+
+
+def test_reads_still_work_when_refresh_sources_fails():
+    world, _, _ = china_world(refresh_fails=True)
+    assert len(real_adapter(world).fetch_events(at(5), at(6))) == 2
+    assert len(world.refreshes) == 1
+
+
+def test_real_adapter_skips_excluded_calendars_in_reads():
+    world, research, china = china_world()
+    adapter = EventKitCalendar(
+        SEOUL, eventkit=fake_eventkit(world), foundation=FOUNDATION, local_tz=SEOUL, env={"CALENDAR_EXCLUDE": " 중국 공휴일"}
+    )
+    assert [r["title"] for r in adapter.fetch_events(at(5), at(6))] == ["주간 랩미팅"]
+    assert world.predicates[-1][2] == [research]  # never nil (= every calendar) while something is excluded
+    assert adapter.fetch_events(at(5), at(6), names=[CHINA]) == []
+    # list_calendars still shows it (the tool and the diagnostics decide).
+    assert [c["name"] for c in adapter.list_calendars()] == ["연구", CHINA]
+    # Nothing excluded: nil, as before.
+    real_adapter(world).fetch_events(at(5), at(6))
+    assert world.predicates[-1][2] is None
+
+
+def test_calendar_overview_lists_every_calendar_with_type_writability_and_event_count():
+    world, research, china = china_world()
+    birthdays = FakeCalendar("생일", "기타", kind=4, writable=False)
+    work = FakeCalendar("Work", "Exchange", kind=2)
+    world.calendars += [birthdays, work]
+    world.events += [
+        FakeEvent("한글날", at(9), at(9, 23, 59), china, all_day=True),
+        FakeEvent("취소된 회의", at(6, 9), at(6, 10), research, status=3),  # canceled: not counted
+        FakeEvent("먼 일정", at(20, 9), at(20, 10), research),  # outside the 7 days
+    ]
+    adapter = EventKitCalendar(
+        SEOUL, eventkit=fake_eventkit(world), foundation=FOUNDATION, local_tz=SEOUL, env={"CALENDAR_EXCLUDE": CHINA}
+    )
+    assert adapter.calendar_overview(at(5), at(12)) == [
+        {"name": "연구", "source": "iCloud", "type": "CalDAV", "writable": True, "events": 1},
+        {"name": CHINA, "source": "기타", "type": "구독", "writable": False, "events": 2},  # excluded, still listed
+        {"name": "생일", "source": "기타", "type": "생일", "writable": False, "events": 0},
+        {"name": "Work", "source": "Exchange", "type": "Exchange", "writable": True, "events": 0},
+    ]
+    assert world.predicates[-1][2] is None  # one read over every calendar
+
+
+def test_calendar_type_labels():
+    assert [macos_calendar.calendar_type_label(code) for code in range(5)] == ["로컬", "CalDAV", "Exchange", "구독", "생일"]
+    assert macos_calendar.calendar_type_label(9) == "" and macos_calendar.calendar_type_label(None) == ""
 
 
 def test_tool_handler_reads_the_calendar_app_in_a_worker_thread(monkeypatch):
@@ -738,6 +919,139 @@ def test_cli_calendar_setup_dispatch_help_and_conflicts(monkeypatch, capsys):
             main(argv)
         assert exc.value.code == 2
     assert "--calendar-setup은 질문이나 다른 옵션" in capsys.readouterr().err
+
+
+def test_setup_marks_excluded_calendars_and_never_samples_them():
+    adapter = FakeAdapter(calendars=EXCLUDE_CALENDARS, records=EXCLUDE_RECORDS, series=[])
+    code, out = setup(adapter, {"CALENDAR_EXCLUDE": "중국 공휴일"})
+    assert code == 0
+    assert f"  기타\n    - {CHINA} (CALENDAR_EXCLUDE로 뺌)\n" in out and "    - 연구\n" in out
+    assert "CALENDAR_EXCLUDE: 중국 공휴일 (이 캘린더는 읽지도, 일정을 넣지도 않습니다)" in out
+    assert "python -m mungchi --calendars" in out
+    assert "오늘 (2026-10-05 월요일): 일정 2개\n" in out and "한로" not in out
+
+
+# ---------------------------------------------------------------- --calendars
+
+OVERVIEW = [
+    {"name": "연구", "source": "iCloud", "type": "CalDAV", "writable": True, "events": 4},
+    {"name": "Work", "source": "Exchange", "type": "Exchange", "writable": True, "events": 2},
+    {"name": CHINA, "source": "기타", "type": "구독", "writable": False, "events": 3},
+    {"name": "생일", "source": "기타", "type": "", "writable": False, "events": 0},
+]
+
+
+def calendars_cli(adapter, env=None, platform="darwin"):
+    out = io.StringIO()
+    code = calendar_setup.run_calendar_list(
+        {**ENV, **(env or {})}, adapter_factory=lambda tz: adapter, platform=platform, now=CLOCK, out=out
+    )
+    return code, out.getvalue()
+
+
+def test_calendars_lists_every_calendar_with_its_details():
+    adapter = FakeAdapter(overview=OVERVIEW)
+    code, out = calendars_cli(adapter, {"CALENDAR_EXCLUDE": "중국 공휴일, 없는 캘린더"})
+    assert code == 0
+    assert out == (
+        "Mac 캘린더 앱의 캘린더 목록 (EventKit이 보는 그대로, Claude API는 쓰지 않습니다)\n"
+        "캘린더 접근 권한: 허용됨(전체 접근)\n"
+        "\n"
+        "캘린더 4개, 계정별 (일정 수는 오늘부터 7일: 10/05(월)–10/11(일)):\n"
+        "  iCloud\n"
+        "    - 연구 · CalDAV · 쓰기 가능 · 일정 4개\n"
+        "  Exchange\n"
+        "    - Work · Exchange · 쓰기 가능 · 일정 2개\n"
+        "  기타\n"
+        "    - 중국 공휴일 · 구독 · 읽기 전용 · 일정 3개 · 제외됨(CALENDAR_EXCLUDE)\n"
+        "    - 생일 · 읽기 전용 · 일정 0개\n"
+        "\n"
+        "'일정'이 읽는 캘린더 3개, 읽지 않는 캘린더 1개\n"
+        "MACOS_CALENDARS: 비어 있음 (모든 캘린더를 읽습니다)\n"
+        "CALENDAR_EXCLUDE: 중국 공휴일, 없는 캘린더 (읽지도, 일정을 넣지도 않습니다)\n"
+        "[참고] CALENDAR_EXCLUDE의 '없는 캘린더' 캘린더는 캘린더 앱에 없습니다(이미 지웠다면 .env에서 빼도 됩니다).\n"
+        "캘린더를 빼려면: .env에 CALENDAR_EXCLUDE=중국 공휴일 추가 후 python -m mungchi service restart (여러 개는 쉼표로 구분)\n"
+    )
+    # Read-only: permission and one overview of today + 7 days; nothing asked, nothing fetched per calendar.
+    assert adapter.calls == ["status", "overview"] and adapter.fetches == [(at(5), at(12), "overview")]
+
+
+def test_calendars_shows_what_macos_calendars_leaves_out_and_an_empty_exclude():
+    code, out = calendars_cli(FakeAdapter(overview=OVERVIEW), {"MACOS_CALENDARS": "연구, work, 없음", "CALENDAR_SOURCE": "macos"})
+    assert code == 0
+    assert "    - 중국 공휴일 · 구독 · 읽기 전용 · 일정 3개 · 안 읽음(MACOS_CALENDARS에 없음)\n" in out
+    assert "    - 연구 · CalDAV · 쓰기 가능 · 일정 4개\n" in out
+    assert "'일정'이 읽는 캘린더 2개, 읽지 않는 캘린더 2개\n" in out
+    assert "MACOS_CALENDARS: 연구, work, 없음 (이 캘린더만 읽습니다)\n" in out
+    assert "CALENDAR_EXCLUDE: 비어 있음 (빼는 캘린더 없음)\n" in out
+    assert "[경고] MACOS_CALENDARS의 '없음' 캘린더를" in out
+    assert out.rstrip("\n").splitlines()[-1].startswith("캘린더를 빼려면: .env에 CALENDAR_EXCLUDE=")
+
+    _, ics = calendars_cli(FakeAdapter(overview=OVERVIEW), {"CALENDAR_ICS_URLS": URL})
+    assert "[참고] 지금은 .env의 CALENDAR_ICS_URLS(ICS 주소)를 읽으므로" in ics and URL not in ics
+    _, typo = calendars_cli(FakeAdapter(overview=OVERVIEW), {"CALENDAR_SOURCE": "outlook"})
+    assert "[참고] CALENDAR_SOURCE 값 'outlook'은(는) 쓸 수 없습니다" in typo
+
+    _, empty = calendars_cli(FakeAdapter(overview=[]))
+    assert "캘린더 0개, 계정별" in empty and "(캘린더가 하나도 없습니다." in empty
+
+
+@pytest.mark.parametrize("status", [NOT_DETERMINED, DENIED, WRITE_ONLY, RESTRICTED])
+def test_calendars_never_asks_for_access(status):
+    adapter = FakeAdapter(status=status, overview=OVERVIEW)
+    code, out = calendars_cli(adapter)
+    assert code == 1 and adapter.calls == ["status"]  # no request_access, no reads
+    assert ("--calendar-setup" in out) if status == NOT_DETERMINED else (SETTINGS_PATH in out)
+
+
+def test_calendars_off_mac_without_pyobjc_or_when_reading_fails():
+    code, out = calendars_cli(FakeAdapter(), platform="linux")
+    assert code == 1 and "macOS에서만" in out
+
+    def missing(tz):
+        raise EventKitUnavailable("no pyobjc")
+
+    out_io = io.StringIO()
+    assert calendar_setup.run_calendar_list(ENV, adapter_factory=missing, platform="darwin", now=CLOCK, out=out_io) == 1
+    assert "pip install -e ." in out_io.getvalue()
+
+    class Broken(FakeAdapter):
+        def calendar_overview(self, start, end):
+            raise RuntimeError("EKErrorDomain error 1")
+
+    code, out = calendars_cli(Broken())
+    assert code == 1 and "[오류] 캘린더를 읽지 못했습니다: " in out and "EKErrorDomain" in out
+
+
+def test_calendars_on_the_real_adapter():
+    world, research, china = china_world()
+    adapter = EventKitCalendar(SEOUL, eventkit=fake_eventkit(world), foundation=FOUNDATION, local_tz=SEOUL)
+    code, out = calendars_cli(adapter, {"CALENDAR_EXCLUDE": CHINA})
+    assert code == 0
+    assert "  iCloud\n    - 연구 · CalDAV · 쓰기 가능 · 일정 1개\n" in out
+    assert "  기타\n    - 중국 공휴일 · 구독 · 읽기 전용 · 일정 1개 · 제외됨(CALENDAR_EXCLUDE)\n" in out
+
+
+def test_cli_calendars_dispatch_help_and_conflicts(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(calendar_setup, "run_calendar_list", lambda: calls.append("calendars") or 0)
+    assert main(["--calendars"]) == 0 and calls == ["calendars"]
+    help_text = build_parser().format_help()
+    assert "--calendars" in help_text and "python -m mungchi --calendars" in help_text and "CALENDAR_EXCLUDE" in help_text
+    for argv in (
+        ["--calendars", "질문"],
+        ["--calendars", "--brief"],
+        ["--calendars", "--agent", "schedule"],
+        ["--calendars", "--calendar-setup"],
+        ["--calendars", "--credits"],
+        ["--calendars", "--dropbox-check"],
+        ["slack", "--calendars"],
+    ):
+        with pytest.raises(SystemExit) as exc:
+            main(argv)
+        assert exc.value.code == 2
+    assert "--calendars는 질문이나 다른 옵션" in capsys.readouterr().err
+    assert calls == ["calendars"]
 
 
 # ---------------------------------------------------------------- no EventKit at import time

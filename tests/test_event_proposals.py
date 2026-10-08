@@ -742,6 +742,7 @@ class World:
         self.built: list = []
         self.saves: list = []
         self.predicates: list = []
+        self.stores: list = []
 
 
 class ExistingEvent:
@@ -815,6 +816,7 @@ def fake_eventkit(world: World) -> SimpleNamespace:
             return cls()
 
         def init(self):
+            world.stores.append(self)
             return self
 
         @classmethod
@@ -828,6 +830,7 @@ def fake_eventkit(world: World) -> SimpleNamespace:
             return world.default
 
         def saveEvent_span_commit_error_(self, event, span, commit, error):
+            assert event.store is self  # EventKit only saves an event through the store that made it
             world.saves.append((event, span, commit, error))
             return world.save_result
 
@@ -836,8 +839,12 @@ def fake_eventkit(world: World) -> SimpleNamespace:
 
         def eventsMatchingPredicate_(self, predicate):
             world.predicates.append(predicate)
-            start, end, _calendars = predicate
-            return [e for e in world.events if e.startDate().ts < end.ts and e.endDate().ts > start.ts]
+            start, end, calendars = predicate
+            return [
+                e for e in world.events
+                if (calendars is None or e.calendar() in calendars)
+                and e.startDate().ts < end.ts and e.endDate().ts > start.ts
+            ]
 
     return SimpleNamespace(
         EKEventStore=EKEventStore,
@@ -970,6 +977,53 @@ def test_find_similar_events_reads_two_hours_around_on_that_day_only():
     start, end, calendars = world.predicates[-1]
     assert (start.ts, end.ts, calendars) == (at(10, 22, 10).timestamp(), at(10, 22, 15).timestamp(), None)
     assert [(r["title"], r["calendar"]) for r in found] == [("신임교수모임", "연구"), ("세미나", "Work")]
+
+
+# ---------------------------------------------------------------- fresh store and CALENDAR_EXCLUDE on the write path
+
+
+def test_write_path_reads_on_a_new_store_every_time():
+    world, research, work = calendars_world()
+    app = adapter(world)
+    assert [c["name"] for c in app.list_writable_calendars()] == ["연구", "Work"]
+    world.calendars.remove(work)  # removed in the Calendar app while the bot runs
+    stores = len(world.stores)
+    assert [c["name"] for c in app.list_writable_calendars()] == ["연구"]
+    app.find_similar_events(at(10, 22, 12), at(10, 22, 13), "x")
+    assert app.create_event("x", at(10, 22, 9), at(10, 22, 10), False)["ok"] is True
+    assert len(world.stores) == stores + 3
+    # The event is built and saved on the store its calendar came from (asserted by the fake's saveEvent).
+    assert world.built[-1].store is world.stores[-1]
+
+
+def test_excluded_calendars_are_never_write_targets_or_duplicates():
+    world, research, work = calendars_world()
+    world.events = [
+        ExistingEvent("신임교수모임", at(10, 22, 12), at(10, 22, 13), work),
+        ExistingEvent("신임교수모임 리허설", at(10, 22, 11), at(10, 22, 12), research),
+    ]
+    env = {"CALENDAR_EXCLUDE": "work"}
+    app = adapter(world, env=env)
+    assert app.list_writable_calendars() == [{"name": "연구", "source": "iCloud", "is_default": True}]
+    found = app.find_similar_events(at(10, 22, 12), at(10, 22, 13), "신임교수모임 (10월)")
+    assert [(r["title"], r["calendar"]) for r in found] == [("신임교수모임 리허설", "연구")]
+    assert [c.title() for c in world.predicates[-1][2]] == ["연구", "대한민국 공휴일"]  # every calendar but Work
+    for kwargs, target_env in (({"calendar_name": "Work"}, env), ({}, {**env, "CALENDAR_WRITE_TARGET": "WORK"})):
+        result = adapter(world, env=target_env).create_event("x", at(10, 22, 9), at(10, 22, 10), False, **kwargs)
+        assert result["ok"] is False and result["error"].endswith("일정을 추가할 수 있는 캘린더: 연구")
+    assert world.saves == []
+
+
+def test_an_excluded_default_calendar_is_never_written_to():
+    world, research, work = calendars_world()
+    world.default = work
+    result = adapter(world, env={"CALENDAR_EXCLUDE": "Work"}).create_event("x", at(10, 22, 9), at(10, 22, 10), False)
+    assert result["ok"] is False and "기본 캘린더 'Work'은(는) CALENDAR_EXCLUDE에 있어" in result["error"]
+    assert "CALENDAR_WRITE_TARGET" in result["error"] and world.saves == []
+    # Write-only access lists no calendars; the excluded default is still refused.
+    world.status = 4
+    assert adapter(world, env={"CALENDAR_EXCLUDE": "Work"}).create_event("x", at(10, 22, 9), at(10, 22, 10), False)["ok"] is False
+    assert adapter(world).create_event("x", at(10, 22, 9), at(10, 22, 10), False)["ok"] is True
 
 
 # ---------------------------------------------------------------- --calendar-setup

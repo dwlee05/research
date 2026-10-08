@@ -11,8 +11,25 @@ small adapter (``authorization_status``, ``request_access``,
 only after the user said "네" (see ``event_proposals``); no agent tool can.
 
 All EventKit calls block, so callers run them in a worker thread
-(the ``get_schedule`` tool uses ``asyncio.to_thread``). Each adapter owns its
-own ``EKEventStore`` and is used from one thread only.
+(the ``get_schedule`` tool uses ``asyncio.to_thread``). Each adapter is used
+from one thread only.
+
+Fresh data: an ``EKEventStore`` caches calendars and events and only learns
+about changes through ``EKEventStoreChangedNotification``, which needs a
+running CFRunLoop. The bot's asyncio process (and its worker threads) never
+runs one, so a long-lived store would keep showing a calendar the user has
+since removed. The adapter therefore starts every read and write on a new
+store (``_refresh``): it costs one connection to the calendar daemon, which is
+small next to the query itself, and needs no extra permission (access belongs
+to the app, not to a store). ``refreshSourcesIfNecessary`` is then asked on the
+new store so accounts edited on another device sync soon (it returns at once).
+
+``CALENDAR_EXCLUDE``: calendars the bots never read or write. EventKit also
+returns calendars that are only unchecked in the Calendar app's sidebar, so
+reads (``fetch_events``, ``find_similar_events``) and write targets
+(``list_writable_calendars``, ``create_event``) skip them here.
+``list_calendars`` and ``calendar_overview`` still list every calendar: the
+calendar tool drops excluded ones itself, and ``--calendars`` marks them.
 """
 
 from __future__ import annotations
@@ -81,7 +98,12 @@ class EventKitUnavailable(RuntimeError):
 
 
 class CalendarAdapter(Protocol):
-    """What the calendar tool, ``--calendar-setup`` and the note -> event flow need from the Calendar app."""
+    """What the calendar tool, ``--calendar-setup``, ``--calendars`` and the note -> event flow need from the Calendar app.
+
+    ``fetch_events``, ``list_writable_calendars``, ``create_event`` and
+    ``find_similar_events`` leave out the ``CALENDAR_EXCLUDE`` calendars;
+    ``list_calendars`` and ``calendar_overview`` list every calendar.
+    """
 
     def authorization_status(self) -> str: ...
 
@@ -92,6 +114,8 @@ class CalendarAdapter(Protocol):
     def fetch_events(
         self, start: datetime, end: datetime, names: Sequence[str] | None = None
     ) -> list[dict[str, Any]]: ...
+
+    def calendar_overview(self, start: datetime, end: datetime) -> list[dict[str, Any]]: ...
 
     def list_writable_calendars(self) -> list[dict[str, Any]]: ...
 
@@ -142,6 +166,38 @@ def select_calendars(wanted: Sequence[str], available: Iterable[str]) -> tuple[l
             continue
         selected.extend(m for m in matches if m not in selected)
     return selected, not_found
+
+
+def exclusion_keys(names: Iterable[Any]) -> frozenset[str]:
+    """``CALENDAR_EXCLUDE`` names as ``normalize_name`` keys (blank names dropped)."""
+    return frozenset(key for key in (normalize_name(name) for name in names) if key)
+
+
+def is_excluded(name: Any, keys: Iterable[str]) -> bool:
+    """True when the calendar ``name`` is one of the ``exclusion_keys``."""
+    return normalize_name(name) in keys
+
+
+# EKCalendarType, as documented (Local, CalDAV, Exchange, Subscription, Birthday).
+CALENDAR_TYPE_LABELS = {
+    "EKCalendarTypeLocal": (0, "로컬"),
+    "EKCalendarTypeCalDAV": (1, "CalDAV"),
+    "EKCalendarTypeExchange": (2, "Exchange"),
+    "EKCalendarTypeSubscription": (3, "구독"),
+    "EKCalendarTypeBirthday": (4, "생일"),
+}
+
+
+def calendar_type_label(code: Any, eventkit: Any = None) -> str:
+    """Korean label of an ``EKCalendarType`` value ("" when unknown)."""
+    try:
+        value = int(code)
+    except (TypeError, ValueError):
+        return ""
+    for name, (default, label) in CALENDAR_TYPE_LABELS.items():
+        if int(getattr(eventkit, name, default)) == value:
+            return label
+    return ""
 
 
 def status_name(code: Any, eventkit: Any = None) -> str:
@@ -377,6 +433,18 @@ class EventKitCalendar:
     def _new_store(self) -> Any:
         return self._ek.EKEventStore.alloc().init()
 
+    def _refresh(self) -> None:
+        """A new store for the next read or write, so a removed calendar never lingers (see the module docstring)."""
+        self._store = self._new_store()
+        if _responds_to(self._store, "refreshSourcesIfNecessary"):
+            try:
+                self._store.refreshSourcesIfNecessary()  # asynchronous: only asks the daemon to sync
+            except Exception:  # noqa: BLE001 - the new store is fresh enough without it
+                pass
+
+    def _exclusions(self) -> frozenset[str]:
+        return exclusion_keys(config.get_calendar_exclude(self._env))
+
     def authorization_status(self) -> str:
         code = self._ek.EKEventStore.authorizationStatusForEntityType_(self._ek.EKEntityTypeEvent)
         return status_name(code, self._ek)
@@ -401,28 +469,24 @@ class EventKitCalendar:
             self._store = self._new_store()
         return outcome["granted"]
 
-    def _calendars(self) -> list[Any]:
-        return list(self._store.calendarsForEntityType_(self._ek.EKEntityTypeEvent) or [])
+    def _calendars(self, *, include_excluded: bool = False) -> list[Any]:
+        """The store's event calendars, without the ``CALENDAR_EXCLUDE`` ones unless ``include_excluded``."""
+        calendars = list(self._store.calendarsForEntityType_(self._ek.EKEntityTypeEvent) or [])
+        excluded = frozenset() if include_excluded else self._exclusions()
+        if not excluded:
+            return calendars
+        return [c for c in calendars if not is_excluded(_text(c.title()), excluded)]
 
     def list_calendars(self) -> list[dict[str, str]]:
+        """Every calendar (``CALENDAR_EXCLUDE`` ones too): ``[{name, source}]``."""
+        self._refresh()
         calendars = []
-        for calendar in self._calendars():
-            source = calendar.source()
-            calendars.append(
-                {"name": _text(calendar.title()), "source": _text(source.title()) if source is not None else ""}
-            )
+        for calendar in self._calendars(include_excluded=True):
+            calendars.append({"name": _text(calendar.title()), "source": _source_title(calendar)})
         return calendars
 
-    def fetch_events(
-        self, start: datetime, end: datetime, names: Sequence[str] | None = None
-    ) -> list[dict[str, Any]]:
-        """Events overlapping ``[start, end)``; recurring events come expanded."""
-        calendars = None  # nil: every calendar
-        if names is not None:
-            wanted = {normalize_name(name) for name in names}
-            calendars = [c for c in self._calendars() if normalize_name(_text(c.title())) in wanted]
-            if not calendars:
-                return []  # passing nil would read every calendar instead
+    def _events(self, start: datetime, end: datetime, calendars: list[Any] | None) -> list[Any]:
+        """Non-canceled EKEvents overlapping ``[start, end)`` in ``calendars`` (``None``: every calendar)."""
         nsdate = self._ns.NSDate
         predicate = self._store.predicateForEventsWithStartDate_endDate_calendars_(
             nsdate.dateWithTimeIntervalSince1970_(start.timestamp()),
@@ -430,11 +494,28 @@ class EventKitCalendar:
             calendars,
         )
         canceled = int(getattr(self._ek, "EKEventStatusCanceled", 3))
+        return [
+            event
+            for event in self._store.eventsMatchingPredicate_(predicate) or []
+            if event.startDate() is not None and event.status() != canceled
+        ]
+
+    def fetch_events(
+        self, start: datetime, end: datetime, names: Sequence[str] | None = None
+    ) -> list[dict[str, Any]]:
+        """Events overlapping ``[start, end)``; recurring events come expanded. Never from ``CALENDAR_EXCLUDE`` calendars."""
+        self._refresh()
+        calendars = None  # nil: every calendar
+        if names is not None or self._exclusions():
+            calendars = self._calendars()
+            if names is not None:
+                wanted = {normalize_name(name) for name in names}
+                calendars = [c for c in calendars if normalize_name(_text(c.title())) in wanted]
+            if not calendars:
+                return []  # passing nil would read every calendar instead
         records = []
-        for event in self._store.eventsMatchingPredicate_(predicate) or []:
+        for event in self._events(start, end, calendars):
             start_date, end_date = event.startDate(), event.endDate()
-            if start_date is None or event.status() == canceled:
-                continue
             calendar = event.calendar()
             records.append(
                 event_record(
@@ -450,6 +531,37 @@ class EventKitCalendar:
             )
         return records
 
+    def calendar_overview(self, start: datetime, end: datetime) -> list[dict[str, Any]]:
+        """Every calendar (``CALENDAR_EXCLUDE`` ones too) for ``--calendars``.
+
+        ``[{name, source, type, writable, events}]`` in the Calendar app's
+        order; ``events`` counts the non-canceled events overlapping
+        ``[start, end)`` (one read over every calendar).
+        """
+        self._refresh()
+        calendars = self._calendars(include_excluded=True)
+        counts: dict[str, int] = {}
+        for event in self._events(start, end, None):
+            key = _calendar_key(event.calendar())
+            if key:
+                counts[key] = counts.get(key, 0) + 1
+        overview = []
+        for calendar in calendars:
+            try:
+                kind = calendar_type_label(calendar.type(), self._ek)
+            except Exception:  # noqa: BLE001 - the type is only shown, never needed
+                kind = ""
+            overview.append(
+                {
+                    "name": _text(calendar.title()),
+                    "source": _source_title(calendar),
+                    "type": kind,
+                    "writable": _allows_modifications(calendar),
+                    "events": counts.get(_calendar_key(calendar), 0),
+                }
+            )
+        return overview
+
     # -- adding events (only ever called by code, after the user confirmed)
 
     def _default_calendar(self) -> Any:
@@ -459,14 +571,13 @@ class EventKitCalendar:
             return None
 
     def _writable(self) -> list[tuple[Any, dict[str, Any]]]:
-        """``(EKCalendar, {name, source, is_default})`` for calendars that accept new events."""
+        """``(EKCalendar, {name, source, is_default})`` for calendars that accept new events (never ``CALENDAR_EXCLUDE`` ones)."""
         default = self._default_calendar()
         default_id = _calendar_id(default)
         writable = []
         for calendar in self._calendars():
             if not _allows_modifications(calendar):
                 continue
-            source = calendar.source()
             if default is None:
                 is_default = False
             elif default_id:
@@ -475,7 +586,7 @@ class EventKitCalendar:
                 is_default = calendar == default
             info = {
                 "name": _text(calendar.title()),
-                "source": _text(source.title()) if source is not None else "",
+                "source": _source_title(calendar),
                 "is_default": bool(is_default),
             }
             writable.append((calendar, info))
@@ -483,6 +594,7 @@ class EventKitCalendar:
 
     def list_writable_calendars(self) -> list[dict[str, Any]]:
         """Calendars new events can go to: ``[{name, source, is_default}]``."""
+        self._refresh()
         return [info for _calendar, info in self._writable()]
 
     def _nsdate(self, timestamp: float) -> Any:
@@ -516,13 +628,15 @@ class EventKitCalendar:
         """Add one event: ``{"ok", "id", "calendar", "error"}``. Never raises.
 
         The calendar is ``calendar_name``, else ``CALENDAR_WRITE_TARGET``, else
-        the default calendar for new events. ``end`` is exclusive (an all-day
-        event on one day ends at the next midnight, like ``event_record``).
+        the default calendar for new events; never a ``CALENDAR_EXCLUDE`` one.
+        ``end`` is exclusive (an all-day event on one day ends at the next
+        midnight, like ``event_record``).
         """
         try:
             status = self.authorization_status()
             if status not in WRITE_STATUSES:
                 return _create_failure(write_permission_hint(status))
+            self._refresh()  # the calendars and the new event share this one store
             writable = self._writable()
             name, error = resolve_write_calendar(
                 [info for _calendar, info in writable], calendar_name, config.get_calendar_write_target(self._env)
@@ -531,6 +645,12 @@ class EventKitCalendar:
                 return _create_failure(error)
             if name is None:
                 calendar = self._default_calendar()
+                # ``writable`` already leaves excluded calendars out; the store's default may still be one.
+                if calendar is not None and is_excluded(_text(calendar.title()), self._exclusions()):
+                    return _create_failure(
+                        f"기본 캘린더 '{_text(calendar.title())}'은(는) CALENDAR_EXCLUDE에 있어 일정을 넣지 않았어요. "
+                        ".env의 CALENDAR_WRITE_TARGET에 넣을 캘린더 이름을 적어 주세요."
+                    )
             else:
                 calendar = next(c for c, info in writable if info["name"] == name)
             if calendar is None:
@@ -560,7 +680,7 @@ class EventKitCalendar:
             return _create_failure(f"캘린더에 저장하지 못했어요 ({detail})")
 
     def find_similar_events(self, start: datetime, end: datetime, title: str) -> list[dict[str, Any]]:
-        """Existing events (every calendar) within two hours of ``[start, end)`` on that day that look the same."""
+        """Existing events (every calendar but ``CALENDAR_EXCLUDE``) within two hours of ``[start, end)`` on that day that look the same."""
         window_start, window_end = duplicate_window(start, end)
         return similar_events(self.fetch_events(window_start, window_end), start, end, title)
 
@@ -571,6 +691,25 @@ def _calendar_id(calendar: Any) -> str:
     try:
         return _text(calendar.calendarIdentifier())
     except Exception:  # noqa: BLE001 - compare the objects instead
+        return ""
+
+
+def _source_title(calendar: Any) -> str:
+    """The calendar's account as the Calendar app's sidebar shows it (iCloud, 구독, 기타 …)."""
+    source = calendar.source()
+    return _text(source.title()) if source is not None else ""
+
+
+def _calendar_key(calendar: Any) -> str:
+    """Identifies a calendar across EventKit objects: its identifier, else its title and account."""
+    if calendar is None:
+        return ""
+    ident = _calendar_id(calendar)
+    if ident:
+        return ident
+    try:
+        return f"{_text(calendar.title())}\0{_source_title(calendar)}"
+    except Exception:  # noqa: BLE001 - an event without a usable calendar is not counted
         return ""
 
 

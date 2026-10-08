@@ -297,6 +297,52 @@ python -m mungchi --credits
   `--calendar-setup`을 실행하라고 알려 줍니다. 백그라운드 서비스는 시작할 때 아직 정하지 않은 상태면 **한 번** 묻고
   (최대 5분 기다림), 답이 없어도 봇은 그대로 켭니다.
 - 캘린더 앱에 동기화된 내용을 읽으므로, 다른 기기에서 바꾼 일정은 Mac에 동기화된 뒤에 보입니다.
+- 봇은 일정을 읽거나 넣을 때마다 캘린더 목록을 새로 읽습니다. 캘린더 앱에서 캘린더를 **지우거나 구독을 해지하면**
+  봇을 다시 시작하지 않아도 다음 질문부터 빠집니다.
+
+##### 캘린더 목록 확인(`--calendars`)과 캘린더 빼기(`CALENDAR_EXCLUDE`)
+
+캘린더 앱 사이드바에서 **체크만 끈(숨긴)** 캘린더도 macOS(EventKit)는 그대로 돌려줍니다. 그래서 숨긴 캘린더의 일정
+(예: 중국 공휴일 캘린더의 절기)을 '일정'이 계속 말할 수 있습니다. 먼저 봇이 보는 캘린더를 확인하세요(읽기 전용, 권한을 묻지 않고
+Claude API도 쓰지 않습니다).
+
+```bash
+python -m mungchi --calendars
+```
+
+```
+Mac 캘린더 앱의 캘린더 목록 (EventKit이 보는 그대로, Claude API는 쓰지 않습니다)
+캘린더 접근 권한: 허용됨(전체 접근)
+
+캘린더 6개, 계정별 (일정 수는 오늘부터 7일: 10/08(목)–10/14(수)):
+  iCloud
+    - 연구 · CalDAV · 쓰기 가능 · 일정 6개
+    - 가족 · CalDAV · 쓰기 가능 · 일정 2개
+  Exchange
+    - Work · Exchange · 쓰기 가능 · 일정 3개
+  기타
+    - 중국 공휴일 · 구독 · 읽기 전용 · 일정 2개 · 제외됨(CALENDAR_EXCLUDE)
+    - 대한민국 공휴일 · 구독 · 읽기 전용 · 일정 1개
+    - 생일 · 생일 · 읽기 전용 · 일정 0개
+
+'일정'이 읽는 캘린더 5개, 읽지 않는 캘린더 1개
+MACOS_CALENDARS: 비어 있음 (모든 캘린더를 읽습니다)
+CALENDAR_EXCLUDE: 중국 공휴일 (읽지도, 일정을 넣지도 않습니다)
+캘린더를 빼려면: .env에 CALENDAR_EXCLUDE=중국 공휴일 추가 후 python -m mungchi service restart (여러 개는 쉼표로 구분)
+```
+
+캘린더마다 계정(사이드바의 묶음), 종류(CalDAV·Exchange·구독·생일·로컬), 일정을 넣을 수 있는지, 빠졌는지와 그 이유,
+오늘부터 7일 동안의 일정 수가 나옵니다. 빼고 싶은 캘린더는 `.env`의 `CALENDAR_EXCLUDE`에 이름을 적고 봇을 다시 시작합니다.
+
+```
+CALENDAR_EXCLUDE=중국 공휴일,생일
+```
+
+- 이름은 캘린더 앱에 보이는 그대로 적고, 여러 개는 쉼표로 구분합니다. 앞뒤 공백과 대소문자는 무시합니다.
+- 뺀 캘린더는 '일정'의 일정 읽기(아침 브리핑 포함)와 [메모로 일정 추가하기](#메모로-일정-추가하기)의 비슷한 일정 찾기에서 빠지고,
+  일정을 넣을 캘린더로도 쓰지 않습니다.
+- `MACOS_CALENDARS`(읽을 캘린더만 고르기)와 같은 이름이 함께 있으면 `CALENDAR_EXCLUDE`가 먼저입니다.
+- 바꾼 뒤에는 `python -m mungchi service restart`(터미널 탭에서 돌린다면 봇을 다시 시작).
 
 #### 방법 B. ICS 주소로 읽기
 
@@ -374,6 +420,9 @@ python -m mungchi --weather
 
 # Mac 캘린더 앱 연결 (처음 한 번, macOS 터미널에서. 위 "캘린더"의 방법 A 참고)
 python -m mungchi --calendar-setup
+
+# 봇이 보는 캘린더 목록: 계정·종류·쓰기 가능·CALENDAR_EXCLUDE 여부·7일 일정 수 (위 "캘린더 목록 확인" 참고)
+python -m mungchi --calendars
 
 # 업뎃이 Dropbox 변경을 못 찾을 때 원인 확인 (Claude API 안 씀, 아래 "업뎃이 변경을 못 찾을 때" 참고)
 python -m mungchi --dropbox-check --hours 72
@@ -1095,6 +1144,13 @@ python -m mungchi --dropbox-check               # 기간 없이 물을 때와 �
 - 카테고리 버튼을 눌렀는데 Slack이 오류를 보이면 앱의 Interactivity가 꺼져 있는 것입니다([이미 만든 앱 고치기](#이미-만든-앱-고치기-버튼사진)). 그동안은 번호나 이름으로 답하세요.
 - 추가한 일정이 다른 기기에 안 보이면 캘린더 앱의 동기화를 기다리세요. 일정은 Mac 캘린더 앱에 먼저 들어갑니다.
 
+### 지우거나 숨긴 캘린더의 일정을 '일정'이 계속 말할 때
+
+1. `python -m mungchi --calendars`로 그 캘린더가 아직 목록에 있는지 봅니다.
+2. 목록에 있으면 캘린더 앱에서 체크만 끈(숨긴) 캘린더입니다. `.env`의 `CALENDAR_EXCLUDE`에 이름을 적고
+   `python -m mungchi service restart`([캘린더 빼기](#캘린더-목록-확인--calendars과-캘린더-빼기calendar_exclude) 참고).
+3. 목록에 없는데도 말한다면 캘린더에 없는 내용입니다. 새 스레드에서 다시 물어보세요(같은 스레드는 앞의 대화를 이어 갑니다).
+
 ### `zsh: command not found: python`
 
 가상환경이 꺼져 있습니다(Mac에는 `python3`만 있고, `python`은 가상환경 안에만 있습니다).
@@ -1242,7 +1298,7 @@ src/mungchi/
 ├── weather.py         # --weather, 브리핑의 날씨 줄, Slack의 날씨 바로 답(질문 판별 포함), get_weather의 JSON: Open-Meteo 날씨·미세먼지 (키·LLM 호출 없음)
 ├── quick_info.py      # Slack 바로 답의 질문 판별: '날씨랑 토큰 좀 말해봐' 같은 날씨·크레딧 질문, 공통 정규화 (LLM 호출 없음)
 ├── version.py         # 실행 중인 코드 버전(git 커밋, -dirty): 봇 시작 로그·상태 파일, service status의 비교
-├── calendar_setup.py  # --calendar-setup: Mac 캘린더 앱 접근 허용, 캘린더·오늘 일정 확인
+├── calendar_setup.py  # --calendar-setup: Mac 캘린더 앱 접근 허용, 캘린더·오늘 일정 확인 / --calendars: 캘린더 목록 진단(읽기 전용)
 ├── dropbox_check.py   # --dropbox-check: 업뎃이 Dropbox 변경을 못 찾을 때 원인 확인 (읽기 전용)
 ├── service.py         # service: macOS 백그라운드 서비스 (AppleScript 앱 + LaunchAgent), 상태(실행 중인 코드 버전 포함)·로그 보기
 ├── images.py          # 사진 → 일정: Slack 메시지의 사진 고르기(5장, 20MB), 메모리에서 회전·RGB·1568px·JPEG로 줄이기, --image 파일 읽기

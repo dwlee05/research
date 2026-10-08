@@ -86,6 +86,30 @@ def test_voice_prompts_are_constant_and_have_no_placeholders_left():
     assert agents.voice_section("update") == agents.voice_section("update")
 
 
+def test_schedule_never_adds_holidays_or_solar_terms_of_its_own():
+    """일정 reported 절기 after the user removed the calendar that had them: only tool results count."""
+    from mungchi.briefing import GREETING_SYSTEM_PROMPT
+
+    assert "절기" in agents.NO_CALENDAR_TRIVIA and "공휴일" in agents.NO_CALENDAR_TRIVIA
+    assert "그런 일정이 결과에 있으면 다른 일정처럼 그대로 전한다" in agents.NO_CALENDAR_TRIVIA  # real holiday events stay
+    direct = build_options(env={}, persona="schedule").system_prompt
+    subagent = build_options(env={}).agents["schedule"].prompt
+    for prompt in (direct, subagent):
+        assert "2. 도구 결과에 있는 일정만 알린다. 일정이나 시간을 지어내지 않는다. " + agents.NO_CALENDAR_TRIVIA in prompt
+    assert "절기나 공휴일 같은 달력 이야기로 분위기를 내지 않는다" in VOICES["schedule"]
+    assert "'일정' 에이전트의 보고에 없는 공휴일·절기·기념일은 덧붙이지 않는다" in MUNGCHI_SYSTEM_PROMPT
+    assert "절기, 공휴일, 기념일 같은 달력 이야기는 하지 않는다" in GREETING_SYSTEM_PROMPT
+    # Still constant: byte-identical on every build and free of any date.
+    for build in (
+        lambda: build_options(env={}, persona="schedule").system_prompt,
+        lambda: build_options(env={}).agents["schedule"].prompt,
+        lambda: build_options(env={}).system_prompt,
+    ):
+        first, again = build(), build()
+        assert first.encode("utf-8") == again.encode("utf-8")
+        assert not re.search(r"20\d\d-\d\d-\d\d|\d{1,2}월 \d{1,2}일", first)
+
+
 def test_call_names_take_i_after_a_final_consonant():
     assert [call_name(p) for p in PERSONAS] == ["고뭉치", "업뎃이", "일정이"]
 

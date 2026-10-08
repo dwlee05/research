@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, tzinfo
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 import httpx
 import icalendar
@@ -282,8 +282,10 @@ def macos_events(
     tz: tzinfo,
     start: datetime,
     end: datetime,
+    excluded: Sequence[str] = (),
 ) -> tuple[list[Event], list[str]]:
-    """Events from the Calendar app in ``[start, end)``, limited to ``wanted`` calendars (empty = all).
+    """Events from the Calendar app in ``[start, end)``, limited to ``wanted`` calendars (empty = all)
+    and never from ``excluded`` ones (``CALENDAR_EXCLUDE``, which wins over ``wanted``).
 
     Returns ``(events, warnings)``. Wanted names that match no calendar are
     reported, never fatal; if none match, nothing is read (rather than all).
@@ -291,6 +293,10 @@ def macos_events(
     available = [calendar["name"] for calendar in adapter.list_calendars()]
     selected, not_found = macos_calendar.select_calendars(wanted, available)
     warnings = missing_calendar_warnings(not_found)
+    skip = macos_calendar.exclusion_keys(excluded)
+    if skip:
+        pool = available if selected is None else selected
+        selected = list(dict.fromkeys(name for name in pool if not macos_calendar.is_excluded(name, skip)))
     if selected == []:
         return [], warnings
     keys = None if selected is None else {macos_calendar.normalize_name(name) for name in selected}
@@ -322,7 +328,7 @@ def _read_macos(
         return [], {}, macos_unconfigured(f"permission_{status}", macos_calendar.permission_hint(status))
     start = datetime.combine(expand_start, time.min, tzinfo=tz)
     end = datetime.combine(expand_end, time.min, tzinfo=tz)
-    events, warnings = macos_events(adapter, cfg.macos_calendars, tz, start, end)
+    events, warnings = macos_events(adapter, cfg.macos_calendars, tz, start, end, cfg.excluded_calendars)
     return events, ({"warnings": warnings} if warnings else {}), None
 
 

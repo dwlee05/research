@@ -295,6 +295,8 @@ class CalendarConfig:
     source: str = ""
     # MACOS_CALENDARS: calendar names to read from the Calendar app (empty = all).
     macos_calendars: list[str] = field(default_factory=list)
+    # CALENDAR_EXCLUDE: Calendar app calendars never read or written (wins over MACOS_CALENDARS).
+    excluded_calendars: list[str] = field(default_factory=list)
     missing: list[str] = field(default_factory=list)
     # Korean explanation when not configured.
     hint: str = ""
@@ -333,6 +335,7 @@ def load_calendar_config(env: Mapping[str, str] | None = None, platform: str | N
         timezone_name=get_timezone_name(env),
         requested_source=requested,
         macos_calendars=split_csv(_get(env, "MACOS_CALENDARS")),
+        excluded_calendars=get_calendar_exclude(env),
     )
     on_mac = platform == "darwin"
     if requested not in CALENDAR_SOURCES:
@@ -354,6 +357,18 @@ def load_calendar_config(env: Mapping[str, str] | None = None, platform: str | N
             not_mac_hint(cfg.missing) if requested == CALENDAR_SOURCE_MACOS else calendar_hint(cfg.missing, mac_note=True)
         )
     return cfg
+
+
+def get_calendar_exclude(env: Mapping[str, str] | None = None) -> list[str]:
+    """``CALENDAR_EXCLUDE``: Calendar app calendars the bots never read or write (empty: none).
+
+    Comma-separated names as the Calendar app shows them, spaces inside a name
+    collapsed. They are matched like ``MACOS_CALENDARS`` (trimmed, NFC,
+    case-insensitive; see ``macos_calendar.normalize_name``). EventKit also
+    returns calendars only unchecked in the Calendar app's sidebar, so this is
+    how such a calendar is kept out.
+    """
+    return [" ".join(name.split()) for name in split_csv(_get(env, "CALENDAR_EXCLUDE"))]
 
 
 _ICS_HOW = (
