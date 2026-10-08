@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -868,3 +868,89 @@ def test_brief_slack_with_only_mungchi_dms_the_allowed_users(monkeypatch, capsys
     assert sorted(p["channel"] for p in log) == sorted([OWNER, OTHER])
     assert "업뎃·일정 봇은 아직 설정되지 않아서" in log[0]["text"]
     assert "Slack에 오늘 브리핑을 올렸습니다 (DM (허용된 사용자 2명))." in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------- the briefing channel: a top-level "@업뎃 …" continues the briefing
+
+
+class ChatSlack(FakeSlack):
+    """A bot's client in a conversation: the placeholder is edited into the answer."""
+
+    async def chat_update(self, **kwargs):
+        self.log.append({"bot": self.persona, "edit": True, **kwargs})
+        return {"ok": True}
+
+
+OLD_SESSION = "44444444-4444-4444-4444-444444444444"
+MUNGCHI_SESSION = "55555555-5555-5555-5555-555555555555"
+
+
+def test_the_relay_starts_update_and_schedule_channel_conversations(tmp_path):
+    log: list[dict] = []
+    posted = at(8, 7, 3)
+    sessions = ThreadSessions(tmp_path / "threads.json")
+    sessions.set_channel_session(CHANNEL, OLD_SESSION, at(8, 6, 50), persona="mungchi")  # 고뭉치 was chatting just before
+    code, _ = relay(make_bots(log), CHANNEL, tmp_path=tmp_path, sessions=sessions, clock=lambda: posted)
+    assert code == 0
+    assert sessions.channel_session(CHANNEL, persona="update") == (UPDATE_SESSION, posted)
+    assert sessions.channel_session(CHANNEL, persona="schedule") == (SCHEDULE_SESSION, posted)
+    assert sessions.channel_session(CHANNEL, persona="mungchi") is None  # 고뭉치 starts fresh
+    update_ts = log[1]["_ts"]
+    assert sessions.get(CHANNEL, update_ts, persona="update") == UPDATE_SESSION  # the report's thread still works
+
+    # 20 minutes later, at the top level of the channel (SLACK_BRIEF_CHANNEL).
+    later = lambda: posted + timedelta(minutes=20)  # noqa: E731
+    asked = {"update": "그 파일 누가 고쳤어?", "schedule": "오후에 비는 시간 있어?", "mungchi": "고마워!"}
+    for persona, expected in (("update", UPDATE_SESSION), ("schedule", SCHEDULE_SESSION), ("mungchi", None)):
+        chat: list[dict] = []
+        run = PersonaRun(mungchi=TurnResult(text="천만에요!", session_id=MUNGCHI_SESSION))
+        handler = SlackHandler(
+            ChatSlack(persona, chat),
+            persona=persona,
+            allowed_user_ids={OWNER},
+            sessions=ThreadSessions(tmp_path / "threads.json"),
+            run=run,
+            bot_user_id=IDS[persona],
+            brief_room=CHANNEL,
+            clock=later,
+        )
+        event = {"type": "app_mention", "user": OWNER, "text": f"<@{IDS[persona]}> {asked[persona]}", "ts": "1700000200.000001", "channel": CHANNEL}
+        asyncio.run(handler.handle_event(event, event_id=f"Ev-{persona}", source="mention"))
+        assert [(c["prompt"], c["resume"]) for c in run.calls] == [(asked[persona], expected)]
+        posts = [p for p in chat if not p.get("edit")]
+        assert posts and all(p["channel"] == CHANNEL and "thread_ts" not in p for p in posts)
+
+    # A mention in 업뎃's report thread still continues the briefing there, in that thread.
+    chat: list[dict] = []
+    run = PersonaRun()
+    handler = SlackHandler(
+        ChatSlack("update", chat), persona="update", allowed_user_ids={OWNER}, sessions=ThreadSessions(tmp_path / "threads.json"),
+        run=run, bot_user_id=IDS["update"], brief_room=CHANNEL, clock=later,
+    )
+    event = {"type": "app_mention", "user": OWNER, "text": "<@UUPDATE> 그 파일 언제?", "ts": "1700000200.000002", "thread_ts": update_ts, "channel": CHANNEL}
+    asyncio.run(handler.handle_event(event, event_id="Ev-thread", source="mention"))
+    assert run.calls[0]["resume"] == UPDATE_SESSION
+    assert all(p["thread_ts"] == update_ts for p in chat if not p.get("edit"))
+
+
+def test_dm_and_thread_relays_leave_the_channel_conversations_and_a_failed_report_clears_its_bots(tmp_path):
+    sessions = ThreadSessions(tmp_path / "threads.json")
+    for persona in ("mungchi", "update", "schedule"):
+        sessions.set_channel_session(CHANNEL, OLD_SESSION, at(8, 6, 50), persona=persona)
+    before = {p: sessions.channel_session(CHANNEL, persona=p) for p in ("mungchi", "update", "schedule")}
+    relay(make_bots([]), [OWNER], tmp_path=tmp_path, sessions=sessions, clock=lambda: at(8, 7, 3))
+    relay(make_bots([]), slack_bot.BriefTarget(channel=CHANNEL, thread_ts="1700000000.000100"), tmp_path=tmp_path, sessions=sessions, clock=lambda: at(8, 7, 3))
+    assert {p: sessions.channel_session(CHANNEL, persona=p) for p in before} == before
+    # At the top level, a report that failed leaves its bot nothing old to continue.
+    relay(make_bots([]), CHANNEL, PersonaRun(update=RuntimeError("boom")), tmp_path=tmp_path, sessions=sessions, clock=lambda: at(8, 7, 3))
+    assert sessions.channel_session(CHANNEL, persona="update") is None
+    assert sessions.channel_session(CHANNEL, persona="schedule") == (SCHEDULE_SESSION, at(8, 7, 3))
+    assert sessions.channel_session(CHANNEL, persona="mungchi") is None
+
+
+def test_the_scheduled_briefing_stamps_the_channel_conversations_with_its_clock(tmp_path):
+    sessions = ThreadSessions(tmp_path / "threads.json")
+    store = StateStore(tmp_path / "state.json")
+    assert tick(make_bots([]), store, FakeClock(at(8, 7, 0)), PersonaRun(), state=slack_bot.BriefLoopState(), sessions=sessions) == "sent"
+    assert sessions.channel_session(CHANNEL, persona="update") == (UPDATE_SESSION, at(8, 7, 0))
+    assert sessions.channel_session(CHANNEL, persona="schedule") == (SCHEDULE_SESSION, at(8, 7, 0))

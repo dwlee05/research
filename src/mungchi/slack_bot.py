@@ -24,6 +24,15 @@ the orchestrator), 업뎃 (@update) and 일정 (@schedule), each with its own
 ``AsyncApp`` and Socket Mode connection. They share the allow-list, the
 thread -> session map (keyed per persona) and one concurrency cap.
 
+Replies go into the thread of the message, except in the briefing channel
+(``SLACK_BRIEF_CHANNEL`` as a C…/G… channel id, e.g. a private #비서실): there a
+top-level mention is answered at the top level, like a group chat, and each
+bot keeps one top-level conversation per channel (``TOP_LEVEL``). It is
+continued while its last reply is less than
+``SLACK_CHANNEL_SESSION_IDLE_MINUTES`` (default 60) old, else a new one
+starts. The relay briefing starts 업뎃's and 일정's with their report runs.
+A mention inside a thread there still gets its reply in that thread.
+
 ``SlackHandler`` holds all event logic for one bot and talks to Slack only
 through an injected ``AsyncWebClient``-like object, so it can be tested
 without Bolt.
@@ -42,7 +51,7 @@ import time
 import traceback
 from collections import OrderedDict
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from urllib.parse import urlsplit
 
@@ -80,6 +89,10 @@ FileFetcher = Callable[[str, str], Awaitable[bytes]]
 
 REFUSAL_TEXT = "죄송하지만 이 봇은 소유자만 사용할 수 있어요."
 FRESH_SESSION_NOTE = "이 스레드의 이전 대화는 이어 갈 수 없어서, 다음 메시지부터는 새 대화로 시작해요."
+FRESH_CHANNEL_SESSION_NOTE = "지금까지의 대화는 이어 갈 수 없어서, 다음 메시지부터는 새 대화로 시작해요."
+# Stands in for ``thread_ts`` at the top level of the briefing channel: a bot's
+# channel conversation there (its replies, lock, calendar proposal and session).
+TOP_LEVEL = "top"
 CREDIT_CRASH_TEXT = "⚠️ 크레딧을 확인하지 못했어요 ({kind}). 잠시 후 다시 시도해 주세요."
 WEATHER_CRASH_TEXT = "⚠️ 날씨를 가져오지 못했어요 ({kind}). 잠시 후 다시 시도해 주세요."
 CALENDAR_CRASH_TEXT = "❌ 캘린더에 추가하지 못했어요 ({kind}). 다시 부탁해 주세요."
@@ -378,6 +391,22 @@ def remember_session(
         log.warning("스레드와 대화의 연결을 저장하지 못했습니다: %s", safe_error(exc))
 
 
+def remember_channel_session(
+    sessions: ThreadSessions, channel: str, session_id: str | None, when: datetime, *, persona: str
+) -> None:
+    """Store (or with ``session_id=None`` drop) ``persona``'s top-level conversation in ``channel``, last active at ``when``.
+
+    A disk error never blocks a reply.
+    """
+    try:
+        if session_id:
+            sessions.set_channel_session(channel, session_id, when, persona=persona)
+        else:
+            sessions.forget_channel_session(channel, persona=persona)
+    except OSError as exc:
+        log.warning("채널 대화를 저장하지 못했습니다: %s", safe_error(exc))
+
+
 def describe_slack_error(exc: BaseException, persona: str = MUNGCHI) -> str:
     code = ""
     response = getattr(exc, "response", None)
@@ -508,6 +537,13 @@ class SlackHandler:
     ``persona`` picks the agent behind the bot: 고뭉치 (``mungchi``) or 업뎃 /
     일정 answering directly (``update`` / ``schedule``). ``semaphore`` and
     ``our_bot_user_ids`` are shared between the bots of one process.
+
+    ``brief_room`` is the briefing channel (``SLACK_BRIEF_CHANNEL``; only a
+    C…/G… channel id counts). A top-level mention there is answered at the
+    top level, in this bot's channel conversation (``TOP_LEVEL`` in place of
+    a thread): its session is resumed while the last top-level reply is
+    younger than ``channel_idle`` (default ``SLACK_CHANNEL_SESSION_IDLE_MINUTES``),
+    measured with ``clock``.
     """
 
     def __init__(
@@ -532,6 +568,9 @@ class SlackHandler:
         bot_token: str | None = None,
         file_fetcher: FileFetcher | None = None,
         rng: random.Random | None = None,
+        brief_room: str = "",
+        clock: Callable[[], datetime] | None = None,
+        channel_idle: timedelta | None = None,
     ):
         self.allowed_user_ids = frozenset(allowed_user_ids)
         if not self.allowed_user_ids:
@@ -567,6 +606,11 @@ class SlackHandler:
         self.file_fetcher = file_fetcher or download_slack_file
         # Picks the varied lines (placeholders, shortcut lead-ins); seed it for repeatable tests.
         self.rng = rng or random.Random()
+        # The briefing channel ("" when SLACK_BRIEF_CHANNEL is not a C…/G… channel id):
+        # top-level mentions there get top-level replies in a per-bot channel conversation.
+        self.brief_room = config.brief_room(brief_room)
+        self.clock = clock or utcnow
+        self._channel_idle = channel_idle
         # Threads with an agent turn running or queued: a "네" sent meanwhile came
         # before its preview was shown, so it never confirms anything.
         self._turns: dict[str, int] = {}
@@ -606,6 +650,16 @@ class SlackHandler:
     def is_allowed(self, user: str | None) -> bool:
         return bool(user) and user in self.allowed_user_ids
 
+    def in_room(self, channel: str) -> bool:
+        """True in the briefing channel, where top-level mentions get top-level replies."""
+        return bool(self.brief_room) and channel == self.brief_room
+
+    def channel_idle(self) -> timedelta:
+        """How long a top-level conversation in the briefing channel stays open after its last reply."""
+        if self._channel_idle is not None:
+            return self._channel_idle
+        return timedelta(minutes=config.get_channel_session_idle_minutes())
+
     def wants_briefing(self, request: str) -> bool:
         """고뭉치 only: a bare mention / empty DM, or a short briefing request ("오늘 건너뛴 브리핑 좀 해봐").
 
@@ -638,6 +692,10 @@ class SlackHandler:
         if not self.is_allowed(user):
             await self._refuse(channel, thread_ts, user)
             return
+        # The briefing channel's top level is one conversation per bot, answered at
+        # the top level (every reply, proposal and session of it goes by ``TOP_LEVEL``).
+        if self.in_room(channel) and not event.get("thread_ts"):
+            thread_ts = TOP_LEVEL
         # The user's text without this bot's mention; empty means 고뭉치's briefing
         # or ``default_prompt()``.
         request = strip_mention(str(event.get("text") or ""), self.bot_user_id)
@@ -819,6 +877,10 @@ class SlackHandler:
         channel = str((body.get("channel") or {}).get("id") or container.get("channel_id") or "")
         message_ts = str(message.get("ts") or container.get("message_ts") or "")
         thread_ts = str(message.get("thread_ts") or container.get("thread_ts") or message_ts)
+        if self.in_room(channel) and thread_ts == message_ts:
+            # Buttons posted at the top level of the briefing channel (a thread reply
+            # under them makes the message its own thread_ts): the channel conversation.
+            thread_ts = TOP_LEVEL
         if not channel or not message_ts:
             log.warning("%s 봇: 채널이나 메시지가 없는 버튼 클릭을 무시합니다.", self.texts.label)
             return
@@ -991,8 +1053,10 @@ class SlackHandler:
 
         In a channel the three parts go into that channel: into the request's
         thread when it was asked in a thread, else at the top level (like the
-        morning briefing). In 고뭉치's DM it is the DM relay for the person
-        who asked: 고뭉치's part in this DM (in the thread when asked in one),
+        morning briefing; in the briefing channel that also starts 업뎃's and
+        일정's channel conversations with their reports). In 고뭉치's DM it
+        is the DM relay for the person who asked: 고뭉치's part in this DM (in
+        the thread when asked in one),
         업뎃's and 일정's in their own DMs with that person. 업뎃's run is a
         briefing run, so the Dropbox checkpoint moves. ``last_brief_date`` is
         never written: a briefing on request never stops the next scheduled one.
@@ -1022,12 +1086,45 @@ class SlackHandler:
                         sessions=self.sessions,
                         run_timeout=BRIEF_RUN_TIMEOUT_SECONDS,
                         rng=self.rng,
+                        clock=self.clock,
                     )
                 except Exception as exc:  # noqa: BLE001 - reported in Slack without details
                     _log_exception("브리핑을 만들지 못했습니다.", exc)
                     await self._post(channel, thread_ts, BRIEF_CRASH_TEXT.format(kind=briefing.crash_kind(exc)))
                     return
         log.info("%s: 스레드 %s:%s 브리핑 %s", self.texts.label, channel, thread_ts, "완료" if code == 0 else "끝 (일부 실패, 위 로그 참고)")
+
+    # -- sessions: the thread map, or this bot's top-level conversation in the briefing channel
+
+    def _resume_session(self, channel: str, thread_ts: str) -> str | None:
+        """The session to continue: the thread's, or (``TOP_LEVEL``) the channel conversation's while it is fresh."""
+        if thread_ts != TOP_LEVEL:
+            return self.sessions.get(channel, thread_ts, persona=self.persona)
+        entry = self.sessions.channel_session(channel, persona=self.persona)
+        if entry is None:
+            return None
+        session_id, last_reply = entry
+        idle = self.channel_idle()
+        if self.clock() - last_reply < idle:
+            return session_id
+        log.info(
+            "%s: 채널 %s 마지막 답 뒤 %d분이 지나 새 대화로 시작합니다",
+            self.texts.label,
+            channel,
+            idle.total_seconds() // 60,
+        )
+        return None
+
+    def _keep_session(self, channel: str, thread_ts: str, session_id: str | None) -> None:
+        """Store (or with None drop) the session of the thread or (``TOP_LEVEL``) the channel conversation, stamped now."""
+        if thread_ts == TOP_LEVEL:
+            remember_channel_session(self.sessions, channel, session_id, self.clock(), persona=self.persona)
+        else:
+            remember_session(self.sessions, channel, thread_ts, session_id, persona=self.persona)
+
+    @staticmethod
+    def _fresh_note(thread_ts: str) -> str:
+        return FRESH_CHANNEL_SESSION_NOTE if thread_ts == TOP_LEVEL else FRESH_SESSION_NOTE
 
     # -- running a turn
 
@@ -1083,7 +1180,7 @@ class SlackHandler:
                 await self._finish(channel, thread_ts, placeholder, to_slack_chunks("\n".join([NO_IMAGE_READ_TEXT, *image_notes])))
                 return
             run_extra["images"] = prepared
-        resume = self.sessions.get(channel, thread_ts, persona=persona)
+        resume = self._resume_session(channel, thread_ts)
         # Only 고뭉치 shows progress ("→ 업뎃이에게 물어보는 중..."); 업뎃 and 일정
         # keep their placeholder until the answer replaces it.
         updater = (
@@ -1120,8 +1217,8 @@ class SlackHandler:
             if resume:
                 # The stored session may be unusable (e.g. its transcript is
                 # gone); start fresh next time instead of failing forever.
-                remember_session(self.sessions, channel, thread_ts, None, persona=persona)
-                reply += "\n" + FRESH_SESSION_NOTE
+                self._keep_session(channel, thread_ts, None)
+                reply += "\n" + self._fresh_note(thread_ts)
             await self._finish(channel, thread_ts, placeholder, [reply])
             return
 
@@ -1129,10 +1226,10 @@ class SlackHandler:
         if image_notes:
             reply += "\n\n" + "\n".join(f"⚠️ {note}" for note in image_notes)
         if result.session_id:
-            remember_session(self.sessions, channel, thread_ts, result.session_id, persona=persona)
+            self._keep_session(channel, thread_ts, result.session_id)
         elif resume and result.failed:
-            remember_session(self.sessions, channel, thread_ts, None, persona=persona)
-            reply += "\n" + FRESH_SESSION_NOTE
+            self._keep_session(channel, thread_ts, None)
+            reply += "\n" + self._fresh_note(thread_ts)
         if result.failed:
             log.warning("%s 답을 끝내지 못했습니다: %s", josa(label, "이", "가"), scrub(result.error or ""))
         await self._finish(channel, thread_ts, placeholder, to_slack_chunks(reply))
@@ -1153,10 +1250,13 @@ class SlackHandler:
     async def _post(
         self, channel: str, thread_ts: str, text: str, *, blocks: list[dict[str, Any]] | None = None
     ) -> str | None:
-        extra = {"blocks": blocks} if blocks is not None else {}
+        """Post in the thread, or at the top level of the channel for ``TOP_LEVEL``."""
+        extra: dict[str, Any] = {"blocks": blocks} if blocks is not None else {}
+        if thread_ts != TOP_LEVEL:
+            extra["thread_ts"] = thread_ts
         try:
             response = await self.client.chat_postMessage(
-                channel=channel, thread_ts=thread_ts, text=text, unfurl_links=False, unfurl_media=False, **extra
+                channel=channel, text=text, unfurl_links=False, unfurl_media=False, **extra
             )
         except Exception as exc:  # noqa: BLE001
             log.error("%s 봇: Slack 메시지를 보내지 못했습니다: %s", self.texts.label, describe_slack_error(exc, self.persona))
@@ -1175,8 +1275,9 @@ class SlackHandler:
 
     async def _ephemeral(self, channel: str, user: str, thread_ts: str, text: str) -> None:
         """A message only ``user`` sees (e.g. a refused or stale button click)."""
+        where = {} if thread_ts == TOP_LEVEL else {"thread_ts": thread_ts}
         try:
-            await self.client.chat_postEphemeral(channel=channel, user=user, thread_ts=thread_ts, text=text)
+            await self.client.chat_postEphemeral(channel=channel, user=user, text=text, **where)
         except Exception as exc:  # noqa: BLE001
             log.warning("%s 봇: 나만 보이는 메시지를 보내지 못했습니다: %s", self.texts.label, describe_slack_error(exc, self.persona))
 
@@ -1233,6 +1334,7 @@ def build_app(
         semaphore=semaphore,
         our_bot_user_ids=our_bot_user_ids,
         bot_token=bot.bot_token,
+        brief_room=cfg.brief_channel,
     )
     register_listeners(app, handler)
     return app, handler
@@ -1463,6 +1565,7 @@ async def morning_brief_tick(
                 greeting_generate=greeting_generate,
                 store=store,
                 rng=rng,
+                clock=clock,
             )
     except Exception as exc:  # noqa: BLE001 - one scrubbed line, the bots keep running
         log.error("아침 브리핑 실패 (%s): %s", today, safe_error(exc))
@@ -1837,6 +1940,25 @@ async def _deliver_report(
     return True
 
 
+def _seed_channel_session(
+    sessions: ThreadSessions | None,
+    target: BriefTarget,
+    persona: str,
+    session_id: str | None,
+    clock: Callable[[], datetime],
+) -> None:
+    """A part posted at the top level of a channel (C…/G…) starts that bot's channel conversation there.
+
+    업뎃 / 일정: their report run's session, stamped now, so a top-level
+    ``@업뎃 …`` soon after continues from the briefing. 고뭉치 (no run of its
+    own) or a report without a session: none, so the next top-level mention
+    starts fresh. DMs and threads keep only the thread map.
+    """
+    if sessions is None or target.dm or target.thread_ts or not config.brief_room(target.channel):
+        return
+    remember_channel_session(sessions, target.channel, session_id, clock(), persona=persona)
+
+
 async def post_briefing(
     bots: Any,
     destinations: "str | BriefTarget | Sequence[str | BriefTarget]",
@@ -1853,6 +1975,7 @@ async def post_briefing(
     greeting_generate: briefing.GreetingGenerate | None = None,
     store: StateStore | None = None,
     rng: random.Random | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> int:
     """Run today's relay briefing once and post it to every destination, in order: 고뭉치 → 업뎃 → 일정.
 
@@ -1870,7 +1993,10 @@ async def post_briefing(
     ``not_in_channel``) has 고뭉치 post its part instead, with the
     ``/invite`` hint once. 고뭉치's own message is not mapped to any session
     (a mention there starts fresh); 업뎃's and 일정's are mapped to their runs'
-    sessions. ``last_brief_date`` is never touched here.
+    sessions. At the top level of a channel the parts also start each bot's
+    channel conversation there (``_seed_channel_session``, stamped with
+    ``clock`` at posting): 업뎃's and 일정's are their runs' sessions,
+    고뭉치's is cleared. ``last_brief_date`` is never touched here.
 
     Returns 0 when every part was made and reached every destination, else 1
     (details are logged).
@@ -1885,6 +2011,7 @@ async def post_briefing(
     reporters = [persona for persona in briefing.REPORTERS if persona in relay_bots]
     missing = [persona for persona in briefing.REPORTERS if persona not in relay_bots]
     rng = rng or random.Random()
+    clock = clock or utcnow
     ok = True
     state = _RelayState()
     async with briefing.start_relay(
@@ -1911,11 +2038,16 @@ async def post_briefing(
             except Exception as exc:  # noqa: BLE001 - the others still get theirs
                 ok = False
                 log.error("브리핑을 Slack(%s)에 올리지 못했습니다: %s", channel, describe_slack_error(exc))
+            else:
+                _seed_channel_session(sessions, target, MUNGCHI, None, clock)
         for persona in reporters:
             report = await relay.report(persona)
             ok = ok and not report.failed
             for target in targets:
-                ok = await _deliver_report(report, target, relay_bots, sessions, state) and ok
+                delivered = await _deliver_report(report, target, relay_bots, sessions, state)
+                if delivered:
+                    _seed_channel_session(sessions, target, persona, report.session_id, clock)
+                ok = delivered and ok
     return 0 if ok else 1
 
 

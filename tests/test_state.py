@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from mungchi import config
-from mungchi.state import MAX_SLACK_THREADS, StateStore, ThreadSessions, ensure_aware, resolve_since
+from mungchi.state import MAX_SLACK_CHANNELS, MAX_SLACK_THREADS, StateStore, ThreadSessions, ensure_aware, resolve_since
 
 NOW = datetime(2026, 10, 5, 0, 0, tzinfo=timezone.utc)
 
@@ -176,6 +176,52 @@ def test_thread_sessions_ignore_corrupt_or_unsafe_values(tmp_path):
     assert store.get("C1", "1.0", persona="mungchi") is None
     path.write_text(json.dumps({"threads": {"C1:1.0": "--flag", "C1:2.0": SID_A}}), encoding="utf-8")
     assert store.threads() == {"mungchi:C1:2.0": SID_A}
+
+
+def test_channel_sessions_live_next_to_the_threads_and_survive_a_restart(tmp_path):
+    path = tmp_path / "threads.json"
+    store = ThreadSessions(path)
+    assert store.channel_session("C1", persona="update") is None
+    store.set("C1", "1.0", SID_A, persona="mungchi")
+    store.set_channel_session("C1", SID_B, NOW, persona="update")
+    reopened = ThreadSessions(path)  # e.g. after a bot restart
+    assert reopened.channel_session("C1", persona="update") == (SID_B, NOW)
+    assert reopened.channel_session("C1", persona="schedule") is None and reopened.channel_session("C2", persona="update") is None
+    assert reopened.get("C1", "1.0", persona="mungchi") == SID_A
+    # Writing a thread keeps the channel conversations, and the other way round.
+    store.set("C1", "2.0", SID_A, persona="update")
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "threads": {"mungchi:C1:1.0": SID_A, "update:C1:2.0": SID_A},
+        "channels": {"update:C1": {"session_id": SID_B, "at": "2026-10-05T00:00:00+00:00"}},
+    }
+    store.forget("C1", "1.0", persona="mungchi")
+    assert store.channel_session("C1", persona="update") == (SID_B, NOW)
+    store.forget_channel_session("C1", persona="update")
+    assert store.channel_session("C1", persona="update") is None and store.get("C1", "2.0", persona="update") == SID_A
+    assert json.loads(path.read_text(encoding="utf-8")) == {"threads": {"update:C1:2.0": SID_A}}
+
+
+def test_channel_sessions_ignore_bad_values_and_are_capped(tmp_path):
+    path = tmp_path / "threads.json"
+    at = NOW.isoformat()
+    channels = {
+        "update:C1": {"session_id": "--flag", "at": at},
+        "schedule:C1": {"session_id": SID_A, "at": "어제"},
+        "nobody:C1": {"session_id": SID_A, "at": at},
+        "C1": {"session_id": SID_A, "at": at},
+        "mungchi:C1": {"session_id": SID_B, "at": at},
+    }
+    path.write_text(json.dumps({"channels": channels}), encoding="utf-8")
+    store = ThreadSessions(path)
+    assert [store.channel_session("C1", persona=p) for p in ("update", "schedule", "mungchi")] == [None, None, (SID_B, NOW)]
+    store.set_channel_session("C1", "--bad value; rm -rf /", NOW, persona="update")  # never stored or passed to --resume
+    assert store.channel_session("C1", persona="update") is None
+    with pytest.raises(ValueError):
+        store.channel_session("C1", persona="nobody")
+    for i in range(MAX_SLACK_CHANNELS + 5):
+        store.set_channel_session(f"C{i:03d}", SID_A, NOW, persona="update")
+    kept = json.loads(path.read_text(encoding="utf-8"))["channels"]
+    assert len(kept) == MAX_SLACK_CHANNELS and list(kept)[-1] == f"update:C{MAX_SLACK_CHANNELS + 4:03d}"
 
 
 def test_slack_threads_file_sits_next_to_state_file(tmp_path):

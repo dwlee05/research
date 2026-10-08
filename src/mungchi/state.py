@@ -1,6 +1,7 @@
 """Persisted state: "last checked" timestamps per source and calendar events
 waiting for the user's confirmation (``.mungchi_state.json``), and the Slack
-thread -> Agent SDK session map (``.mungchi_slack_threads.json``)."""
+thread -> Agent SDK session map with each bot's top-level conversation in the
+briefing channel (``.mungchi_slack_threads.json``)."""
 
 from __future__ import annotations
 
@@ -19,6 +20,8 @@ from .personas import MUNGCHI, PERSONAS
 _LOCK = threading.Lock()
 
 MAX_SLACK_THREADS = 200
+# Top-level conversations (one per bot and channel) kept in the same file.
+MAX_SLACK_CHANNELS = 50
 # Calendar events proposed from a pasted note wait this long for "네" / "아니요".
 PROPOSAL_TTL = timedelta(hours=24)
 MAX_PENDING_PROPOSALS = 50
@@ -238,6 +241,11 @@ class ThreadSessions:
     Entries are kept oldest first and capped at ``max_threads`` in total. The
     file is re-read on every access so the bots see threads started by a
     separate ``--brief --slack`` run without restarting.
+
+    The same file also keeps each bot's top-level conversation in a channel
+    (``"channels": {"<persona>:<channel>": {"session_id": ..., "at": "<iso8601>"}}``):
+    the session of the bot's last top-level reply there and when it finished.
+    Whether it is still fresh enough to continue is the caller's decision.
     """
 
     def __init__(self, path: Path | str, max_threads: int = MAX_SLACK_THREADS):
@@ -250,8 +258,17 @@ class ThreadSessions:
             raise ValueError(f"unknown persona: {persona!r}")
         return f"{persona}:{channel}:{thread_ts}"
 
+    @staticmethod
+    def channel_key(persona: str, channel: str) -> str:
+        if persona not in PERSONAS:
+            raise ValueError(f"unknown persona: {persona!r}")
+        return f"{persona}:{channel}"
+
     def threads(self) -> dict[str, str]:
-        raw = _read_json(self.path).get("threads")
+        return self._threads(_read_json(self.path))
+
+    def _threads(self, data: dict[str, Any]) -> dict[str, str]:
+        raw = data.get("threads")
         if not isinstance(raw, dict):
             return {}
         threads: dict[str, str] = {}
@@ -266,6 +283,31 @@ class ThreadSessions:
             threads[key] = value
         return threads
 
+    @staticmethod
+    def _channels(data: dict[str, Any]) -> dict[str, dict[str, str]]:
+        """Well-formed top-level conversations, oldest first (as stored)."""
+        raw = data.get("channels")
+        if not isinstance(raw, dict):
+            return {}
+        channels: dict[str, dict[str, str]] = {}
+        for key, value in raw.items():
+            if not (isinstance(key, str) and isinstance(value, dict)):
+                continue
+            parts = key.split(":")
+            session_id, at = value.get("session_id"), value.get("at")
+            if len(parts) != 2 or parts[0] not in PERSONAS or not parts[1]:
+                continue
+            if not (isinstance(session_id, str) and _SESSION_ID_RE.match(session_id)) or _parse_iso(at) is None:
+                continue
+            channels[key] = {"session_id": session_id, "at": at}
+        return channels
+
+    def _write(self, threads: dict[str, str], channels: dict[str, dict[str, str]]) -> None:
+        data: dict[str, Any] = {"threads": threads}
+        if channels:
+            data["channels"] = channels
+        _write_json(self.path, data)
+
     def get(self, channel: str, thread_ts: str, *, persona: str) -> str | None:
         return self.threads().get(self.key(persona, channel, thread_ts))
 
@@ -274,19 +316,54 @@ class ThreadSessions:
             return
         key = self.key(persona, channel, thread_ts)
         with _LOCK:
-            threads = self.threads()
+            data = _read_json(self.path)
+            threads = self._threads(data)
             threads.pop(key, None)  # re-insert as the most recent thread
             threads[key] = session_id
             while len(threads) > self.max_threads:
                 del threads[next(iter(threads))]
-            _write_json(self.path, {"threads": threads})
+            self._write(threads, self._channels(data))
 
     def forget(self, channel: str, thread_ts: str, *, persona: str) -> None:
         key = self.key(persona, channel, thread_ts)
         with _LOCK:
-            threads = self.threads()
+            data = _read_json(self.path)
+            threads = self._threads(data)
             if threads.pop(key, None) is not None:
-                _write_json(self.path, {"threads": threads})
+                self._write(threads, self._channels(data))
+
+    # -- each bot's top-level conversation in a channel
+
+    def channel_session(self, channel: str, *, persona: str) -> tuple[str, datetime] | None:
+        """``(session id, when its last top-level reply finished)`` of ``persona`` in ``channel``, or None."""
+        entry = self._channels(_read_json(self.path)).get(self.channel_key(persona, channel))
+        if entry is None:
+            return None
+        at = _parse_iso(entry["at"])
+        return (entry["session_id"], at) if at is not None else None
+
+    def set_channel_session(self, channel: str, session_id: str, when: datetime, *, persona: str) -> None:
+        """Remember ``session_id`` as ``persona``'s top-level conversation in ``channel``, last active at ``when``."""
+        if not _SESSION_ID_RE.match(session_id or ""):
+            return
+        key = self.channel_key(persona, channel)
+        stamp = ensure_aware(when).astimezone(timezone.utc).isoformat()
+        with _LOCK:
+            data = _read_json(self.path)
+            channels = self._channels(data)
+            channels.pop(key, None)  # re-insert as the most recent one
+            channels[key] = {"session_id": session_id, "at": stamp}
+            while len(channels) > MAX_SLACK_CHANNELS:
+                del channels[next(iter(channels))]
+            self._write(self._threads(data), channels)
+
+    def forget_channel_session(self, channel: str, *, persona: str) -> None:
+        key = self.channel_key(persona, channel)
+        with _LOCK:
+            data = _read_json(self.path)
+            channels = self._channels(data)
+            if channels.pop(key, None) is not None:
+                self._write(self._threads(data), channels)
 
 
 def resolve_since(

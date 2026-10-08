@@ -2788,3 +2788,334 @@ def test_a_redirect_to_another_host_never_gets_the_token():
     assert data == b"\xff\xd8ok"
     first, second = seen
     assert first.headers["authorization"] == f"Bearer {SLACK_TOKEN}" and "authorization" not in second.headers
+
+
+# ---------------------------------------------------------------- the briefing channel (#비서실): top-level replies
+
+ROOM = "C0ROOM0001"  # SLACK_BRIEF_CHANNEL
+T0 = datetime(2026, 10, 8, 1, 0, tzinfo=timezone.utc)  # 10:00 in Seoul
+
+
+class Clock:
+    """The handler's wall clock (aware UTC), moved forward by hand."""
+
+    def __init__(self, now=T0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, minutes):
+        self.now += timedelta(minutes=minutes)
+
+
+def room_mention(text=f"<@{BOT}> 김공저 님 업데이트가 잦은 거 보니 엄청 열심히 하시네, 그치?", *, ts="1700000000.000100", **extra):
+    return mention(text, ts=ts, channel=ROOM, **extra)
+
+
+def room_handler(tmp_path, *, clock=None, **kwargs):
+    return make_handler(tmp_path, brief_room=ROOM, clock=clock or Clock(), **kwargs)
+
+
+def top_level(posts) -> bool:
+    return bool(posts) and all(p["channel"] == ROOM and "thread_ts" not in p for p in posts)
+
+
+def top_click(value, *, message_ts, thread_ts=None, user=OWNER):
+    """A click on a button of a top-level message in the brief channel (its own thread_ts once it has thread replies)."""
+    body = click(value, user=user, channel=ROOM, message_ts=message_ts, thread_ts=thread_ts)
+    if thread_ts is None:
+        del body["container"]["thread_ts"], body["message"]["thread_ts"]
+    return body
+
+
+def test_only_a_channel_id_turns_on_top_level_replies(tmp_path, monkeypatch):
+    assert config.brief_room(ROOM) == ROOM and config.brief_room(" G0ROOM0001 ") == "G0ROOM0001"
+    for value in ("", DM, OWNER, "W0123ABCD", "#비서실", "c0room0001"):
+        assert config.brief_room(value) == ""
+    _no_network(monkeypatch)
+    for value, expected in ((ROOM, ROOM), (OWNER, ""), ("", "")):
+        cfg = config.load_slack_config({**ALL_BOTS_ENV, "SLACK_BRIEF_CHANNEL": value})
+        apps = slack_bot.build_apps(cfg, sessions=ThreadSessions(tmp_path / "t.json"))
+        assert [handler.brief_room for _bot, _app, handler in apps] == [expected] * 3
+
+
+def test_a_top_level_mention_in_the_brief_channel_is_answered_at_the_top_level(tmp_path):
+    long_answer = "\n\n".join(f"**항목 {i}**: " + "내용 " * 600 for i in range(3))
+    handler, client, run = room_handler(tmp_path, run=FakeRun(TurnResult(text=long_answer, session_id=SESSION_1)))
+    asyncio.run(handler.handle_event(room_mention(), event_id="Ev1", source="mention"))
+    placeholder, *rest = client.posts
+    # The placeholder, its status lines and the answer that replaces it, and the rest of a long answer: all at the top level.
+    assert placeholder["text"] in PLACEHOLDER_POOLS["mungchi"] and rest and top_level(client.posts)
+    assert {u["ts"] for u in client.updates} == {placeholder["_ts"]} and client.updates[-1]["text"].startswith("*항목 0*")
+    assert run.calls[0]["prompt"] == "김공저 님 업데이트가 잦은 거 보니 엄청 열심히 하시네, 그치?" and run.calls[0]["resume"] is None
+    assert run.keys == [slack_conversation_key("mungchi", ROOM, slack_bot.TOP_LEVEL)]
+    # The bot's channel conversation remembers the session (no thread is mapped).
+    assert handler.sessions.channel_session(ROOM, persona="mungchi") == (SESSION_1, T0)
+    assert handler.sessions.threads() == {}
+
+
+def test_a_mention_in_a_thread_of_the_brief_channel_is_answered_in_that_thread(tmp_path):
+    handler, client, run = room_handler(tmp_path, run=FakeRun(TurnResult(text="이어진 답", session_id=SESSION_2)))
+    root = "1700000000.000050"
+    handler.sessions.set(ROOM, root, SESSION_1, persona="mungchi")  # e.g. a briefing message's thread
+    event = room_mention(f"<@{BOT}> 그럼 내일은?", ts="1700000000.000300", thread_ts=root)
+    asyncio.run(handler.handle_event(event, event_id="Ev1", source="mention"))
+    assert client.posts and all(p["channel"] == ROOM and p["thread_ts"] == root for p in client.posts)
+    assert run.calls[0]["resume"] == SESSION_1 and run.keys == [slack_conversation_key("mungchi", ROOM, root)]
+    assert handler.sessions.get(ROOM, root, persona="mungchi") == SESSION_2
+    assert handler.sessions.channel_session(ROOM, persona="mungchi") is None
+
+
+@pytest.mark.parametrize("brief_room", [ROOM, "", DM, OWNER, "#비서실"])
+def test_other_channels_and_dms_are_still_answered_in_threads(tmp_path, brief_room):
+    handler, client, run = make_handler(tmp_path, brief_room=brief_room, clock=Clock())
+    asyncio.run(handler.handle_event(mention(ts="1700000000.000100"), event_id="Ev1", source="mention"))
+    asyncio.run(handler.handle_event(dm(ts="1700000000.000200"), event_id="Ev2", source="dm"))
+    assert [(p["channel"], p["thread_ts"]) for p in client.posts] == [(CHANNEL, "1700000000.000100"), (DM, "1700000000.000200")]
+    assert run.keys == [slack_conversation_key("mungchi", CHANNEL, "1700000000.000100"), slack_conversation_key("mungchi", DM, "1700000000.000200")]
+    assert all(handler.sessions.channel_session(c, persona="mungchi") is None for c in (CHANNEL, DM))
+
+
+def test_the_channel_conversation_continues_for_an_hour_after_the_last_reply(tmp_path):
+    clock = Clock()
+    run = FakeRun(
+        TurnResult(text="첫 답", session_id=SESSION_1),
+        TurnResult(text="이어진 답", session_id=SESSION_1),
+        TurnResult(text="새 대화", session_id=SESSION_2),
+    )
+    handler, client, run = room_handler(tmp_path, clock=clock, run=run, persona="update")
+    asyncio.run(handler.handle_event(room_mention(ts="1700000000.000100"), event_id="Ev1", source="mention"))
+    clock.advance(30)
+    asyncio.run(handler.handle_event(room_mention(f"<@{BOT}> 그 파일 언제 바뀌었어?", ts="1700000000.000200"), event_id="Ev2", source="mention"))
+    # Every reply restarts the hour.
+    assert handler.sessions.channel_session(ROOM, persona="update") == (SESSION_1, T0 + timedelta(minutes=30))
+    clock.advance(61)
+    asyncio.run(handler.handle_event(room_mention(f"<@{BOT}> 오늘 바뀐 거 있어?", ts="1700000000.000300"), event_id="Ev3", source="mention"))
+    assert [c["resume"] for c in run.calls] == [None, SESSION_1, None]
+    assert handler.sessions.channel_session(ROOM, persona="update") == (SESSION_2, T0 + timedelta(minutes=91))
+    assert top_level(client.posts) and len(client.posts) == 3
+
+
+@pytest.mark.parametrize("minutes,resumed", [(59, True), (60, False)])
+def test_the_hour_is_counted_from_the_last_reply(tmp_path, minutes, resumed):
+    clock = Clock()
+    handler, client, run = room_handler(tmp_path, clock=clock, persona="schedule")
+    handler.sessions.set_channel_session(ROOM, SESSION_1, T0, persona="schedule")
+    clock.advance(minutes)
+    asyncio.run(handler.handle_event(room_mention(), event_id="Ev1", source="mention"))
+    assert run.calls[0]["resume"] == (SESSION_1 if resumed else None)
+
+
+def test_each_bot_has_its_own_channel_conversation(tmp_path):
+    clock = Clock()
+    update, _uc, update_run = room_handler(tmp_path, clock=clock, persona="update", run=FakeRun(TurnResult(text="업뎃 답", session_id=SESSION_1)))
+    schedule, _sc, schedule_run = room_handler(tmp_path, clock=clock, persona="schedule", run=FakeRun(TurnResult(text="일정 답", session_id=SESSION_2)))
+    asyncio.run(update.handle_event(room_mention(ts="1700000000.000100"), event_id="Ev1", source="mention"))
+    clock.advance(5)
+    asyncio.run(schedule.handle_event(room_mention(ts="1700000000.000200"), event_id="Ev2", source="mention"))
+    clock.advance(5)
+    asyncio.run(update.handle_event(room_mention(ts="1700000000.000300"), event_id="Ev3", source="mention"))
+    asyncio.run(schedule.handle_event(room_mention(ts="1700000000.000400"), event_id="Ev4", source="mention"))
+    assert [c["resume"] for c in update_run.calls] == [None, SESSION_1]
+    assert [c["resume"] for c in schedule_run.calls] == [None, SESSION_2]
+
+
+def test_the_window_follows_slack_channel_session_idle_minutes(tmp_path, monkeypatch):
+    assert config.get_channel_session_idle_minutes({}) == 60
+    for raw, minutes in (("15", 15), ("120", 120), ("0", 60), ("-5", 60), ("한 시간", 60), ("1.5", 60), ("", 60)):
+        assert config.get_channel_session_idle_minutes({"SLACK_CHANNEL_SESSION_IDLE_MINUTES": raw}) == minutes
+    monkeypatch.setenv("SLACK_CHANNEL_SESSION_IDLE_MINUTES", "120")
+    clock = Clock()
+    handler, client, run = room_handler(tmp_path, clock=clock, run=FakeRun(TurnResult(text="답", session_id=SESSION_1)))
+    asyncio.run(handler.handle_event(room_mention(ts="1700000000.000100"), event_id="Ev1", source="mention"))
+    clock.advance(90)  # past the default hour, inside two hours
+    asyncio.run(handler.handle_event(room_mention(ts="1700000000.000200"), event_id="Ev2", source="mention"))
+    monkeypatch.setenv("SLACK_CHANNEL_SESSION_IDLE_MINUTES", "20")
+    clock.advance(30)
+    asyncio.run(handler.handle_event(room_mention(ts="1700000000.000300"), event_id="Ev3", source="mention"))
+    assert [c["resume"] for c in run.calls] == [None, SESSION_1, None]
+
+
+def test_quick_top_level_mentions_to_one_bot_share_one_conversation(tmp_path):
+    run = FakeRun(TurnResult(text="첫 답", session_id=SESSION_1), TurnResult(text="둘째 답", session_id=SESSION_1), statuses=(), delay=0.05)
+    handler, client, run = room_handler(tmp_path, persona="schedule", run=run)
+
+    async def scenario():
+        await asyncio.gather(
+            handler.handle_event(room_mention(f"<@{BOT}> 오늘 일정?", ts="1700000000.000100"), event_id="Ev1", source="mention"),
+            handler.handle_event(room_mention(f"<@{BOT}> 내일은?", ts="1700000000.000200"), event_id="Ev2", source="mention"),
+        )
+
+    asyncio.run(scenario())
+    # One after the other: the second continues the first one's session instead of starting another.
+    assert run.max_active == 1 and [c["resume"] for c in run.calls] == [None, SESSION_1]
+    assert len(client.posts) == 2 and top_level(client.posts) and handler._locks == {} and handler._turns == {}
+    assert handler.sessions.channel_session(ROOM, persona="schedule") == (SESSION_1, T0)
+
+
+def test_the_channel_conversation_survives_a_restart(tmp_path):
+    clock = Clock()
+    handler, _client, _run = room_handler(tmp_path, clock=clock, persona="update", run=FakeRun(TurnResult(text="답", session_id=SESSION_1)))
+    asyncio.run(handler.handle_event(room_mention(), event_id="Ev1", source="mention"))
+    clock.advance(10)
+    restarted, _client, run = room_handler(tmp_path, clock=clock, persona="update", run=FakeRun(TurnResult(text="이어서", session_id=SESSION_1)))
+    asyncio.run(restarted.handle_event(room_mention(ts="1700000000.000500"), event_id="Ev2", source="mention"))
+    assert run.calls[0]["resume"] == SESSION_1
+    saved = json.loads((tmp_path / "threads.json").read_text(encoding="utf-8"))
+    assert saved["channels"] == {f"update:{ROOM}": {"session_id": SESSION_1, "at": (T0 + timedelta(minutes=10)).isoformat()}}
+
+
+def test_errors_are_answered_at_the_top_level_and_a_broken_conversation_starts_over(tmp_path):
+    clock = Clock()
+    run = FakeRun(TurnResult(text="첫 답", session_id=SESSION_1), RuntimeError("transcript gone"))
+    handler, client, run = room_handler(tmp_path, clock=clock, persona="update", run=run)
+    asyncio.run(handler.handle_event(room_mention(ts="1700000000.000100"), event_id="Ev1", source="mention"))
+    clock.advance(10)
+    asyncio.run(handler.handle_event(room_mention(ts="1700000000.000200"), event_id="Ev2", source="mention"))
+    assert run.calls[1]["resume"] == SESSION_1
+    assert client.updates[-1] == {
+        "channel": ROOM,
+        "ts": client.posts[-1]["_ts"],
+        "text": "⚠️ 업뎃을 실행하지 못했어요 (RuntimeError). 잠시 후 다시 시도해 주세요.\n" + slack_bot.FRESH_CHANNEL_SESSION_NOTE,
+    }
+    assert top_level(client.posts) and handler.sessions.channel_session(ROOM, persona="update") is None
+    assert slack_bot.FRESH_CHANNEL_SESSION_NOTE == "지금까지의 대화는 이어 갈 수 없어서, 다음 메시지부터는 새 대화로 시작해요."
+
+
+@pytest.mark.parametrize("text", [f"<@{BOT}> 날씨", f"<@{BOT}> 토큰", f"<@{BOT}> 날씨랑 토큰 좀 말해봐"])
+def test_quick_info_shortcuts_answer_at_the_top_level(tmp_path, text):
+    handler, client, run = room_handler(
+        tmp_path, persona="schedule", weather_text=lambda: "🌤️ 서울 날씨: 맑음", credit_text=lambda: "💳 크레딧: 9,050 남음"
+    )
+    asyncio.run(handler.handle_event(room_mention(text), event_id="Ev1", source="mention"))
+    assert run.calls == [] and len(client.posts) == 1 and top_level(client.posts)
+    assert handler.sessions.channel_session(ROOM, persona="schedule") is None  # no agent turn, no session
+
+
+def test_photos_in_the_brief_channel_are_answered_at_the_top_level(tmp_path):
+    store = StateStore(tmp_path / "state.json")
+    run = CategoryProposingRun(store, TurnResult(text="• 10/22(목) 12:00–13:00 신임교수모임 (10월)\n카테고리를 골라주세요 …", session_id=SESSION_1), statuses=())
+    handler, client, run, fetcher, store = photo_handler(tmp_path, run=run, brief_room=ROOM, clock=Clock())
+    files = [slack_file(), slack_file("notice.pdf", "application/pdf")]
+    asyncio.run(handler.handle_event(room_mention("<@UBOT> 이 포스터 일정 등록해줘", files=files), event_id="Ev1", source="mention"))
+    note, placeholder, buttons = client.posts
+    assert "읽지 않은 파일: notice.pdf" in note["text"] and placeholder["text"] in PLACEHOLDER_POOLS["update"]
+    assert buttons["blocks"][1]["type"] == "actions" and len(run.images[0]) == 1 and top_level(client.posts)
+    # 고뭉치 points photos to 업뎃 / 일정, at the top level too.
+    mungchi, m_client, m_run, _fetcher, _store = photo_handler(tmp_path, persona="mungchi", brief_room=ROOM, briefing_relay=RecordingRelay())
+    asyncio.run(mungchi.handle_event(room_mention("<@UBOT> 이거", files=[slack_file()], ts="1700000000.000900"), event_id="Ev2", source="mention"))
+    assert [p["text"] for p in m_client.posts] == [slack_bot.IMAGE_REDIRECT_TEXT] and top_level(m_client.posts) and m_run.calls == []
+
+
+@pytest.mark.parametrize("own_thread", [False, True])
+def test_a_top_level_proposal_gets_buttons_and_a_click_creates_the_events(tmp_path, own_thread):
+    handler, client, run, app, store = _proposing_handler(tmp_path, brief_room=ROOM, clock=Clock())
+    asyncio.run(handler.handle_event(room_mention("<@UBOT> 메모: 10월 22일(목) 오후 12시 신임교수모임"), event_id="Ev1", source="mention"))
+    key = slack_conversation_key("update", ROOM, slack_bot.TOP_LEVEL)
+    assert run.keys == [key]
+    placeholder, buttons = client.posts
+    assert top_level(client.posts) and buttons["text"] == "카테고리를 골라주세요 (추천: Event-KHU)"
+    assert handler._button_messages[key] == (ROOM, buttons["_ts"], "pid-1")
+    # A reply in the buttons' thread makes the message its own thread_ts: still the top-level proposal.
+    body = top_click({"proposal_id": "pid-1", "category": "Research"}, message_ts=buttons["_ts"], thread_ts=buttons["_ts"] if own_thread else None)
+    asyncio.run(handler.handle_action(body))
+    assert app.created == ["신임교수모임 (10월)", "신임교수모임 (11월)"] and app.calendars == ["Research", "Research"]
+    result = client.updates[-1]
+    assert result["ts"] == buttons["_ts"] and result["channel"] == ROOM and result["blocks"] == []
+    assert result["text"].startswith("✅ Research 캘린더에 추가했어요")
+    assert client.ephemerals == [] and len(client.posts) == 2 and store.pending_proposal(key, utcnow()) is None
+    assert handler._button_messages == {} and handler._confirming == {} and handler._turns == {}
+    # Clicking again creates nothing; the note only the clicker sees is not in a thread either.
+    asyncio.run(handler.handle_action(body))
+    assert len(app.created) == 2
+    assert client.ephemerals == [{"channel": ROOM, "user": OWNER, "text": slack_bot.STALE_ACTION_TEXT}]
+
+
+def test_a_typed_answer_at_the_top_level_creates_the_events(tmp_path):
+    handler, client, run, app, store = _proposing_handler(tmp_path, persona="schedule", brief_room=ROOM, clock=Clock())
+    asyncio.run(handler.handle_event(room_mention("<@UBOT> 메모 붙여 넣음", ts="1700000000.000100"), event_id="Ev1", source="mention"))
+    buttons_ts = client.posts[-1]["_ts"]
+    asyncio.run(handler.handle_event(room_mention("<@UBOT> 3", ts="1700000000.000300"), event_id="Ev2", source="mention"))
+    assert len(run.calls) == 1 and app.calendars == ["Research", "Research"]  # code only, no second agent turn
+    assert client.posts[-1]["text"].startswith("✅ Research 캘린더에 추가했어요") and top_level(client.posts)
+    assert {"channel": ROOM, "ts": buttons_ts, "text": slack_bot.BUTTONS_ANSWERED_TEXT, "blocks": []} in client.updates
+    assert handler._button_messages == {}
+    assert store.pending_proposal(slack_conversation_key("schedule", ROOM, slack_bot.TOP_LEVEL), utcnow()) is None
+
+
+def test_the_top_level_proposal_is_kept_apart_from_threads_and_other_bots_and_expires(tmp_path):
+    handler, client, run, app, store = proposal_handler(tmp_path, brief_room=ROOM, clock=Clock())  # 일정
+    key = store_category_proposal(store, "schedule", ROOM, slack_bot.TOP_LEVEL)
+    # A "3" in a thread of the channel, or to another bot at the top level, does not answer it.
+    asyncio.run(handler.handle_event(room_mention("<@UBOT> 3", ts="1700000000.000300", thread_ts="1700000000.000100"), event_id="Ev1", source="mention"))
+    update, _client, update_run, _app, _store = proposal_handler(tmp_path, "update", app=app, brief_room=ROOM, clock=Clock())
+    asyncio.run(update.handle_event(room_mention("<@UBOT> 3", ts="1700000000.000400"), event_id="Ev2", source="mention"))
+    assert app.created == [] and [c["prompt"] for c in run.calls] == ["3"] and [c["prompt"] for c in update_run.calls] == ["3"]
+    assert store.pending_proposal(key, utcnow()) is not None
+    # After 24 hours it is gone: a "네" goes to the agent (and the old entry is cleared), a click is stale.
+    store_category_proposal(store, "schedule", ROOM, slack_bot.TOP_LEVEL, now=utcnow() - timedelta(hours=25))
+    asyncio.run(handler.handle_event(room_mention("<@UBOT> 네", ts="1700000000.000500"), event_id="Ev3", source="mention"))
+    asyncio.run(handler.handle_action(top_click({"proposal_id": "pid-1", "category": "Family"}, message_ts="1700000100.000009")))
+    assert app.created == [] and [c["prompt"] for c in run.calls] == ["3", "네"]
+    assert key not in store.load().get("pending_events", {})
+    assert client.ephemerals == [{"channel": ROOM, "user": OWNER, "text": slack_bot.STALE_ACTION_TEXT}]
+
+
+def test_one_message_to_two_bots_gets_one_top_level_answer_from_each(tmp_path):
+    ids = {"update": "UUPDATE", "schedule": "USCHEDULE"}
+    handlers = {
+        persona: SlackHandler(
+            FakeSlackClient(),
+            persona=persona,
+            allowed_user_ids={OWNER},
+            sessions=ThreadSessions(tmp_path / "threads.json"),
+            run=FakeRun(TurnResult(text=f"{persona} 답", session_id=session), statuses=()),
+            bot_user_id=ids[persona],
+            our_bot_user_ids=set(ids.values()),
+            brief_room=ROOM,
+            clock=Clock(),
+        )
+        for persona, session in (("update", SESSION_1), ("schedule", SESSION_2))
+    }
+    event = room_mention("<@UUPDATE> <@USCHEDULE> 오늘 뭐 바뀌었고 일정은 뭐야?", client_msg_id="m-both")
+
+    async def scenario():
+        # Slack sends app_mention to each app; one of them gets it twice (a retry).
+        await asyncio.gather(*(h.handle_event(event, event_id=f"Ev-{p}", source="mention") for p, h in handlers.items()))
+        await handlers["update"].handle_event(event, event_id="Ev-update", source="mention")
+
+    asyncio.run(scenario())
+    for persona, handler in handlers.items():
+        [placeholder] = handler.client.posts
+        assert top_level([placeholder]) and handler.client.updates[-1]["text"] == f"{persona} 답"
+        assert len(handler.run.calls) == 1
+    assert handlers["update"].sessions.channel_session(ROOM, persona="update")[0] == SESSION_1
+    assert handlers["schedule"].sessions.channel_session(ROOM, persona="schedule")[0] == SESSION_2
+
+
+def test_bots_and_messages_without_a_mention_are_still_ignored_in_the_brief_channel(tmp_path):
+    handler, client, run = room_handler(tmp_path, our_bot_user_ids={"UUPDATE"})
+    events = [
+        (room_mention(bot_id="B1"), "mention"),  # a bot
+        (room_mention(user=BOT, ts="1700000000.000201"), "mention"),  # this bot
+        (room_mention(user="UUPDATE", ts="1700000000.000202"), "mention"),  # another of our bots
+        ({**room_mention("그냥 혼잣말", ts="1700000000.000203"), "type": "message", "channel_type": "group"}, "dm"),  # no mention
+    ]
+    for i, (event, source) in enumerate(events):
+        asyncio.run(handler.handle_event(event, event_id=f"Ev{i}", source=source))
+    assert client.calls == [] and run.calls == []
+
+
+def test_a_briefing_asked_at_the_top_level_of_the_brief_channel_stays_there(tmp_path):
+    relay = RecordingRelay()
+    clock = Clock()
+    handler, client, run = room_handler(tmp_path, clock=clock, briefing_relay=relay)
+    asyncio.run(handler.handle_event(room_mention(f"<@{BOT}>"), event_id="Ev1", source="mention"))
+    [call] = relay.calls
+    assert call["targets"] == [slack_bot.BriefTarget(channel=ROOM)] and call["clock"] is clock
+    # A crashed relay: the short note is at the top level too.
+    handler.briefing_relay = RecordingRelay(OSError("disk"))
+    asyncio.run(handler.handle_event(room_mention(f"<@{BOT}> 브리핑", ts="1700000000.000300"), event_id="Ev2", source="mention"))
+    assert [p["text"] for p in client.posts] == ["⚠️ 오늘 브리핑을 만들지 못했어요 (OSError). 실행 로그를 확인해 주세요."]
+    assert top_level(client.posts) and run.calls == []

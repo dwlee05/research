@@ -25,6 +25,9 @@ DEFAULT_LOOKBACK_DAYS = 1
 DEFAULT_STATE_FILE = ".mungchi_state.json"
 SLACK_THREADS_FILE = ".mungchi_slack_threads.json"
 DEFAULT_SLACK_MAX_CONCURRENT = 2
+# A top-level mention in the briefing channel continues the same bot's last
+# top-level conversation there if that one ended less than this many minutes ago.
+DEFAULT_CHANNEL_SESSION_IDLE_MINUTES = 60
 # Dropbox folder checked when DROPBOX_ROOT_FOLDER is unset or empty.
 DEFAULT_DROPBOX_ROOT_FOLDER = "/20_연구-진행"
 
@@ -499,6 +502,7 @@ def get_calendar_categories(env: Mapping[str, str] | None = None) -> list[Calend
 # DM ids with D. A member id as the briefing target posts to the app's DM.
 _SLACK_USER_ID_RE = re.compile(r"^[UW][A-Z0-9]{2,}$")
 _SLACK_CHANNEL_ID_RE = re.compile(r"^[CGDUW][A-Z0-9]{2,}$")
+_SLACK_ROOM_ID_RE = re.compile(r"^[CG][A-Z0-9]{2,}$")
 SLACK_README_HINT = "설정 방법은 README의 'Slack에서 부르기'를 보세요."
 
 # One Slack app per persona: (bot token env, app-level token env). Every pair
@@ -700,6 +704,27 @@ def slack_brief_problems(cfg: SlackConfig) -> list[str]:
             "보내니, U로 시작하는 멤버 ID만 적으세요."
         )
     return problems
+
+
+def brief_room(brief_channel: str) -> str:
+    """``SLACK_BRIEF_CHANNEL``'s value when it is a channel id (C…/G…), else "".
+
+    In that channel the bots answer a top-level mention at the top level and
+    keep one conversation per bot (``get_channel_session_idle_minutes``).
+    A member id (U…/W…) or a DM id (D…) never turns this on.
+    """
+    value = (brief_channel or "").strip()
+    return value if _SLACK_ROOM_ID_RE.match(value) else ""
+
+
+def get_channel_session_idle_minutes(env: Mapping[str, str] | None = None) -> int:
+    """``SLACK_CHANNEL_SESSION_IDLE_MINUTES`` (default 60); anything that is not a positive whole number keeps the default."""
+    raw = _get(env, "SLACK_CHANNEL_SESSION_IDLE_MINUTES")
+    try:
+        minutes = int(raw) if raw else DEFAULT_CHANNEL_SESSION_IDLE_MINUTES
+    except ValueError:
+        return DEFAULT_CHANNEL_SESSION_IDLE_MINUTES
+    return minutes if minutes > 0 else DEFAULT_CHANNEL_SESSION_IDLE_MINUTES
 
 
 def brief_destinations(cfg: SlackConfig) -> list[str]:
