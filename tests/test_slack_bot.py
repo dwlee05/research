@@ -791,7 +791,7 @@ def test_error_hints_name_each_bots_handle_env_vars_and_manifest(persona, handle
 
 @pytest.mark.parametrize(
     "persona,expected",
-    [("update", "공저자 업데이트 확인해줘"), ("schedule", "오늘과 내일 일정 알려줘")],
+    [("update", "Dropbox 업데이트 확인해줘"), ("schedule", "오늘과 내일 일정 알려줘")],
 )
 def test_direct_bot_empty_mention_defaults(tmp_path, persona, expected):
     handler, client, run = make_handler(tmp_path, persona=persona)

@@ -494,9 +494,10 @@ def _report_opening(when: BriefTime, others: str) -> str:
 def _update_report_prompt(when: BriefTime) -> str:
     return (
         _report_opening(when, "일정 보고는 일정이 따로 해.")
-        + "- check_dropbox_updates를 since_hours 없이(0) 한 번만 불러 공저자 업데이트를 확인해. "
+        + "- check_dropbox_updates를 since_hours 없이(0) 한 번만 불러 Dropbox 업데이트를 확인해. "
         "이번 실행은 브리핑이라 도구가 지난 브리핑 이후를 본다. 기간은 결과의 since_basis대로 써.\n"
-        f'- 업뎃다운 짧은 {when.period} 인사 한 줄(예: "업뎃 보고드립니다!")로 시작하고, 그다음은 네 형식(하위 폴더, 링크, '
+        f'- 업뎃다운 짧은 {when.period} 인사 한 줄(예: "업뎃 보고드립니다! Dropbox 업데이트 전해드려요 📂")로 시작하고, '
+        "그다음은 네 형식(하위 폴더, 링크, "
         "사람별 파일과 수정 시각)과 규칙을 그대로 따라. 변경이 없으면 그 한 줄이면 돼.\n"
         + ("" if when.period == MORNING else NOT_MORNING_RULE.format(period=when.period))
         + "- 날씨, 크레딧, 일정은 쓰지 말고, 다른 팀원을 부르거나 멘션하지 마. 짧게."

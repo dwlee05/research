@@ -388,7 +388,7 @@ def run_check(
 
 
 TOOL_DESCRIPTION = (
-    "DROPBOX_ROOT_FOLDER(기본 /20_연구-진행)와 그 하위 폴더 전체에서 공저자(나 제외)가 수정한 파일 목록만 확인한다. "
+    "DROPBOX_ROOT_FOLDER(기본 /20_연구-진행)와 그 하위 폴더 전체에서 다른 분(나 제외)이 수정한 파일 목록만 확인한다. "
     "하위 폴더 → 사람별로 파일 경로와 수정 시각, 하위 폴더 링크를 짧은 JSON으로 돌려준다. "
     f"파일 내용·diff는 읽지 않는다. 최근 {MAX_LISTED_FILES}개를 넘는 파일은 개수(omitted)만 준다. "
     "임시·잠금 파일(~$…, .~lock.…, .DS_Store, *.tmp, *.swp 등)은 처음부터 뺀다. "

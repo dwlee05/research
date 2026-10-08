@@ -43,7 +43,7 @@ def test_slack_prompt_covers_mrkdwn_rules():
 def test_mrkdwn_converts_bold_headings_links_and_bullets():
     md = "\n".join(
         [
-            "### ① 공저자 업데이트",
+            "### ② Dropbox 업데이트",
             "## **굵은 제목** ##",
             "* **김OO**: 서론 수정 ([커밋](https://example.com/c/1))",
             "+ 두 번째",
@@ -52,7 +52,7 @@ def test_mrkdwn_converts_bold_headings_links_and_bullets():
         ]
     )
     assert to_mrkdwn(md).split("\n") == [
-        "*① 공저자 업데이트*",
+        "*② Dropbox 업데이트*",
         "*굵은 제목*",
         "• *김OO*: 서론 수정 (<https://example.com/c/1|커밋>)",
         "• 두 번째",

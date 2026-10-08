@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mungchi"
 version = "0.1.0"
-description = "고뭉치 비서실: 공저자 업데이트(업뎃)와 캘린더 일정('일정')을 챙겨 주는 Claude Agent SDK 멀티 에이전트 비서"
+description = "고뭉치 비서실: Dropbox 업데이트(업뎃)와 캘린더 일정('일정')을 챙겨 주는 Claude Agent SDK 멀티 에이전트 비서"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

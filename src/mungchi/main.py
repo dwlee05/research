@@ -79,7 +79,7 @@ SERVICE_COMMAND = "service"
 
 CHAT_GREETINGS = {
     MUNGCHI: "고뭉치 비서실입니다. 무엇을 도와드릴까요? (끝내려면 exit 또는 종료)",
-    UPDATE: "업뎃입니다. 공저자 업데이트(Dropbox)를 확인해 드릴게요. (끝내려면 exit 또는 종료)",
+    UPDATE: "업뎃입니다. Dropbox 업데이트를 확인해 드릴게요. (끝내려면 exit 또는 종료)",
     SCHEDULE: "'일정'입니다. 캘린더 일정과 오늘·내일 날씨를 확인해 드릴게요. (끝내려면 exit 또는 종료)",
 }
 
@@ -699,14 +699,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = KoreanArgumentParser(
         prog="mungchi",
         description=(
-            "고뭉치 비서실: 업뎃(공저자 업데이트)과 '일정'(캘린더·날씨)에게 일을 맡기는 연구 비서.\n"
+            "고뭉치 비서실: 업뎃(Dropbox 업데이트)과 '일정'(캘린더·날씨)에게 일을 맡기는 연구 비서.\n"
             "Chat KHU 크레딧('토큰')과 오늘·내일 날씨는 고뭉치가 직접 확인합니다(get_credits, get_weather)."
         ),
         epilog=(
             "예시:\n"
             "  python -m mungchi                       # 대화 모드\n"
             "  python -m mungchi --brief               # 오늘 브리핑: [고뭉치] 인사·날씨·크레딧, [업뎃] Dropbox, [일정] 오늘 일정\n"
-            '  python -m mungchi "어제 공저자들이 뭐 고쳤어?"   # 질문 한 번\n'
+            '  python -m mungchi "어제 Dropbox에서 뭐 바뀌었어?"   # 질문 한 번\n'
             '  python -m mungchi "날씨랑 토큰 좀 알려줘"      # 고뭉치가 날씨와 Chat KHU 크레딧을 직접 확인\n'
             "  python -m mungchi slack                 # Slack 봇 실행 (Socket Mode, BRIEF_TIME이 있으면 아침 브리핑도)\n"
             "  python -m mungchi --brief --slack       # 오늘 브리핑을 지금 바로 Slack에 올리기 (아침 브리핑 시험용)\n"

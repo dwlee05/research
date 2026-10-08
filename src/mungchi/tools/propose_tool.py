@@ -81,7 +81,7 @@ INPUT_SCHEMA: dict[str, Any] = {
             "type": "string",
             "description": (
                 "추천 카테고리 하나(사용자가 고른다). Family: 가족·개인 일. Teaching: 강의·수업·학생·채점·조교(TA)·시험. "
-                "Research: 논문·공저자·실험·IRB·연구 회의. Event-KHU: 경희대 안의 회의·행사, 학과·단과대 행사(예: 신임교수모임). "
+                "Research: 논문·공동 연구·실험·IRB·연구 회의. Event-KHU: 경희대 안의 회의·행사, 학과·단과대 행사(예: 신임교수모임). "
                 "Event-Outside: 경희대 밖의 학회·워크숍·세미나·외부 행사. 애매하면 넣지 않는다."
             ),
         },

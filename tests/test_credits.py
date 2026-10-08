@@ -449,7 +449,7 @@ def test_decomposed_hangul_is_normalized_before_matching():
         "크레딧 아끼려면 어떻게 해?",
         "크레딧이 뭐야?",
         "크레딧 많이 쓰는 모델이 뭐야",
-        "어제 공저자들이 뭐 고쳤어?",
+        "어제 Dropbox에서 누가 뭐 고쳤어?",
         "사용량 줄이는 법",
         "오늘 일정 알려줘",
         "credits please explain how billing works",

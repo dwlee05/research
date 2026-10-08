@@ -639,7 +639,7 @@ def test_dropbox_check_without_hours_shows_24h_and_the_briefing_checkpoint(tmp_p
     assert lines[period + 1 : period + 3] == [
         "브리핑 기준 시각: 2026-10-03 09:00 (Asia/Seoul) 이후 — --brief가 Dropbox를 마지막으로 확인한 때 "
         "(이 시각은 브리핑만 바꿉니다)",
-        "  - 지금 브리핑하면 나올 공저자 파일: 2개",  # intro.tex and refs.bib
+        "  - 지금 브리핑하면 업뎃이 알려 줄 파일: 2개",  # intro.tex and refs.bib
     ]
     assert "기간 안에 바뀐 파일: 3개" in lines and "  - 포함: 1개 (업뎃이 알려 주는 파일)" in lines
     assert [row[0] for row in table_after(out, "기간 안에 바뀐 파일 (최근 수정 순")[1:]] == [
@@ -656,7 +656,7 @@ def test_dropbox_check_without_hours_shows_24h_and_the_briefing_checkpoint(tmp_p
     assert code == 0
     assert (
         "브리핑 기준 시각: 기록 없음 — 다음 브리핑은 최근 3일(LOOKBACK_DAYS)을 봅니다 (이 시각은 브리핑만 바꿉니다)\n"
-        "  - 지금 브리핑하면 나올 공저자 파일: 3개\n"  # old.tex (10-02 18:00) is inside 3 days
+        "  - 지금 브리핑하면 업뎃이 알려 줄 파일: 3개\n"  # old.tex (10-02 18:00) is inside 3 days
     ) in out
     assert not (fresh / "state.json").exists()  # nothing written
 

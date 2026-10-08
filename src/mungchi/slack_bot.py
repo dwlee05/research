@@ -130,7 +130,7 @@ NO_MUNGCHI_BRIEF_WARNING = (
 # What a bare mention (no text) asks 업뎃 and 일정 for. 고뭉치's is today's
 # briefing, built by code like the morning one (``SlackHandler.wants_briefing``).
 EMPTY_MENTION_PROMPTS = {
-    UPDATE: "공저자 업데이트 확인해줘",
+    UPDATE: "Dropbox 업데이트 확인해줘",
     SCHEDULE: "오늘과 내일 일정 알려줘",
 }
 

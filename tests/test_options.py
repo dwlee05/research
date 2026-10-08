@@ -224,7 +224,7 @@ SCRIPT = [
         model="m",
     ),
     AssistantMessage(content=[TextBlock(text="업뎃 내부 보고")], model="m", parent_tool_use_id="t1"),
-    AssistantMessage(content=[TextBlock(text="*① 공저자 업데이트*\n• 변경 없음")], model="m"),
+    AssistantMessage(content=[TextBlock(text="*② Dropbox 업데이트*\n• 변경 없음")], model="m"),
     ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1, is_error=False, num_turns=2, session_id="sess-final"),
 ]
 
@@ -272,7 +272,7 @@ def test_run_turn_resumes_reports_status_and_returns_answer(fake_sdk, capsys):
     result = asyncio.run(run_turn("질문", resume="sess-0", on_status=on_status, extra_system_prompt="## Slack 규칙"))
     assert isinstance(result, TurnResult)
     # Preamble before the delegation and subagent-internal text are not part of the answer.
-    assert result.text == "*① 공저자 업데이트*\n• 변경 없음"
+    assert result.text == "*② Dropbox 업데이트*\n• 변경 없음"
     assert result.session_id == "sess-final"
     assert not result.failed and result.error is None
     assert seen == ["→ 업뎃이에게 물어보는 중..."]
@@ -313,12 +313,12 @@ def test_build_options_defaults_have_no_resume_and_no_extra_prompt():
 
 
 def test_cli_one_shot_output_is_unchanged(fake_sdk, capsys):
-    assert main(["어제 공저자들이 뭐 고쳤어?"]) == 0
+    assert main(["어제 Dropbox에서 누가 뭐 고쳤어?"]) == 0
     out, err = capsys.readouterr()
-    assert out == "업뎃에게 맡길게요.\n*① 공저자 업데이트*\n• 변경 없음\n"
+    assert out == "업뎃에게 맡길게요.\n*② Dropbox 업데이트*\n• 변경 없음\n"
     assert err == "→ 업뎃이에게 물어보는 중...\n"
     [client] = fake_sdk.instances
-    assert [without_now_line(p) for p in client.prompts] == ["어제 공저자들이 뭐 고쳤어?"]
+    assert [without_now_line(p) for p in client.prompts] == ["어제 Dropbox에서 누가 뭐 고쳤어?"]
     assert client.options.resume is None
     assert "Slack 출력" not in client.options.system_prompt
 
@@ -398,7 +398,7 @@ def test_update_prompts_turn_periods_into_since_hours_and_explain_empty_results(
         ):
             assert key in prompt
         assert "last_check" not in prompt and "마지막 확인" not in prompt
-        assert "최근 24시간 동안 공저자가 바꾼 파일이 없어요" in prompt
+        assert "Dropbox 업데이트 없음: 최근 24시간 동안 바뀐 파일이 없어요" in prompt
         assert "지난 브리핑(10/06 07:50) 이후 바뀐 파일이 없어요" in prompt
         assert "기간 안에 바뀐 파일 5개는 모두 내가 수정했어요" in prompt
         assert "수정한 사람을 알 수 없어 뺐어요 (공유 폴더가 아닌 곳에 있을 수 있어요)" in prompt
@@ -435,7 +435,7 @@ def test_the_dropbox_window_is_explained_from_since_basis_only():
         assert "Dropbox <folder> (<기간>, 파일 total_files개)" in prompt and "(since 이후," not in prompt
         # Every no-result line names its window the same way.
         assert "지난 브리핑 기록이 없어 최근 24시간 기준으로 봤는데, 바뀐 파일이 없어요" in prompt
-        assert "공저자 변경 없음 (Dropbox, 최근 24시간 기준): 기간 안에 바뀐 파일 5개는 모두 내가 수정했어요" in prompt
+        assert "Dropbox 업데이트 없음 (최근 24시간 기준): 기간 안에 바뀐 파일 5개는 모두 내가 수정했어요" in prompt
         assert "since_basis가 default_24h, briefing_checkpoint, lookback_default이면 같은 줄 끝에" in prompt
         assert "since_basis가 since_hours나 lookback_default" not in prompt
     # 고뭉치 relays 업뎃's wording and never guesses why the window is what it is.
@@ -754,7 +754,7 @@ def test_old_env_with_overleaf_and_my_lines_still_works(tmp_path, monkeypatch, f
         monkeypatch.setenv(key, "")
         monkeypatch.delenv(key)
 
-    assert main(["--agent", "update", "공저자 업데이트 확인해줘"]) == 0
+    assert main(["--agent", "update", "Dropbox 업데이트 확인해줘"]) == 0
     assert os.environ["OVERLEAF_GIT_TOKEN"] == "olp_not-a-real-token"  # loaded from .env, then ignored
     [client] = fake_sdk.instances
     assert client.options.allowed_tools == [DROPBOX_TOOL, PROPOSE_TOOL]
@@ -904,7 +904,7 @@ def _dropbox_mode(tools, monkeypatch) -> bool:
 def test_only_the_brief_run_gets_a_briefing_dropbox_tool(fake_sdk, server_tools, monkeypatch, capsys):
     assert main(["--brief"]) == 0  # the relay: 업뎃's report run (briefing mode) and 일정's (no Dropbox tool at all)
     assert len(server_tools) == 2 and not any(t.name == "check_dropbox_updates" for t in server_tools[1])
-    assert main(["어제 공저자들이 뭐 고쳤어?"]) == 0
+    assert main(["어제 Dropbox에서 누가 뭐 고쳤어?"]) == 0
     assert main(["--agent", "update", "누가 무슨 파일 고쳤어?"]) == 0
     asyncio.run(run_turn("업데이트 알려줘", extra_system_prompt=SLACK_FORMAT_PROMPT))  # a Slack turn
     with_dropbox = [tools for tools in server_tools if any(t.name == "check_dropbox_updates" for t in tools)]
@@ -1229,7 +1229,7 @@ def test_prompts_propose_and_end_with_the_exact_question():
         for line in (
             "- Family: 가족·개인 일",
             "- Teaching: 강의, 수업, 학생, 채점, 조교(TA), 시험",
-            "- Research: 논문, 공저자, 실험, IRB, 연구 회의",
+            "- Research: 논문, 공동 연구, 실험, IRB, 연구 회의",
             "- Event-KHU: 경희대 안의 회의·행사, 학과·단과대 행사(예: 신임교수모임)",
             "- Event-Outside: 경희대 밖의 학회, 워크숍, 세미나, 외부 행사",
         ):

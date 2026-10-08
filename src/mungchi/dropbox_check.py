@@ -170,7 +170,7 @@ def run_dropbox_check(
         else:
             when = f"기록 없음 — 다음 브리핑은 최근 {lookback_days}일(LOOKBACK_DAYS)을 봅니다"
         say(f"브리핑 기준 시각: {when} (이 시각은 브리핑만 바꿉니다)")
-        say(f"  - 지금 브리핑하면 나올 공저자 파일: {_included(brief_stats)}개")
+        say(f"  - 지금 브리핑하면 업뎃이 알려 줄 파일: {_included(brief_stats)}개")
     say(f"훑어본 파일: {stats['scanned']}개 (하위 폴더 포함)")
     say(
         f"  - {DECISION_LABELS[EXCLUDED_TEMP]}: {stats['excluded_temp']}개 "

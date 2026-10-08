@@ -45,7 +45,7 @@ from mungchi.state import StateStore
 SEOUL = ZoneInfo("Asia/Seoul")
 UPDATE_SESSION = "22222222-2222-2222-2222-222222222222"
 SCHEDULE_SESSION = "33333333-3333-3333-3333-333333333333"
-UPDATE_REPORT = "업뎃 보고드립니다!\n공저자 변경 없음 (Dropbox): 지난 브리핑(10/07 07:00) 이후 바뀐 파일이 없어요"
+UPDATE_REPORT = "업뎃 보고드립니다!\nDropbox 업데이트 없음: 지난 브리핑(10/07 07:00) 이후 바뀐 파일이 없어요"
 SCHEDULE_REPORT = "좋은 아침이에요! 오늘은 여유로운 편이에요 😊\n10/08 (목)\n• 10:00–11:00 랩 미팅 (302호)"
 GREETING = "똑똑! 🚪 10월 8일(목) 아침이에요. 오늘도 같이 챙겨 볼게요!"
 
@@ -468,7 +468,8 @@ def test_the_real_greeting_call_is_one_tool_less_turn(monkeypatch):
 def test_report_prompts_ask_for_their_own_part_only():
     update, schedule_ = report_prompt("update", scheduled(8, 7)), report_prompt("schedule", scheduled(8, 7))
     assert "since_hours 없이(0)" in update and "지난 브리핑 이후" in update and "since_basis" in update
-    assert '"업뎃 보고드립니다!"' in update
+    assert '(예: "업뎃 보고드립니다! Dropbox 업데이트 전해드려요 📂")' in update
+    assert "한 번만 불러 Dropbox 업데이트를 확인해." in update and "공저자" not in update
     assert 'date="2026-10-08", days=1' in schedule_ and "오늘(2026-10-08 (목요일))" in schedule_
     assert "get_weather는 부르지 마" in schedule_
     for prompt in (update, schedule_):

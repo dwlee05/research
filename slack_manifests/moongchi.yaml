@@ -4,7 +4,7 @@
 # 토큰은 SLACK_BOT_TOKEN(xoxb-)과 SLACK_APP_TOKEN(xapp-)에 넣습니다.
 display_information:
   name: 비서실 고뭉치
-  description: 업뎃과 '일정'에게 일을 맡겨 공저자 업데이트와 캘린더를 함께 브리핑해 주는 연구 비서실장
+  description: 업뎃과 '일정'에게 일을 맡겨 Dropbox 업데이트와 캘린더를 함께 브리핑해 주는 연구 비서실장
   background_color: "#3b4a5a"
 features:
   app_home:
