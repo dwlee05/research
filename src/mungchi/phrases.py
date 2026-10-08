@@ -7,9 +7,10 @@ every message the same way:
 * ``WEATHER_LEADS`` / ``CREDIT_LEADS`` / ``BOTH_LEADS``: one line in front of
   the weather and credit shortcut replies. They only say that the bot
   checked; the data line under them is code's and never changes.
-* The relay morning briefing (``briefing``): 고뭉치's fallback greetings
-  (when the small LLM greeting fails), its hand-off lines to 업뎃이 and
-  일정이, and 업뎃's / 일정's short apology when their part could not be made.
+* The relay briefing (``briefing``): 고뭉치's fallback greetings (when the
+  small LLM greeting fails) and its hand-off lines to 업뎃이 and 일정이, one
+  pool per time of day (아침, 오후, 저녁, 밤), and 업뎃's / 일정's short
+  apology when their part could not be made.
 
 Voices: 고뭉치 is a warm, slightly playful chief of staff (0–2 emoji),
 업뎃 a tidy, earnest research assistant (📂 at most), 일정 a bright,
@@ -72,39 +73,105 @@ BOTH_LEADS: dict[str, tuple[str, ...]] = {
 }
 
 
-# ---------------------------------------------------------------- the relay morning briefing
+# ---------------------------------------------------------------- the relay briefing
 #
+# The wording follows the time of day (``briefing.BriefTime``): the scheduled
+# briefing is always 아침; one asked for by hand follows the clock (아침
+# 05:00–10:59, 오후 11:00–16:59, 저녁 17:00–20:59, 밤 21:00–04:59). Every
+# pool below has one entry per time of day, and no line names another time.
+
+MORNING = "아침"
+AFTERNOON = "오후"
+EVENING = "저녁"
+NIGHT = "밤"
+TIMES_OF_DAY: tuple[str, ...] = (MORNING, AFTERNOON, EVENING, NIGHT)
+
 # Greeting templates are formatted with: {date} "2026년 10월 8일(목)",
 # {short} "10월 8일(목)", {md} "10월 8일", {wd} "목요일". Every one keeps
-# the date, so a fallback greeting is always correct.
+# the date, so a fallback greeting is always correct. The 밤 ones never put
+# "밤" right after the date: after midnight that would read as the coming night.
 
-GREETING_TEMPLATES: tuple[str, ...] = (
-    "똑똑! 🚪 {date} 아침 브리핑입니다~",
-    "좋은 아침이에요! {md} {wd} 브리핑 시작할게요 🙂",
-    "안녕하세요, 고뭉치예요. {short} 아침 소식 챙겨 왔어요!",
-    "{short} 아침이 밝았어요. 오늘도 차근차근 같이 챙겨 봐요 ✨",
-    "똑똑, 고뭉치예요! {date} 아침 브리핑 들어갑니다.",
-)
-WEEKEND_GREETING_TEMPLATES: tuple[str, ...] = (
-    "주말 아침이에요! {short} 브리핑 살짝 놓고 갈게요 🙂",
-    "똑똑! 🚪 {short} 주말 아침 브리핑이에요. 편하게 보세요~",
-)
-MONDAY_GREETING_TEMPLATES: tuple[str, ...] = ("한 주의 시작이에요! {short} 아침 브리핑입니다 💪",)
+GREETING_TEMPLATES: dict[str, tuple[str, ...]] = {
+    MORNING: (
+        "똑똑! 🚪 {date} 아침 브리핑입니다~",
+        "좋은 아침이에요! {md} {wd} 브리핑 시작할게요 🙂",
+        "안녕하세요, 고뭉치예요. {short} 아침 소식 챙겨 왔어요!",
+        "{short} 아침이 밝았어요. 오늘도 차근차근 같이 챙겨 봐요 ✨",
+        "똑똑, 고뭉치예요! {date} 아침 브리핑 들어갑니다.",
+    ),
+    AFTERNOON: (
+        "똑똑! 🚪 {date} 오후 브리핑입니다~",
+        "안녕하세요, 고뭉치예요. {md} {wd} 오후 브리핑 시작할게요 🙂",
+        "{short} 오후예요. 지금까지 소식 챙겨 왔어요!",
+        "오후도 힘내요! {short} 브리핑 들어갑니다 ✨",
+        "똑똑, 고뭉치예요! {date} 오후 소식 전해 드릴게요.",
+    ),
+    EVENING: (
+        "똑똑! 🚪 {date} 저녁 브리핑이에요~",
+        "오늘 하루도 수고 많으셨어요! {md} {wd} 저녁 브리핑 시작할게요 🙂",
+        "안녕하세요, 고뭉치예요. {short} 저녁 소식 챙겨 왔어요!",
+        "{short} 저녁이에요. 오늘 정리하고 내일도 같이 챙겨 봐요 ✨",
+        "똑똑, 고뭉치예요! {date} 저녁 브리핑 들어갑니다.",
+    ),
+    NIGHT: (
+        "똑똑! 🚪 늦은 시간이네요. {short} 브리핑 살짝 놓고 갈게요 🌙",
+        "늦게까지 수고 많으세요. {md} {wd} 브리핑 짧게 전할게요 🙂",
+        "안녕하세요, 고뭉치예요. 밤늦게 {short} 브리핑 챙겨 왔어요.",
+        "똑똑, 고뭉치예요! {date} 브리핑, 조용히 들어갑니다 🌙",
+    ),
+}
+WEEKEND_GREETING_TEMPLATES: dict[str, tuple[str, ...]] = {
+    MORNING: (
+        "주말 아침이에요! {short} 브리핑 살짝 놓고 갈게요 🙂",
+        "똑똑! 🚪 {short} 주말 아침 브리핑이에요. 편하게 보세요~",
+    ),
+    AFTERNOON: ("주말 오후예요! {short} 브리핑 살짝 놓고 갈게요 🙂",),
+    EVENING: ("주말 저녁이에요! {short} 브리핑 편하게 보세요~",),
+    NIGHT: ("편안한 주말 보내고 계세요? {short} 브리핑 살짝 놓고 갈게요 🌙",),
+}
+MONDAY_GREETING_TEMPLATES: dict[str, tuple[str, ...]] = {
+    MORNING: ("한 주의 시작이에요! {short} 아침 브리핑입니다 💪",),
+}
 
 # 고뭉치 hands over to the other two. {bots}: Slack mentions ("<@U1> <@U2>")
 # or, in the terminal, their names ("업뎃이, 일정이").
-HANDOFF_TEMPLATES: tuple[str, ...] = (
-    "{bots} 아침 보고 부탁해요!",
-    "그럼 {bots} 차례예요. 오늘 소식 들려주세요 🙌",
-    "{bots} 이어서 부탁할게요~",
-    "이제 {bots} 보고 들어볼까요?",
-)
+HANDOFF_TEMPLATES: dict[str, tuple[str, ...]] = {
+    MORNING: (
+        "{bots} 아침 보고 부탁해요!",
+        "그럼 {bots} 차례예요. 오늘 소식 들려주세요 🙌",
+        "{bots} 이어서 부탁할게요~",
+        "이제 {bots} 보고 들어볼까요?",
+    ),
+    AFTERNOON: (
+        "{bots} 오후 보고 부탁해요!",
+        "그럼 {bots} 차례예요. 지금까지 소식 들려주세요 🙌",
+        "{bots} 이어서 부탁할게요~",
+        "이제 {bots} 보고 들어볼까요?",
+    ),
+    EVENING: (
+        "{bots} 오늘 소식 정리 부탁해요!",
+        "{bots} 저녁 보고 부탁해요!",
+        "그럼 {bots} 차례예요. 오늘 하루 정리해 주세요 🙌",
+        "이제 {bots} 보고 들어볼까요?",
+    ),
+    NIGHT: (
+        "{bots} 늦은 시간이지만 보고 부탁해요 🌙",
+        "그럼 {bots} 차례예요. 짧게 정리해 주세요~",
+        "{bots} 이어서 부탁할게요~",
+        "이제 {bots} 보고 들어볼까요?",
+    ),
+}
 # DM mode: each bot reports in its own DM. {names}: "업뎃이와 일정이는", "업뎃이는", ...
-DM_HANDOFF_TEMPLATES: tuple[str, ...] = (
-    "{names} 각자 DM으로 아침 보고를 드릴 거예요 📬",
+_DM_HANDOFF_ANY_TIME = (
     "{names} 자기 DM에서 따로 보고드릴 거예요!",
     "이어서 {names} 각자 DM으로 찾아갈 거예요 🙂",
 )
+DM_HANDOFF_TEMPLATES: dict[str, tuple[str, ...]] = {
+    MORNING: ("{names} 각자 DM으로 아침 보고를 드릴 거예요 📬", *_DM_HANDOFF_ANY_TIME),
+    AFTERNOON: ("{names} 각자 DM으로 오후 보고를 드릴 거예요 📬", *_DM_HANDOFF_ANY_TIME),
+    EVENING: ("{names} 각자 DM으로 오늘 소식을 정리해 드릴 거예요 📬", *_DM_HANDOFF_ANY_TIME),
+    NIGHT: ("{names} 각자 DM으로 짧게 보고드릴 거예요 🌙", *_DM_HANDOFF_ANY_TIME),
+}
 
 # 업뎃 / 일정 when their part could not be made. {reason}: short, already scrubbed.
 APOLOGY_TEMPLATES: dict[str, tuple[str, ...]] = {

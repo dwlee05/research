@@ -469,10 +469,11 @@ def test_a_briefing_in_conversation_has_all_four_parts():
     # The morning reports' prompts are per run (with the date), never in a cached system prompt.
     from mungchi import briefing
 
+    when = briefing.BriefTime.at(NOW)
     for persona in ("update", "schedule"):
-        report = briefing.report_prompt(persona, NOW)
+        report = briefing.report_prompt(persona, when)
         assert report not in prompt and report not in build_options(env={}, persona=persona).system_prompt
-    assert "2026-10-05" in briefing.report_prompt("schedule", NOW) and "2026-10-05" not in prompt
+    assert "2026-10-05" in briefing.report_prompt("schedule", when) and "2026-10-05" not in prompt
 
 
 def test_folder_link_example_line_is_in_every_prompt_that_writes_one():

@@ -1,4 +1,4 @@
-"""The morning briefing as a relay: 고뭉치 greets and hands off, 업뎃 and 일정 report their own parts.
+"""The briefing as a relay: 고뭉치 greets and hands off, 업뎃 and 일정 report their own parts.
 
 ``python -m mungchi --brief`` (terminal), ``--brief --slack``, the scheduled
 morning briefing of the running Slack bots (``BRIEF_TIME``) and a short
@@ -17,16 +17,27 @@ Everything starts at once: the weather and the credits in worker threads,
 The callers deliver the parts in that order as each one is ready; weather
 and credits only ever appear in 고뭉치's part.
 
+* **Time of day** (``BriefTime``, from the injected clock): the scheduled
+  briefing is always 아침, even a late catch-up. A briefing asked for by
+  hand (Slack, ``--brief``, ``--brief --slack``) follows the local clock:
+  아침 05:00–10:59, 오후 11:00–16:59, 저녁 17:00–20:59, 밤 21:00–04:59.
+  The greeting, the hand-off and 업뎃's / 일정's framing all use it, and
+  from 17:00 to midnight a manual briefing's 일정 also covers tomorrow
+  (``days=2``, both dates from code).
 * **Greeting**: one tool-less turn with a tiny constant system prompt
-  (``GREETING_SYSTEM_PROMPT``). Its user prompt holds today's date, a
-  weekday/weekend note, the weather in words (numbers removed) and the last
-  greeting, which the model is told not to repeat. The answer is checked
-  (``valid_greeting``: today's month/day present, no other date, year or
-  weekday, no other numbers, short); a failure, a timeout (30 s) or an
-  invalid answer falls back to a template (``phrases.GREETING_TEMPLATES``).
-  The greeting used is stored in the state file (``last_greeting``).
+  (``GREETING_SYSTEM_PROMPT``). Its user prompt holds the time of day and
+  the current time, today's date, a weekday/weekend note, the weather in
+  words (numbers removed) and the last greeting, which the model is told
+  not to repeat. The answer is checked (``valid_greeting``: today's
+  month/day present, no other date, year or weekday, no other numbers, no
+  word of another time of day, short); a failure, a timeout (30 s) or an
+  invalid answer falls back to a template for that time of day
+  (``phrases.GREETING_TEMPLATES``). Only the scheduled briefing stores the
+  greeting it used (``last_greeting``), so the next morning's is compared
+  with this morning's; every run is told not to repeat the stored one.
 * **업뎃**: ``briefing=True``, so its Dropbox tool looks at the time since the
-  last briefing and moves that checkpoint. **일정**: today only.
+  last briefing and moves that checkpoint. **일정**: today only, or today's
+  rest and tomorrow for a manual briefing from 17:00 to midnight.
 * A failed or timed-out (15 min in Slack) report becomes a short apology in
   that bot's voice with a scrubbed reason; the other parts go out anyway.
 
@@ -44,13 +55,14 @@ import re
 import sys
 import unicodedata
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Mapping, Sequence, TextIO
 
 from . import config, credits, phrases, weather
 from .agents import ACCURACY_RULE, VOICES
 from .main import TurnResult, run_plain_turn, run_turn
 from .personas import MUNGCHI, PERSONA_LABELS, SCHEDULE, UPDATE, josa
+from .phrases import AFTERNOON, EVENING, MORNING, NIGHT, TIMES_OF_DAY
 from .slack_format import SLACK_FORMAT_PROMPT, WEEKDAYS_KO
 from .state import StateStore
 from .tools.common import safe_error, scrub
@@ -118,6 +130,52 @@ def brief_due(schedule: config.BriefSchedule, now: datetime, last_brief_date: st
     ):
         return MISSED
     return DUE
+
+
+# ---------------------------------------------------------------- time of day
+
+# A briefing asked for by hand from this hour until midnight also covers tomorrow's schedule.
+TOMORROW_FROM_HOUR = 17
+
+
+def time_of_day(now: datetime) -> str:
+    """The time of day of a local wall-clock time: 아침 05:00–10:59, 오후 11:00–16:59, 저녁 17:00–20:59, 밤 21:00–04:59."""
+    if 5 <= now.hour < 11:
+        return MORNING
+    if 11 <= now.hour < 17:
+        return AFTERNOON
+    if 17 <= now.hour < 21:
+        return EVENING
+    return NIGHT
+
+
+@dataclass(frozen=True)
+class BriefTime:
+    """When one relay briefing runs: the local time, whether it is the scheduled one, and its time of day.
+
+    Made once per relay from the injected clock (``BriefTime.at``) and passed
+    to every part. The scheduled briefing (``BRIEF_TIME``) is always 아침,
+    even a late catch-up; a manual one (Slack request, ``--brief``,
+    ``--brief --slack``) follows the clock (``time_of_day``).
+    """
+
+    now: datetime  # in TIMEZONE
+    scheduled: bool
+    period: str  # 아침, 오후, 저녁 or 밤
+
+    @classmethod
+    def at(cls, now: datetime, *, scheduled: bool = False) -> "BriefTime":
+        return cls(now, scheduled, MORNING if scheduled else time_of_day(now))
+
+    @property
+    def clock(self) -> str:
+        """``17:50``."""
+        return f"{self.now:%H:%M}"
+
+    @property
+    def schedule_days(self) -> int:
+        """일정's ``days``: 2 (today and tomorrow) for a manual briefing from 17:00 to 23:59, else 1 (today)."""
+        return 2 if not self.scheduled and self.now.hour >= TOMORROW_FROM_HOUR else 1
 
 
 # ---------------------------------------------------------------- weather and credits (code, no LLM)
@@ -193,8 +251,9 @@ def date_fields(day: date | datetime) -> dict[str, str]:
     return {"date": f"{day.year}년 {md}({weekday})", "short": f"{md}({weekday})", "md": md, "wd": f"{weekday}요일"}
 
 
+# Constant (no date, no time, no time of day): the time of day and the clock go in the user prompt.
 GREETING_SYSTEM_PROMPT = (
-    "너는 한 연구자의 비서실장 '고뭉치'다. 아침 브리핑을 여는 인사만 쓴다. 날씨 줄과 Chat KHU 크레딧은 프로그램이, "
+    "너는 한 연구자의 비서실장 '고뭉치'다. 브리핑을 여는 인사만 쓴다. 날씨 줄과 Chat KHU 크레딧은 프로그램이, "
     "Dropbox 소식과 오늘 일정은 팀원 업뎃과 일정이 따로 전한다.\n\n"
     "## 말투\n" + VOICES[MUNGCHI] + "\n\n"
     "## 규칙\n"
@@ -218,8 +277,29 @@ def weather_words(line: str) -> str:
     return " · ".join(part for part in parts if part and not re.search(r"\d", part) and weather.FAILED_NOTE not in part)
 
 
-def greeting_prompt(now: datetime, *, weather_text: str = "", previous: str | None = None) -> str:
-    """The greeting's user prompt: today's date (from code), a weekday note, the weather in words, the last greeting."""
+# What a greeting for each time of day may sound like (in the user prompt only).
+GREETING_EXAMPLES = {
+    MORNING: '"좋은 아침이에요", "아침 브리핑입니다"',
+    AFTERNOON: '"오후 브리핑 시작할게요", "오후도 힘내요"',
+    EVENING: '"저녁 브리핑이에요~", "오늘 하루도 수고 많으셨어요"',
+    NIGHT: '"늦은 시간까지 수고 많으세요", "브리핑 짧게 전할게요"',
+}
+
+# Words that name a time of day: a greeting may use only its own time's words.
+TIME_WORDS = {MORNING: ("아침", "모닝"), AFTERNOON: ("오후",), EVENING: ("저녁",), NIGHT: ("밤",)}
+
+
+def other_time_words(text: str, period: str) -> list[str]:
+    """The words in ``text`` that name a time of day other than ``period`` ("좋은 아침" in the evening, ...)."""
+    return [word for other, words in TIME_WORDS.items() if other != period for word in words if word in text]
+
+
+def greeting_prompt(
+    now: datetime, *, period: str | None = None, weather_text: str = "", previous: str | None = None
+) -> str:
+    """The greeting's user prompt: the time of day and the time, today's date (from code), a weekday note,
+    the weather in words, the last greeting. ``period`` defaults to the clock's time of day."""
+    period = period or time_of_day(now)
     fields = date_fields(now)
     if now.weekday() >= 5:
         day_note = f"오늘은 주말({fields['wd']})이에요."
@@ -227,8 +307,15 @@ def greeting_prompt(now: datetime, *, weather_text: str = "", previous: str | No
         day_note = "오늘은 한 주를 시작하는 월요일이에요."
     else:
         day_note = "오늘은 평일이에요."
+    others = "·".join(f"'{other}'" for other in TIMES_OF_DAY if other != period)
     lines = [
-        "오늘 아침 브리핑을 여는 인사를 1~2문장으로 써 줘.",
+        f"{period} 브리핑을 여는 인사를 1~2문장으로 써 줘.",
+        f"- 지금: {period} 브리핑 ({now:%H:%M}). {period}에 맞는 인사로 써 줘(예: {GREETING_EXAMPLES[period]}). 시각은 쓰지 마.",
+        f"- {others} 같은 다른 때를 가리키는 말은 쓰지 마.",
+    ]
+    if period == NIGHT and now.hour < 5:
+        lines.append("- 자정을 넘긴 늦은 밤이에요. 날짜 바로 뒤에 '밤'을 붙이지 마(그날 밤으로 읽혀요).")
+    lines += [
         f"- 오늘 날짜: {now.year}년 {fields['md']} {fields['wd']} (짧게 쓰면 {fields['short']})",
         f"- {day_note}",
         f"- 날씨 요약: {weather_words(weather_text) or '없음'}",
@@ -251,16 +338,20 @@ def clean_greeting(text: str | None) -> str:
     return "\n".join(line.strip(_QUOTES).strip() for line in lines if line.strip())
 
 
-def valid_greeting(text: str, now: datetime) -> bool:
+def valid_greeting(text: str, now: datetime, period: str | None = None) -> bool:
     """True when ``text`` is a short greeting with today's date and nothing that could be wrong.
 
     Today's month and day must appear ("10월 8일", or "10/8"); any other date,
-    year or weekday, any other number, Slack markup or mention, more than two
-    lines or more than ``MAX_GREETING_CHARS`` characters makes it invalid.
+    year or weekday, any other number, a word of another time of day than
+    ``period`` (default: the clock's; e.g. "좋은 아침" in the evening), Slack
+    markup or mention, more than two lines or more than ``MAX_GREETING_CHARS``
+    characters makes it invalid.
     """
     if not text or len(text) > MAX_GREETING_CHARS or text.count("\n") > 1:
         return False
     if any(char in text for char in "<>@*#`|[]_"):
+        return False
+    if other_time_words(text, period or time_of_day(now)):
         return False
     if sum(1 for char in text if unicodedata.category(char) == "So") > 3:
         return False
@@ -277,21 +368,26 @@ def valid_greeting(text: str, now: datetime) -> bool:
     return not re.search(r"\d", rest)
 
 
-def greeting_templates(now: date | datetime) -> list[str]:
-    """The fallback templates for ``now``'s day (weekend and Monday ones added on those days)."""
-    pool = list(phrases.GREETING_TEMPLATES)
+def greeting_templates(now: date | datetime, period: str = MORNING) -> list[str]:
+    """The fallback templates for ``period`` on ``now``'s day (weekend and Monday ones added on those days)."""
+    pool = list(phrases.GREETING_TEMPLATES[period])
     if now.weekday() >= 5:
-        pool += phrases.WEEKEND_GREETING_TEMPLATES
+        pool += phrases.WEEKEND_GREETING_TEMPLATES.get(period, ())
     if now.weekday() == 0:
-        pool += phrases.MONDAY_GREETING_TEMPLATES
+        pool += phrases.MONDAY_GREETING_TEMPLATES.get(period, ())
     return pool
 
 
 def fallback_greeting(
-    now: datetime, *, rng: random.Random | None = None, previous: tuple[str, str] | None = None
+    now: datetime,
+    *,
+    period: str | None = None,
+    rng: random.Random | None = None,
+    previous: tuple[str, str] | None = None,
 ) -> str:
-    """A template greeting for ``now`` (the date filled in by code); not the template used last time when possible."""
-    pool = greeting_templates(now)
+    """A template greeting for ``now`` and ``period`` (default: the clock's), the date filled in by code;
+    not the template used last time when possible."""
+    pool = greeting_templates(now, period or time_of_day(now))
     avoid = None
     if previous is not None:
         try:
@@ -300,7 +396,8 @@ def fallback_greeting(
             last_day = None
         if last_day is not None:
             last_fields = date_fields(last_day)
-            avoid = next((t for t in greeting_templates(last_day) if t.format(**last_fields) == previous[1]), None)
+            used = (t for p in TIMES_OF_DAY for t in greeting_templates(last_day, p))
+            avoid = next((t for t in used if t.format(**last_fields) == previous[1]), None)
     return phrases.pick(pool, rng, avoid=avoid).format(**date_fields(now))
 
 
@@ -323,7 +420,7 @@ class Greeting:
 
 
 async def make_greeting(
-    now: datetime,
+    when: BriefTime,
     *,
     weather_text: str = "",
     env: Mapping[str, str] | None = None,
@@ -332,65 +429,119 @@ async def make_greeting(
     rng: random.Random | None = None,
     timeout: float = GREETING_TIMEOUT_SECONDS,
 ) -> Greeting:
-    """고뭉치's greeting for ``now``: the model's when it is valid and new, else a template. Never raises.
+    """고뭉치's greeting for ``when``: the model's when it is valid and new, else a template. Never raises.
 
-    The last greeting (state file) goes into the prompt; the one used is
-    stored for tomorrow.
+    The time of day and the time go into the prompt with the last greeting
+    (state file), which every run is told not to repeat. Only the scheduled
+    briefing stores the one it used (for tomorrow morning's): a manual
+    evening briefing never replaces this morning's greeting.
     """
+    now, period = when.now, when.period
     store = store or StateStore(config.get_state_path(env))
     try:
         previous = store.last_greeting()
     except OSError:
         previous = None
-    prompt = greeting_prompt(now, weather_text=weather_text, previous=previous[1] if previous else None)
+    prompt = greeting_prompt(now, period=period, weather_text=weather_text, previous=previous[1] if previous else None)
     greeting: Greeting | None = None
     try:
         call = generate(prompt) if generate is not None else generate_greeting(prompt, env)
         text = clean_greeting(await asyncio.wait_for(call, timeout))
-        if valid_greeting(text, now) and (previous is None or text != previous[1]):
+        if valid_greeting(text, now, period) and (previous is None or text != previous[1]):
             greeting = Greeting(text, "llm")
         else:
-            log.info("아침 인사가 형식에 맞지 않아(날짜 확인 등) 준비된 인사를 씁니다.")
+            log.info("%s 인사가 형식에 맞지 않아(날짜·시간대 확인 등) 준비된 인사를 씁니다.", period)
     except Exception as exc:  # noqa: BLE001 - a template greeting is always fine
         reason = crash_kind(exc) if isinstance(exc, asyncio.TimeoutError) else safe_error(exc)
-        log.warning("아침 인사를 만들지 못해 준비된 인사를 씁니다: %s", reason)
+        log.warning("%s 인사를 만들지 못해 준비된 인사를 씁니다: %s", period, reason)
     if greeting is None:
-        greeting = Greeting(fallback_greeting(now, rng=rng, previous=previous), "template")
-    try:
-        store.mark_greeting(now.date().isoformat(), greeting.text)
-    except OSError as exc:
-        log.warning("아침 인사를 상태 파일에 기록하지 못했습니다: %s", safe_error(exc))
+        greeting = Greeting(fallback_greeting(now, period=period, rng=rng, previous=previous), "template")
+    if when.scheduled:
+        try:
+            store.mark_greeting(now.date().isoformat(), greeting.text)
+        except OSError as exc:
+            log.warning("아침 인사를 상태 파일에 기록하지 못했습니다: %s", safe_error(exc))
     return greeting
 
 
 # ---------------------------------------------------------------- 업뎃's and 일정's reports
 
 
-REPORT_PROMPTS = {
-    UPDATE: (
-        "아침 브리핑에서 네가 맡은 부분을 보고할 차례야. 고뭉치가 인사와 날씨, Chat KHU 크레딧을 이미 전했고, "
-        "오늘 일정은 일정이 따로 보고해.\n"
-        "- check_dropbox_updates를 since_hours 없이(0) 한 번만 불러 공저자 업데이트를 확인해. "
-        "이번 실행은 아침 브리핑이라 도구가 지난 브리핑 이후를 본다. 기간은 결과의 since_basis대로 써.\n"
-        '- 업뎃다운 짧은 아침 인사 한 줄(예: "업뎃 보고드립니다!")로 시작하고, 그다음은 네 형식(하위 폴더, 링크, '
+# 일정's opening line, per time of day.
+SCHEDULE_LEADS = {MORNING: "밝은 아침 한마디", AFTERNOON: "밝은 오후 한마디", EVENING: "밝은 저녁 한마디", NIGHT: "차분한 밤 한마디"}
+# Outside 아침: no morning wording (일정's evening prompt says it in its own words).
+NOT_MORNING_RULE = "- 지금은 {period} 브리핑이니 여는 말도 그때에 맞게 쓰고, '좋은 아침'이나 '아침 보고'처럼 아침을 가리키는 말은 쓰지 마.\n"
+
+
+def _korean_day(day: date) -> str:
+    """``2026-10-08 (목요일)``."""
+    return f"{day.isoformat()} ({WEEKDAYS_KO[day.weekday()]}요일)"
+
+
+def _day_heading(day: date, slack: bool) -> str:
+    """``10/08 (목)``, bold in Slack: ``*10/08 (목)*``."""
+    text = f"{day:%m/%d} ({WEEKDAYS_KO[day.weekday()]})"
+    return f"*{text}*" if slack else text
+
+
+def _report_opening(when: BriefTime, others: str) -> str:
+    return (
+        f"{when.period} 브리핑에서 네가 맡은 부분을 보고할 차례야(지금 {when.clock}). "
+        f"고뭉치가 인사와 날씨, Chat KHU 크레딧을 이미 전했고, {others}\n"
+    )
+
+
+def _update_report_prompt(when: BriefTime) -> str:
+    return (
+        _report_opening(when, "일정 보고는 일정이 따로 해.")
+        + "- check_dropbox_updates를 since_hours 없이(0) 한 번만 불러 공저자 업데이트를 확인해. "
+        "이번 실행은 브리핑이라 도구가 지난 브리핑 이후를 본다. 기간은 결과의 since_basis대로 써.\n"
+        f'- 업뎃다운 짧은 {when.period} 인사 한 줄(예: "업뎃 보고드립니다!")로 시작하고, 그다음은 네 형식(하위 폴더, 링크, '
         "사람별 파일과 수정 시각)과 규칙을 그대로 따라. 변경이 없으면 그 한 줄이면 돼.\n"
-        "- 날씨, 크레딧, 일정은 쓰지 말고, 다른 팀원을 부르거나 멘션하지 마. 짧게."
-    ),
-    SCHEDULE: (
-        "아침 브리핑에서 네가 맡은 부분을 보고할 차례야. 고뭉치가 인사와 날씨, Chat KHU 크레딧을 이미 전했고, "
-        "Dropbox 소식은 업뎃이 따로 보고해.\n"
-        '- get_schedule을 date="{iso}", days=1로 한 번만 불러 오늘({korean}) 하루치 일정만 확인해. get_weather는 부르지 마.\n'
-        "- 일정다운 밝은 아침 한마디로 시작하고, 지금 / 바로 다음 일정을 맨 앞에, 이어서 오늘 일정을 네 형식대로 시간 순으로 써. "
-        '겹침과 쓸모 있는 빈 시간(1~3개)도 형식대로. 오늘 일정이 없으면 "오늘 일정 없음"이라고 써.\n'
-        "- 날씨, 크레딧, Dropbox는 쓰지 말고, 다른 팀원을 부르거나 멘션하지 마. 짧게."
-    ),
-}
+        + ("" if when.period == MORNING else NOT_MORNING_RULE.format(period=when.period))
+        + "- 날씨, 크레딧, 일정은 쓰지 말고, 다른 팀원을 부르거나 멘션하지 마. 짧게."
+    )
 
 
-def report_prompt(persona: str, now: datetime) -> str:
-    """업뎃's or 일정's user prompt for the morning report (the date from code; no weather, no credits)."""
-    korean = f"{now.date().isoformat()} ({WEEKDAYS_KO[now.weekday()]}요일)"
-    return REPORT_PROMPTS[persona].format(iso=now.date().isoformat(), korean=korean)
+def _schedule_report_prompt(when: BriefTime, slack: bool) -> str:
+    today = when.now.date()
+    iso, lead = today.isoformat(), SCHEDULE_LEADS[when.period]
+    opening = _report_opening(when, "Dropbox 소식은 업뎃이 따로 보고해.")
+    closing = "- 날씨, 크레딧, Dropbox는 쓰지 말고, 다른 팀원을 부르거나 멘션하지 마. 짧게."
+    if when.schedule_days == 1:
+        return (
+            opening
+            + f'- get_schedule을 date="{iso}", days=1로 한 번만 불러 오늘({_korean_day(today)}) 하루치 일정만 확인해. get_weather는 부르지 마.\n'
+            f"- 일정다운 {lead}로 시작하고, 지금 / 바로 다음 일정을 맨 앞에, 이어서 오늘 일정을 네 형식대로 시간 순으로 써. "
+            '겹침과 쓸모 있는 빈 시간(1~3개)도 형식대로. 오늘 일정이 없으면 "오늘 일정 없음"이라고 써.\n'
+            + ("" if when.period == MORNING else NOT_MORNING_RULE.format(period=when.period))
+            + closing
+        )
+    # A manual briefing from 17:00 to midnight: the rest of today, then tomorrow (both dates from code).
+    tomorrow = today + timedelta(days=1)
+    return (
+        opening
+        + f'- get_schedule을 date="{iso}", days=2로 한 번만 불러 오늘({_korean_day(today)})의 남은 일정과 '
+        f"내일({_korean_day(tomorrow)}) 일정을 확인해. get_weather는 부르지 마.\n"
+        f"- 일정다운 {lead}로 시작하고, 지금 / 바로 다음 일정을 맨 앞에 써(바로 다음 일정이 내일이면 날짜도 함께).\n"
+        f"- 이어서 날짜 제목 줄({_day_heading(today, slack)}, {_day_heading(tomorrow, slack)})을 두고 날짜별로 네 형식대로 써. "
+        '오늘은 지금 진행 중이거나 아직 시작하지 않은 일정만 쓰고(이미 끝난 일정은 빼고), 없으면 "오늘 남은 일정 없음"이라고 써. '
+        '내일은 하루치 일정을 시간 순으로 쓰고, 없으면 "내일 일정 없음"이라고 써. '
+        "겹침과 쓸모 있는 빈 시간(1~3개, 이미 지난 시간은 빼고)도 형식대로.\n"
+        "- 오늘 하루는 거의 지나갔어. '좋은 아침'이나 '아침 보고', '여유로운 하루예요'처럼 하루를 앞두고 하는 말은 쓰지 말고, "
+        "남은 일정과 내일 준비에 어울리는 말로 써.\n"
+        "- 내일 일정도 결과에 있는 것만 쓰고, 결과에 없는 공휴일·절기는 덧붙이지 마.\n"
+        + closing
+    )
+
+
+def report_prompt(persona: str, when: BriefTime, *, slack: bool = False) -> str:
+    """업뎃's or 일정's user prompt for its part: the time of day, the time and the dates from code (no weather, no credits)."""
+    if persona == UPDATE:
+        return _update_report_prompt(when)
+    if persona == SCHEDULE:
+        return _schedule_report_prompt(when, slack)
+    raise ValueError(f"no report for persona {persona!r}")
 
 
 @dataclass
@@ -440,22 +591,23 @@ async def run_report(
     persona: str,
     *,
     run: RunTurn,
-    now: datetime,
+    when: BriefTime,
     slack: bool,
     run_timeout: float | None = None,
     on_status: Callable[[str], Any] | None = None,
     rng: random.Random | None = None,
 ) -> Report:
-    """One direct 업뎃 / 일정 run for the morning briefing. Never raises (except when cancelled).
+    """One direct 업뎃 / 일정 run for the relay briefing. Never raises (except when cancelled).
 
-    업뎃 runs in briefing mode (its Dropbox checkpoint moves); 일정 looks at today only.
+    업뎃 runs in briefing mode (its Dropbox checkpoint moves); 일정 looks at
+    today (and tomorrow for a manual briefing from 17:00, ``when.schedule_days``).
     """
     label = PERSONA_LABELS[persona]
     result: TurnResult | None = None
     crash: BaseException | None = None
     try:
         turn = run(
-            report_prompt(persona, now),
+            report_prompt(persona, when, slack=slack),
             on_status=on_status,
             extra_system_prompt=SLACK_FORMAT_PROMPT if slack else "",
             persona=persona,
@@ -464,10 +616,11 @@ async def run_report(
         result = await (asyncio.wait_for(turn, run_timeout) if run_timeout else turn)
     except Exception as exc:  # noqa: BLE001 - reported as a short apology, details in the log
         crash = exc
-        log.error("%s의 아침 보고를 만들지 못했습니다: %s", label, crash_kind(exc) if isinstance(exc, asyncio.TimeoutError) else safe_error(exc))
+        reason = crash_kind(exc) if isinstance(exc, asyncio.TimeoutError) else safe_error(exc)
+        log.error("%s의 %s 보고를 만들지 못했습니다: %s", label, when.period, reason)
     else:
         if result.failed:
-            log.warning("%s의 아침 보고가 완전하지 않습니다: %s", label, scrub(result.error or ""))
+            log.warning("%s의 %s 보고가 완전하지 않습니다: %s", label, when.period, scrub(result.error or ""))
     return Report(persona, report_text(persona, result, crash, rng=rng), result, crash)
 
 
@@ -494,7 +647,7 @@ def compose_head(greeting: str, weather_text: str, credit_text: str, closing: Se
 
 
 async def _build_head(
-    now: datetime,
+    when: BriefTime,
     *,
     env: Mapping[str, str] | None,
     slack: bool,
@@ -505,7 +658,9 @@ async def _build_head(
     rng: random.Random | None,
     greeting_timeout: float,
 ) -> Head:
-    credit_task = asyncio.ensure_future(asyncio.to_thread(credit_section, env, fetch=credit_fetch, now=now, slack=slack))
+    credit_task = asyncio.ensure_future(
+        asyncio.to_thread(credit_section, env, fetch=credit_fetch, now=when.now, slack=slack)
+    )
     try:
         weather_text = (
             await asyncio.to_thread(weather_section, env, fetch=weather_fetch, slack=slack)
@@ -513,7 +668,7 @@ async def _build_head(
             else ""
         )
         greeting = await make_greeting(
-            now,
+            when,
             weather_text=weather_text,
             env=env,
             store=store,
@@ -534,10 +689,14 @@ class Relay:
     cancels whatever is still running (e.g. when the bots stop).
     """
 
-    def __init__(self, head: asyncio.Future[Head], reports: dict[str, asyncio.Future[Report]], now: datetime):
+    def __init__(self, head: asyncio.Future[Head], reports: dict[str, asyncio.Future[Report]], when: BriefTime):
         self._head = head
         self._reports = reports
-        self.now = now
+        self.when = when  # the time of day for the callers' own lines (the hand-off)
+
+    @property
+    def now(self) -> datetime:
+        return self.when.now
 
     @property
     def personas(self) -> list[str]:
@@ -567,6 +726,7 @@ def start_relay(
     personas: Sequence[str] = REPORTERS,
     run: RunTurn | None = None,
     now: datetime | None = None,
+    scheduled: bool = False,
     env: Mapping[str, str] | None = None,
     slack: bool = False,
     credit_fetch: CreditFetch | None = None,
@@ -581,22 +741,24 @@ def start_relay(
     """Start every part of today's relay briefing at once (call it inside a running event loop).
 
     ``personas``: who reports after 고뭉치 (업뎃, 일정; a bot that is not set
-    up is left out by the caller). ``slack`` picks Slack formatting.
-    ``run_timeout`` (seconds) bounds each report run.
+    up is left out by the caller). ``scheduled``: the ``BRIEF_TIME`` briefing
+    (always 아침); otherwise the wording follows ``now``'s time of day
+    (``BriefTime``). ``slack`` picks Slack formatting. ``run_timeout``
+    (seconds) bounds each report run.
     """
     tz = config.get_timezone(env)
-    now = (now or datetime.now(tz)).astimezone(tz)
+    when = BriefTime.at((now or datetime.now(tz)).astimezone(tz), scheduled=scheduled)
     run = run or run_turn
     rng = rng or random.Random()
     reports = {
         persona: asyncio.ensure_future(
-            run_report(persona, run=run, now=now, slack=slack, run_timeout=run_timeout, on_status=on_status, rng=rng)
+            run_report(persona, run=run, when=when, slack=slack, run_timeout=run_timeout, on_status=on_status, rng=rng)
         )
         for persona in personas
     }
     head = asyncio.ensure_future(
         _build_head(
-            now,
+            when,
             env=env,
             slack=slack,
             credit_fetch=credit_fetch,
@@ -607,7 +769,7 @@ def start_relay(
             greeting_timeout=greeting_timeout,
         )
     )
-    return Relay(head, reports, now)
+    return Relay(head, reports, when)
 
 
 # ---------------------------------------------------------------- terminal
@@ -628,7 +790,8 @@ def run_brief_cli(
 ) -> int:
     """``python -m mungchi --brief``: the three parts on stdout under ``[고뭉치]``, ``[업뎃]``, ``[일정]``.
 
-    Progress and errors go to stderr. Exits 1 when 업뎃's or 일정's part could not be made.
+    A manual briefing: its wording follows the time of day. Progress and
+    errors go to stderr. Exits 1 when 업뎃's or 일정's part could not be made.
     """
     out = out or sys.stdout
     err = err or sys.stderr
@@ -655,7 +818,9 @@ def run_brief_cli(
             on_status=status,
         ) as parts:
             head = await parts.head()
-            handoff = phrases.pick(phrases.HANDOFF_TEMPLATES, rng).format(bots=phrases.teammate_names(REPORTERS))
+            handoff = phrases.pick(phrases.HANDOFF_TEMPLATES[parts.when.period], rng).format(
+                bots=phrases.teammate_names(REPORTERS)
+            )
             show(MUNGCHI, head.text([handoff]))
             for persona in REPORTERS:
                 report = await parts.report(persona)

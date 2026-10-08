@@ -5,7 +5,8 @@ questions, alone or together ("날씨랑 토큰 좀 말해봐"), are answered by
 without an agent turn. A short briefing request to 고뭉치 ("오늘 건너뛴 브리핑
 좀 해봐", or a bare ``@고뭉치``) gets the same relay briefing as the morning
 one (``post_briefing``): 고뭉치 greets with the weather and the credits and
-hands off, then 업뎃 and 일정 post their own parts as their own bots. The
+hands off, then 업뎃 and 일정 post their own parts as their own bots; its
+wording follows the time of day (the scheduled one is always 아침). The
 answer to a calendar proposal waiting in the thread (events from a pasted
 note) is handled by code too, without an agent turn: a category picked by
 number or name ("2", "Research", "khu"), "네" (the suggested category),
@@ -995,6 +996,8 @@ class SlackHandler:
         업뎃's and 일정's in their own DMs with that person. 업뎃's run is a
         briefing run, so the Dropbox checkpoint moves. ``last_brief_date`` is
         never written: a briefing on request never stops the next scheduled one.
+        A manual briefing: the wording follows the time of day, and from 17:00
+        일정 also covers tomorrow (``briefing.BriefTime``).
         """
         log.info(
             "%s: 스레드 %s:%s 브리핑 요청: 아침 브리핑과 같은 릴레이 브리핑을 보냅니다 (%s, 아침 브리핑 기록은 그대로 둡니다)",
@@ -1452,6 +1455,7 @@ async def morning_brief_tick(
                 run=run,
                 sessions=sessions,
                 now=now,
+                scheduled=True,  # always 아침, even a late catch-up
                 env=env,
                 credit_fetch=credit_fetch,
                 weather_fetch=weather_fetch,
@@ -1744,8 +1748,10 @@ def mungchi_closing(
     reporters: Sequence[str],
     missing: Sequence[str],
     rng: random.Random | None = None,
+    *,
+    period: str,
 ) -> list[str]:
-    """고뭉치's last lines: a note about bots that are not set up, then the hand-off.
+    """고뭉치's last lines: a note about bots that are not set up, then the hand-off for ``period`` (아침, 오후, 저녁, 밤).
 
     Channel mode mentions 업뎃 and 일정 (``<@U…>``, their names when the id is
     unknown); DM mode says they will report in their own DMs.
@@ -1753,11 +1759,12 @@ def mungchi_closing(
     lines = [_missing_note(missing)] if missing else []
     if reporters:
         if target.dm:
-            lines.append(phrases.pick(phrases.DM_HANDOFF_TEMPLATES, rng).format(names=phrases.teammate_names(reporters, topic=True)))
+            pool = phrases.DM_HANDOFF_TEMPLATES[period]
+            lines.append(phrases.pick(pool, rng).format(names=phrases.teammate_names(reporters, topic=True)))
         else:
             ids = [bots[persona].user_id for persona in reporters]
             who = " ".join(f"<@{uid}>" for uid in ids) if all(ids) else phrases.teammate_names(reporters)
-            lines.append(phrases.pick(phrases.HANDOFF_TEMPLATES, rng).format(bots=who))
+            lines.append(phrases.pick(phrases.HANDOFF_TEMPLATES[period], rng).format(bots=who))
     return lines
 
 
@@ -1837,6 +1844,7 @@ async def post_briefing(
     run: RunTurn | None = None,
     sessions: ThreadSessions | None = None,
     now: datetime | None = None,
+    scheduled: bool = False,
     env: Mapping[str, str] | None = None,
     on_status: Callable[[str], Any] | None = None,
     credit_fetch: Callable[[], credits.CreditReport] | None = None,
@@ -1851,7 +1859,9 @@ async def post_briefing(
     ``bots``: ``{persona: BriefBot}`` (고뭉치 required; 업뎃 / 일정 when set
     up) or just 고뭉치's client. ``destinations``: a channel id (all three
     post there), member ids (each bot posts in its own DM with each person),
-    or ``BriefTarget``s (e.g. a request's thread).
+    or ``BriefTarget``s (e.g. a request's thread). ``scheduled``: only the
+    ``BRIEF_TIME`` briefing (always 아침 wording); a briefing on request or
+    ``--brief --slack`` follows the time of day (``briefing.BriefTime``).
 
     Everything starts at once (``briefing.start_relay``); 고뭉치's part (its
     greeting, the weather and credit lines, the hand-off) goes out as soon as
@@ -1881,6 +1891,7 @@ async def post_briefing(
         personas=reporters,
         run=run or run_turn,
         now=now,
+        scheduled=scheduled,
         env=env,
         slack=True,
         credit_fetch=credit_fetch,
@@ -1894,7 +1905,7 @@ async def post_briefing(
         head = await relay.head()
         for target in targets:
             channel, thread_ts = target.place(MUNGCHI)
-            text = head.text(mungchi_closing(target, relay_bots, reporters, missing, rng))
+            text = head.text(mungchi_closing(target, relay_bots, reporters, missing, rng, period=relay.when.period))
             try:
                 await _post_chunks(relay_bots[MUNGCHI].client, channel, to_slack_chunks(text), thread_ts)
             except Exception as exc:  # noqa: BLE001 - the others still get theirs

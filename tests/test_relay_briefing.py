@@ -177,7 +177,7 @@ def test_channel_relay_posts_in_order_each_bot_its_own_part(tmp_path):
     greeting, data, handoff = mungchi.split("\n\n")
     assert greeting == GREETING
     assert data.splitlines()[:2] == [WEATHER_LINE, CREDIT_LINE]
-    assert handoff in [t.format(bots="<@UUPDATE> <@USCHEDULE>") for t in phrases.HANDOFF_TEMPLATES]
+    assert handoff in [t.format(bots="<@UUPDATE> <@USCHEDULE>") for t in phrases.HANDOFF_TEMPLATES["아침"]]
     # 업뎃 and 일정: their own reports, exactly; no weather and no credits.
     assert update == UPDATE_REPORT and schedule == SCHEDULE_REPORT
     for text in (update, schedule):
@@ -194,8 +194,9 @@ def test_channel_relay_posts_in_order_each_bot_its_own_part(tmp_path):
     assert run.call("schedule")["briefing"] is False and 'date="2026-10-08", days=1' in run.call("schedule")["prompt"]
     assert {c["extra_system_prompt"] for c in run.calls} == {SLACK_FORMAT_PROMPT}
     assert {c["persona"] for c in run.calls} == {"update", "schedule"}  # no 고뭉치 agent run at all
-    # The greeting used is stored; last_brief_date is never written by the relay.
-    assert options["store"].last_greeting() == ("2026-10-08", GREETING)
+    # A manual briefing (the default) never stores its greeting: only the scheduled one does.
+    # last_brief_date is never written by the relay.
+    assert options["store"].last_greeting() is None
     assert options["store"].last_brief_date() is None
 
 
@@ -235,10 +236,10 @@ def test_a_long_report_continues_in_its_own_thread(tmp_path):
 
 def test_the_greeting_falls_back_to_a_template_with_the_right_date(tmp_path):
     log: list[dict] = []
-    code, options = relay(make_bots(log), CHANNEL, tmp_path=tmp_path, greeting=FakeGreeting("좋은 아침! 10월 9일(금)이에요"))
+    code, options = relay(make_bots(log), CHANNEL, tmp_path=tmp_path, greeting=FakeGreeting("좋은 아침! 10월 9일(금)이에요"), scheduled=True)
     assert code == 0
     greeting = texts(log, "mungchi")[0].split("\n\n")[0]
-    assert greeting in [t.format(**briefing.date_fields(at(8, 7))) for t in phrases.GREETING_TEMPLATES]
+    assert greeting in [t.format(**briefing.date_fields(at(8, 7))) for t in phrases.GREETING_TEMPLATES["아침"]]
     assert "10월 8일" in greeting and "10월 9일" not in greeting
     assert options["store"].last_greeting() == ("2026-10-08", greeting)
 
@@ -247,7 +248,7 @@ def test_yesterdays_greeting_reaches_the_greeting_prompt(tmp_path):
     store = StateStore(tmp_path / "state.json")
     store.mark_greeting("2026-10-07", "똑똑! 🚪 2026년 10월 7일(수) 아침 브리핑입니다~")
     greeting = FakeGreeting()
-    relay(make_bots([]), CHANNEL, tmp_path=tmp_path, greeting=greeting, store=store)
+    relay(make_bots([]), CHANNEL, tmp_path=tmp_path, greeting=greeting, store=store, scheduled=True)
     assert '이전 인사: "똑똑! 🚪 2026년 10월 7일(수) 아침 브리핑입니다~"' in greeting.prompts[0]
     assert store.last_greeting() == ("2026-10-08", GREETING)
 
@@ -256,7 +257,7 @@ def test_without_user_ids_the_hand_off_names_the_bots(tmp_path):
     log: list[dict] = []
     relay(make_bots(log, ids=False), CHANNEL, tmp_path=tmp_path)
     handoff = texts(log, "mungchi")[0].splitlines()[-1]
-    assert handoff in [t.format(bots="업뎃이, 일정이") for t in phrases.HANDOFF_TEMPLATES] and "<@" not in handoff
+    assert handoff in [t.format(bots="업뎃이, 일정이") for t in phrases.HANDOFF_TEMPLATES["아침"]] and "<@" not in handoff
 
 
 # ---------------------------------------------------------------- a bot that is not in the channel
@@ -303,7 +304,7 @@ def test_dm_mode_each_bot_posts_in_its_own_dm(tmp_path):
     mungchi = texts(log, "mungchi")[0]
     assert "<@" not in mungchi
     note = mungchi.splitlines()[-1]
-    assert note in [t.format(names="업뎃이와 일정이는") for t in phrases.DM_HANDOFF_TEMPLATES]
+    assert note in [t.format(names="업뎃이와 일정이는") for t in phrases.DM_HANDOFF_TEMPLATES["아침"]]
     assert texts(log, "update") == [UPDATE_REPORT] * 2 and texts(log, "schedule") == [SCHEDULE_REPORT] * 2
     # Each bot's own DM thread continues with that bot.
     for post in log:
@@ -322,7 +323,7 @@ def test_dm_mode_without_a_bot_says_so_in_mungchis_part(tmp_path):
     assert closing[0] == (
         "일정 봇은 아직 설정되지 않아서 오늘 보고는 빠졌어요 (필요한 값: SLACK_SCHEDULE_BOT_TOKEN, SLACK_SCHEDULE_APP_TOKEN)."
     )
-    assert closing[1] in [t.format(names="업뎃이는") for t in phrases.DM_HANDOFF_TEMPLATES]
+    assert closing[1] in [t.format(names="업뎃이는") for t in phrases.DM_HANDOFF_TEMPLATES["아침"]]
 
 
 def test_mungchi_alone_still_greets_with_weather_and_credits(tmp_path):
@@ -444,13 +445,25 @@ def test_mungchis_mention_of_the_other_bots_is_ignored(tmp_path):
 # ---------------------------------------------------------------- a briefing asked of 고뭉치 in Slack
 
 
-def _request_handler(tmp_path, log, run, *, personas=("mungchi", "update", "schedule")):
+AFTERNOON_GREETING = "똑똑! 🚪 10월 8일(목) 오후 브리핑이에요. 지금까지 소식 챙겨 왔어요!"
+
+
+def _request_handler(tmp_path, log, run, *, personas=("mungchi", "update", "schedule"), now=None, greeting=None):
+    """A 고뭉치 handler whose briefing relay runs with a fixed clock (13:05 by default: 오후)."""
     bots = make_bots(log, personas=personas)
     store = StateStore(config.get_state_path())
 
     async def relay_now(bots_, targets, **kwargs):
         return await post_briefing(
-            bots_, targets, **kwargs, now=at(8, 13, 5), env={}, credit_fetch=low_report, weather_fetch=sunny, greeting_generate=FakeGreeting(), store=store
+            bots_,
+            targets,
+            **kwargs,
+            now=now or at(8, 13, 5),
+            env={},
+            credit_fetch=low_report,
+            weather_fetch=sunny,
+            greeting_generate=greeting or FakeGreeting(AFTERNOON_GREETING),
+            store=store,
         )
 
     handler = SlackHandler(
@@ -475,9 +488,13 @@ def test_a_request_in_a_channel_runs_the_relay_into_that_channel(tmp_path):
     asyncio.run(handler.handle_event(event, event_id="Ev1", source="mention"))
     assert [p["bot"] for p in log] == ["mungchi", "update", "schedule"]
     assert all(p["channel"] == CHANNEL and "thread_ts" not in p for p in log)  # top level, like the morning one
-    assert log[0]["text"].startswith(f"{GREETING}\n\n{WEATHER_LINE}\n{CREDIT_LINE}")
+    # Asked at 13:05: an afternoon briefing (오후 greeting and hand-off, today's schedule only).
+    assert log[0]["text"].startswith(f"{AFTERNOON_GREETING}\n\n{WEATHER_LINE}\n{CREDIT_LINE}")
+    assert log[0]["text"].splitlines()[-1] in [t.format(bots="<@UUPDATE> <@USCHEDULE>") for t in phrases.HANDOFF_TEMPLATES["오후"]]
+    assert "아침" not in log[0]["text"]
     assert [p["text"] for p in log[1:]] == [UPDATE_REPORT, SCHEDULE_REPORT]
     assert run.call("update")["briefing"] is True
+    assert run.call("update")["prompt"].startswith("오후 브리핑에서") and 'date="2026-10-08", days=1' in run.call("schedule")["prompt"]
     # last_brief_date is not written: tomorrow's scheduled briefing still goes out.
     assert store.last_brief_date() == "2026-10-07"
     assert briefing.brief_due(config.load_brief_schedule({"BRIEF_TIME": "07:00"}), at(9, 7), store.last_brief_date()) == briefing.DUE
@@ -507,7 +524,7 @@ def test_a_request_in_mungchis_dm_runs_the_dm_relay_for_that_person_only(tmp_pat
     assert [(p["bot"], p["channel"], p.get("thread_ts")) for p in log] == [
         ("mungchi", "DMUOWNER1", None), ("update", OWNER, None), ("schedule", OWNER, None)
     ]
-    assert log[0]["text"].splitlines()[-1] in [t.format(names="업뎃이와 일정이는") for t in phrases.DM_HANDOFF_TEMPLATES]
+    assert log[0]["text"].splitlines()[-1] in [t.format(names="업뎃이와 일정이는") for t in phrases.DM_HANDOFF_TEMPLATES["오후"]]
     assert handler.sessions.get(log[1]["_channel"], log[1]["_ts"], persona="update") == UPDATE_SESSION
     assert store.last_brief_date() is None
 
@@ -522,8 +539,79 @@ def test_the_default_relay_on_request_is_post_briefing(tmp_path, monkeypatch):
     asyncio.run(handler.handle_event({"type": "message", "channel_type": "im", "user": OWNER, "text": "", "ts": "1.000001", "channel": "DMUOWNER1"}, event_id="E", source="dm"))
     assert [p["bot"] for p in log] == ["mungchi", "update", "schedule"]
     assert "💳 *Chat KHU 크레딧*: 확인 안 함 (Chat KHU 게이트웨이를 쓰지 않아요)" in log[0]["text"]  # offline here
-    assert StateStore(config.get_state_path()).last_greeting()[0]  # the template greeting was stored
+    # A briefing on request is manual: it never stores its greeting nor touches last_brief_date.
+    assert StateStore(config.get_state_path()).last_greeting() is None
     assert StateStore(config.get_state_path()).last_brief_date() is None
+
+
+# ---------------------------------------------------------------- the wording follows the time of day
+
+
+EVENING_SCHEDULE_REPORT = (
+    "오늘 일정은 다 마치셨네요, 수고 많으셨어요!\n"
+    "지금 / 바로 다음 일정: 진행 중인 일정 없음 / 10/09 (금) 10:00 랩 미팅 (302호), 16시간 10분 뒤\n"
+    "*10/08 (목)*\n"
+    "• 오늘 남은 일정 없음\n"
+    "*10/09 (금)*\n"
+    "• 10:00–11:00 랩 미팅 (302호)"
+)
+
+
+def test_a_request_at_1750_is_an_evening_briefing_with_tomorrows_schedule(tmp_path):
+    """The reported case: "@비서실 고뭉치 브리핑해봐" at 17:50 got morning wording throughout."""
+    log: list[dict] = []
+    run = PersonaRun(schedule=TurnResult(text=EVENING_SCHEDULE_REPORT, session_id=SCHEDULE_SESSION))
+    morning_like = FakeGreeting("좋은 아침이에요! 10월 8일(목), 구름 한 점 없이 맑아요")
+    handler, store = _request_handler(tmp_path, log, run, now=at(8, 17, 50), greeting=morning_like)
+    store.mark_greeting("2026-10-08", GREETING)  # this morning's scheduled greeting
+    event = {"type": "app_mention", "user": OWNER, "text": "<@UMUNGCHI> 브리핑해봐", "ts": "1700000000.000100", "channel": CHANNEL}
+    asyncio.run(handler.handle_event(event, event_id="Ev1", source="mention"))
+    assert [p["bot"] for p in log] == ["mungchi", "update", "schedule"]
+    # 고뭉치: the morning greeting is rejected for an evening one; the hand-off is an evening line.
+    mungchi = log[0]["text"]
+    greeting, data, handoff = mungchi.split("\n\n")
+    assert greeting in [t.format(**briefing.date_fields(at(8, 17, 50))) for t in phrases.GREETING_TEMPLATES["저녁"]]
+    assert data.splitlines()[:2] == [WEATHER_LINE, CREDIT_LINE]
+    assert handoff in [t.format(bots="<@UUPDATE> <@USCHEDULE>") for t in phrases.HANDOFF_TEMPLATES["저녁"]]
+    assert "아침" not in mungchi
+    assert morning_like.prompts[0].startswith("저녁 브리핑을 여는 인사를 1~2문장으로 써 줘.\n- 지금: 저녁 브리핑 (17:50).")
+    # 업뎃 and 일정 are told it is the evening at 17:50; 일정 looks at the rest of today and tomorrow.
+    update, schedule = run.call("update")["prompt"], run.call("schedule")["prompt"]
+    assert update.startswith("저녁 브리핑에서 네가 맡은 부분을 보고할 차례야(지금 17:50).")
+    assert schedule.startswith("저녁 브리핑에서 네가 맡은 부분을 보고할 차례야(지금 17:50).")
+    assert 'date="2026-10-08", days=2' in schedule and "*10/08 (목)*, *10/09 (금)*" in schedule
+    assert {c["extra_system_prompt"] for c in run.calls} == {SLACK_FORMAT_PROMPT}  # the same system side as in the morning
+    assert log[2]["text"] == EVENING_SCHEDULE_REPORT
+    # This morning's greeting is still the one tomorrow morning's is compared with.
+    assert store.last_greeting() == ("2026-10-08", GREETING)
+
+
+def test_a_dm_request_at_1750_says_the_others_report_without_morning_words(tmp_path):
+    log: list[dict] = []
+    handler, _store = _request_handler(tmp_path, log, PersonaRun(), now=at(8, 17, 50))
+    event = {"type": "message", "channel_type": "im", "user": OWNER, "text": "브리핑", "ts": "1700000000.000200", "channel": "DMUOWNER1"}
+    asyncio.run(handler.handle_event(event, event_id="Ev1", source="dm"))
+    note = log[0]["text"].splitlines()[-1]
+    assert note in [t.format(names="업뎃이와 일정이는") for t in phrases.DM_HANDOFF_TEMPLATES["저녁"]]
+    assert "아침" not in log[0]["text"]
+
+
+def test_hand_off_lines_name_no_other_time_of_day():
+    others = {"아침": ("오후", "저녁", "밤"), "오후": ("아침", "저녁", "밤"), "저녁": ("아침", "오후", "밤"), "밤": ("아침", "오후", "저녁")}
+    assert set(phrases.HANDOFF_TEMPLATES) == set(phrases.DM_HANDOFF_TEMPLATES) == set(phrases.TIMES_OF_DAY)
+    for period, words in others.items():
+        for line in phrases.HANDOFF_TEMPLATES[period] + phrases.DM_HANDOFF_TEMPLATES[period]:
+            assert not any(word in line for word in words), (period, line)
+    assert "{bots} 오늘 소식 정리 부탁해요!" in phrases.HANDOFF_TEMPLATES["저녁"]
+    assert "{bots} 저녁 보고 부탁해요!" in phrases.HANDOFF_TEMPLATES["저녁"]
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_the_hand_off_at_1750_never_says_morning(tmp_path, seed):
+    log: list[dict] = []
+    relay(make_bots(log), CHANNEL, tmp_path=tmp_path, now=at(8, 17, 50), rng=random.Random(seed))
+    handoff = texts(log, "mungchi")[0].splitlines()[-1]
+    assert "아침" not in handoff and handoff in [t.format(bots="<@UUPDATE> <@USCHEDULE>") for t in phrases.HANDOFF_TEMPLATES["저녁"]]
 
 
 # ---------------------------------------------------------------- the scheduled 07:00 briefing
@@ -540,7 +628,7 @@ class FakeClock:
         return self.now
 
 
-def tick(bots, store, clock, run, *, state, destinations=(CHANNEL,), sessions=None, schedule=MORNING, **kwargs):
+def tick(bots, store, clock, run, *, state, destinations=(CHANNEL,), sessions=None, schedule=MORNING, greeting=None, **kwargs):
     return asyncio.run(
         slack_bot.morning_brief_tick(
             bots,
@@ -554,7 +642,7 @@ def tick(bots, store, clock, run, *, state, destinations=(CHANNEL,), sessions=No
             sessions=sessions,
             credit_fetch=low_report,
             weather_fetch=sunny,
-            greeting_generate=FakeGreeting(),
+            greeting_generate=greeting or FakeGreeting(),
             **kwargs,
         )
     )
@@ -581,6 +669,8 @@ def test_the_0700_tick_runs_the_relay_once_and_records_the_date_before_posting(t
     assert tick(bots, store, clock, run, state=state) == "sent"
     assert sorted(recorded_at_run) == [("2026-10-08", "schedule"), ("2026-10-08", "update")]  # written before the runs
     assert [p["bot"] for p in log] == ["mungchi", "update", "schedule"]
+    # The scheduled briefing is the one that stores its greeting (for tomorrow morning's).
+    assert store.last_greeting() == ("2026-10-08", GREETING)
     # Later ticks the same day do nothing, in this process and after a restart (fresh state).
     for moment in (at(8, 7, 0), at(8, 7, 30), at(8, 11, 59)):
         clock.now = moment
@@ -634,6 +724,31 @@ def test_a_crash_in_the_middle_is_not_resent_after_a_restart(tmp_path):
     run = PersonaRun()
     assert tick(make_bots(log), store, FakeClock(at(8, 7, 6)), run, state=slack_bot.BriefLoopState()) == "already"
     assert run.calls == [] and log == []
+
+
+def test_a_scheduled_catch_up_at_1130_is_still_the_morning_briefing(tmp_path):
+    store = StateStore(tmp_path / "state.json")
+    log: list[dict] = []
+    run = PersonaRun()
+    greeting = FakeGreeting()  # a morning greeting: fine for the scheduled briefing at any hour
+    assert tick(make_bots(log), store, FakeClock(at(8, 11, 30)), run, state=slack_bot.BriefLoopState(), greeting=greeting) == "sent"
+    mungchi = texts(log, "mungchi")[0]
+    assert mungchi.startswith(f"{GREETING}\n\n")
+    assert mungchi.splitlines()[-1] in [t.format(bots="<@UUPDATE> <@USCHEDULE>") for t in phrases.HANDOFF_TEMPLATES["아침"]]
+    assert greeting.prompts[0].startswith("아침 브리핑을 여는 인사를 1~2문장으로 써 줘.\n- 지금: 아침 브리핑 (11:30).")
+    for persona in ("update", "schedule"):
+        assert run.call(persona)["prompt"].startswith("아침 브리핑에서 네가 맡은 부분을 보고할 차례야(지금 11:30).")
+    assert 'date="2026-10-08", days=1' in run.call("schedule")["prompt"]
+    assert store.last_greeting() == ("2026-10-08", GREETING)
+
+
+def test_a_scheduled_briefing_in_the_evening_hours_would_still_be_the_morning_one(tmp_path):
+    """``scheduled`` wins over the clock (e.g. BRIEF_TIME=18:00): 아침 wording and today only."""
+    log: list[dict] = []
+    run = PersonaRun()
+    code, _ = relay(make_bots(log), CHANNEL, run, tmp_path=tmp_path, now=at(8, 18, 0), scheduled=True)
+    assert code == 0 and texts(log, "mungchi")[0].startswith(f"{GREETING}\n\n")
+    assert 'date="2026-10-08", days=1' in run.call("schedule")["prompt"]
 
 
 def test_a_late_start_catches_up_until_noon_then_skips_with_one_log_line(tmp_path, caplog):

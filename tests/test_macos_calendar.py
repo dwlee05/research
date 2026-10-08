@@ -419,6 +419,29 @@ def test_tool_handler_and_briefing_run_honour_calendar_exclude_from_the_environm
     assert adapter.fetches[0][2] == ["연구", "Work"]
 
 
+def test_an_evening_briefings_two_days_include_tomorrow_and_still_honour_calendar_exclude():
+    """A manual briefing from 17:00 asks for today and tomorrow (days=2): tomorrow's events come through
+    the same path, so an excluded calendar's 절기 stays out on both days."""
+    records = [
+        record("지도교수 면담", at(8, 9), at(8, 10)),  # today, already over at 17:50
+        record("한로", at(8), at(9), calendar=CHINA, all_day=True),
+        record("랩 미팅", at(9, 10), at(9, 11), location="302호"),  # tomorrow
+        record("상강", at(9), at(10), calendar=CHINA, all_day=True),
+        record("모레 일정", at(10, 9), at(10, 10)),  # outside the window
+    ]
+    adapter = FakeAdapter(calendars=EXCLUDE_CALENDARS, records=records, series=[])
+    evening = datetime(2026, 10, 8, 17, 50, tzinfo=SEOUL)
+    payload = run_schedule(
+        "2026-10-08", 2, env={**ENV, "CALENDAR_EXCLUDE": CHINA}, now=evening, platform="darwin", adapter_factory=lambda tz: adapter
+    )
+    assert payload["range"] == {"start": "2026-10-08", "end": "2026-10-09", "days": 2}
+    assert [(e["title"], e["start"][:10]) for e in payload["events"]] == [("지도교수 면담", "2026-10-08"), ("랩 미팅", "2026-10-09")]
+    assert payload["now"] == [] and payload["next_event"]["title"] == "랩 미팅"  # the next one is tomorrow's
+    text = json.dumps(payload, ensure_ascii=False)
+    assert "한로" not in text and "상강" not in text and "모레 일정" not in text
+    assert all(names == ["연구", "Work"] for _start, _end, names in adapter.fetches)
+
+
 # ---------------------------------------------------------------- pure EventKit helpers
 
 
