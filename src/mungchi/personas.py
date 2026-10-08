@@ -33,3 +33,14 @@ def has_final_consonant(word: str) -> bool:
 def josa(word: str, after_consonant: str, after_vowel: str) -> str:
     """``word`` plus the particle form that fits it, e.g. ``josa("업뎃", "이", "가") == "업뎃이"``."""
     return word + (after_consonant if has_final_consonant(word) else after_vowel)
+
+
+def call_name(persona: str) -> str:
+    """The friendly form a teammate's name takes in casual speech: ``업뎃이``, ``일정이``, ``고뭉치``.
+
+    A Korean name ending in a consonant takes 이 when it is called or talked
+    about warmly ("업뎃이가 채널에 없어서", "일정이에게 물어보는 중"); one
+    ending in a vowel stays as it is (고뭉치가). Particles go after this form.
+    """
+    label = PERSONA_LABELS[persona]
+    return label + ("이" if has_final_consonant(label) else "")

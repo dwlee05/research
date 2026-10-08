@@ -7,18 +7,16 @@ import re
 from datetime import datetime
 from typing import Callable
 
-from .personas import MUNGCHI, SCHEDULE, UPDATE
+from .personas import MUNGCHI
+from .phrases import PLACEHOLDER_POOLS
 
 # Slack recommends keeping message text well under 4,000 characters.
 MAX_CHUNK_CHARS = 3_500
 
-# First reply of each bot while its agent works (Korean particles: 고뭉치가, 업뎃이, 일정이).
-PLACEHOLDERS = {
-    MUNGCHI: "🗂️ 고뭉치가 확인 중이에요...",
-    UPDATE: "📝 업뎃이 확인 중이에요...",
-    SCHEDULE: "⏰ 일정이 확인 중이에요...",
-}
-PLACEHOLDER_TEXT = PLACEHOLDERS[MUNGCHI]
+# The first reply of each bot while its agent works is picked at random from
+# its pool (``phrases.pick_placeholder``); this one is only the default of
+# ``slack_bot.StatusUpdater``.
+PLACEHOLDER_TEXT = PLACEHOLDER_POOLS[MUNGCHI][0]
 WEEKDAYS_KO = ("월", "화", "수", "목", "금", "토", "일")
 # First line of every briefing: "☀️ 오늘의 브리핑 (10/08 목)", bold in Slack.
 BRIEF_TITLE = "오늘의 브리핑 ({date})"

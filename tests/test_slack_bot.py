@@ -27,8 +27,9 @@ from mungchi.slack_bot import (
     post_briefing,
 )
 from mungchi.personas import SLACK_APP_NAMES, SLACK_HANDLES
-from mungchi.slack_format import PLACEHOLDER_TEXT, PLACEHOLDERS, SLACK_FORMAT_PROMPT
+from mungchi.slack_format import PLACEHOLDER_TEXT, SLACK_FORMAT_PROMPT
 from mungchi.state import StateStore, ThreadSessions
+from mungchi.phrases import BOTH_LEADS, CREDIT_LEADS, PLACEHOLDER_POOLS, WEATHER_LEADS
 
 OWNER = "UOWNER1"
 STRANGER = "USTRANGER"
@@ -134,6 +135,13 @@ class FakeRun:
             self.active -= 1
 
 
+def without_lead(text: str, leads, persona: str = "mungchi") -> str:
+    """A shortcut reply's data lines: the first line must be one of ``persona``'s lead-ins."""
+    lead, body = text.split("\n", 1)
+    assert lead in leads[persona], lead
+    return body
+
+
 def make_handler(tmp_path: Path, run=None, client=None, **kwargs) -> tuple[SlackHandler, FakeSlackClient, FakeRun]:
     client = client or FakeSlackClient()
     run = run or FakeRun()
@@ -177,7 +185,7 @@ def test_mention_end_to_end_placeholder_status_and_chunked_answer(tmp_path):
     # 1) placeholder posted in the thread of the mention
     first = client.calls[0]
     assert first[0] == "post"
-    assert first[1]["text"] == PLACEHOLDER_TEXT
+    assert first[1]["text"] in PLACEHOLDER_POOLS["mungchi"]  # one of 고뭉치's varied first replies
     assert first[1]["thread_ts"] == "1700000000.000100"
     placeholder_ts = first[1]["_ts"]
     # 2) the agent ran once with the stripped prompt and Slack formatting
@@ -191,7 +199,7 @@ def test_mention_end_to_end_placeholder_status_and_chunked_answer(tmp_path):
         }
     ]
     # 3) status updates edited the placeholder
-    status_updates = [u for u in client.updates if u["text"].startswith(PLACEHOLDER_TEXT)]
+    status_updates = [u for u in client.updates if u["text"].startswith(first[1]["text"] + "\n")]
     assert status_updates[0]["ts"] == placeholder_ts
     assert "→ 업뎃에게 맡기는 중..." in status_updates[0]["text"]
     assert "→ 일정에게 맡기는 중..." in status_updates[-1]["text"]
@@ -412,7 +420,8 @@ def test_failed_placeholder_update_falls_back_to_posting(tmp_path):
     client = FakeSlackClient(fail_updates=True)
     handler, client, _ = make_handler(tmp_path, client=client)
     asyncio.run(handler.handle_event(mention(), event_id="Ev1", source="mention"))
-    assert [p["text"] for p in client.posts] == [PLACEHOLDER_TEXT, "답변입니다."]
+    placeholder, answer = [p["text"] for p in client.posts]
+    assert placeholder in PLACEHOLDER_POOLS["mungchi"] and answer == "답변입니다."
 
 
 def test_compose_reply_variants():
@@ -771,7 +780,7 @@ def test_slack_manifest_bot_display_name_is_ascii_handle(name):
 
 
 def test_user_facing_slack_texts_use_moongchi_name_and_handle():
-    assert PLACEHOLDER_TEXT == "🗂️ 고뭉치가 확인 중이에요..."
+    assert PLACEHOLDER_TEXT == "잠시만요, 금방 확인해 볼게요 🗂️" == PLACEHOLDER_POOLS["mungchi"][0]
     assert "고뭉치" in CRASH_TEXT
     assert "/invite @moongchi" in slack_bot.SLACK_ERROR_HINTS["not_in_channel"]
     assert "@mungchi" not in slack_bot.SLACK_ERROR_HINTS["not_in_channel"]
@@ -818,10 +827,7 @@ def test_session_store_write_errors_do_not_block_the_reply(tmp_path):
 
 
 def test_per_persona_texts_use_the_right_names_and_particles():
-    assert slack_bot.BOT_TEXTS["mungchi"].placeholder == "🗂️ 고뭉치가 확인 중이에요..."
-    assert slack_bot.BOT_TEXTS["update"].placeholder == "📝 업뎃이 확인 중이에요..."
-    assert slack_bot.BOT_TEXTS["schedule"].placeholder == "⏰ 일정이 확인 중이에요..."
-    assert PLACEHOLDERS == {p: slack_bot.BOT_TEXTS[p].placeholder for p in ("mungchi", "update", "schedule")}
+    assert PLACEHOLDER_POOLS == {p: slack_bot.BOT_TEXTS[p].placeholders for p in ("mungchi", "update", "schedule")}
     # 고뭉치's texts are unchanged.
     assert slack_bot.EMPTY_ANSWER_TEXT == "고뭉치가 빈 답을 보냈어요. 다시 물어봐 주세요."
     assert slack_bot.FAILED_TEXT == "⚠️ 고뭉치가 답을 끝내지 못했어요."
@@ -868,8 +874,7 @@ def test_direct_bot_empty_mention_defaults(tmp_path, persona, expected):
 def test_direct_bot_shows_only_its_placeholder_then_the_answer(tmp_path, persona):
     handler, client, run = make_handler(tmp_path, persona=persona)  # FakeRun still emits status lines
     asyncio.run(handler.handle_event(mention(), event_id="Ev1", source="mention"))
-    placeholder = slack_bot.BOT_TEXTS[persona].placeholder
-    assert client.posts[0]["text"] == placeholder
+    assert client.posts[0]["text"] in slack_bot.BOT_TEXTS[persona].placeholders
     assert [u["text"] for u in client.updates] == ["답변입니다."]  # no "→ ...에게 맡기는 중" status edits
     call = run.calls[0]
     assert call["persona"] == persona and call["extra_system_prompt"] == SLACK_FORMAT_PROMPT
@@ -1220,7 +1225,7 @@ def test_credit_shortcut_answers_without_an_agent_turn(tmp_path, persona, event,
     assert run.calls == []  # run_turn is never called: no LLM
     assert fake.calls == 1
     [post] = client.posts
-    assert post["text"] == FakeCredits.TEXT
+    assert without_lead(post["text"], CREDIT_LEADS, persona) == FakeCredits.TEXT  # the data lines are unchanged
     assert post["thread_ts"] == event["ts"] and post["channel"] == event["channel"]
     assert client.updates == []  # no placeholder to edit
     # No session / thread-map entry for a shortcut reply.
@@ -1292,7 +1297,7 @@ def test_default_credit_text_calls_only_the_gateway(tmp_path, monkeypatch):
     asyncio.run(handler.handle_event(dm("크레딧"), event_id="Ev1", source="dm"))
     assert run.calls == []
     assert paths == ["/v1/gateway/credits/", "/v1/gateway/usage/"]
-    assert client.posts[0]["text"].startswith("💳 *Chat KHU 크레딧*: 75 남음 / 100 (75%)")
+    assert without_lead(client.posts[0]["text"], CREDIT_LEADS).startswith("💳 *Chat KHU 크레딧*: 75 남음 / 100 (75%)")
     assert "gw-slack-test-token" not in client.posts[0]["text"]
 
 
@@ -1849,7 +1854,7 @@ def test_weather_shortcut_answers_without_an_agent_turn(tmp_path, persona, event
     assert run.calls == []  # run_turn is never called: no LLM
     assert fake.calls == 1 and credit.calls == 0
     [post] = client.posts
-    assert post["text"] == FakeWeatherText.TEXT
+    assert without_lead(post["text"], WEATHER_LEADS, persona) == FakeWeatherText.TEXT  # the data line is unchanged
     assert post["thread_ts"] == event["ts"] and post["channel"] == event["channel"]
     assert client.updates == []  # no placeholder to edit
     # No session / thread-map entry for a shortcut reply.
@@ -1918,7 +1923,7 @@ def test_broader_weather_phrasings_use_the_shortcut(tmp_path, persona, text):
     asyncio.run(scenario())
     assert run.calls == []  # never an agent turn, so never an LLM call
     assert fake.calls == 2 and credit.calls == 0
-    assert [p["text"] for p in client.posts] == [FakeWeatherText.TEXT] * 2
+    assert [without_lead(p["text"], WEATHER_LEADS, persona) for p in client.posts] == [FakeWeatherText.TEXT] * 2
     assert handler.sessions.threads() == {}
 
 
@@ -1993,14 +1998,14 @@ def test_default_weather_text_calls_only_open_meteo(tmp_path, monkeypatch):
     asyncio.run(handler.handle_event(dm("날씨"), event_id="Ev1", source="dm"))
     assert run.calls == []
     assert hosts == ["api.open-meteo.com", "air-quality-api.open-meteo.com"]
-    assert [p["text"] for p in client.posts] == ["☀️ *서울 날씨*: 맑음 · 최저 10° / 최고 21° · 강수확률 0% · 미세먼지 좋음"]
+    assert [without_lead(p["text"], WEATHER_LEADS) for p in client.posts] == ["☀️ *서울 날씨*: 맑음 · 최저 10° / 최고 21° · 강수확률 0% · 미세먼지 좋음"]
 
 
 def test_default_weather_text_offline_is_the_short_note(tmp_path):
     handler, client, run = make_handler(tmp_path)  # conftest: no network
     asyncio.run(handler.handle_event(dm("날씨"), event_id="Ev1", source="dm"))
     assert run.calls == []
-    assert [p["text"] for p in client.posts] == ["🌤️ *서울 날씨*: 가져오지 못했어요"]
+    assert [p["text"] for p in client.posts] == ["🌤️ *서울 날씨*: 가져오지 못했어요"]  # a failure line gets no lead-in
 
 
 # ---------------------------------------------------------------- "토큰" and the combined weather + credit shortcut (no LLM)
@@ -2026,8 +2031,8 @@ def test_weather_and_credits_together_are_answered_by_code(tmp_path, persona, ev
     assert fake_weather.calls == 1 and fake_credits.calls == 1
     [post] = client.posts
     # The weather line, a blank line, then the credit summary, in one threaded reply.
-    assert post["text"] == COMBINED_TEXT
-    assert post["text"].split("\n\n") == [FakeWeatherText.TEXT, FakeCredits.TEXT]
+    assert without_lead(post["text"], BOTH_LEADS, persona) == COMBINED_TEXT
+    assert without_lead(post["text"], BOTH_LEADS, persona).split("\n\n") == [FakeWeatherText.TEXT, FakeCredits.TEXT]
     assert post["thread_ts"] == event["ts"] and post["channel"] == event["channel"]
     assert client.updates == []  # no placeholder
     assert not (tmp_path / "threads.json").exists()
@@ -2050,7 +2055,7 @@ def test_weather_and_credits_are_fetched_concurrently(tmp_path):
 
     handler, client, run = make_handler(tmp_path, weather_text=weather_text, credit_text=credit_text)
     asyncio.run(handler.handle_event(dm("날씨랑 토큰"), event_id="Ev1", source="dm"))
-    assert [p["text"] for p in client.posts] == [COMBINED_TEXT]
+    assert [without_lead(p["text"], BOTH_LEADS) for p in client.posts] == [COMBINED_TEXT]
     assert run.calls == []
 
 
@@ -2076,7 +2081,7 @@ def test_one_failing_half_of_the_combined_reply_is_a_short_note(tmp_path, monkey
     with caplog.at_level(logging.ERROR, logger="mungchi.slack"):
         asyncio.run(handler.handle_event(dm("날씨랑 토큰"), event_id="Ev1", source="dm"))
     assert run.calls == []
-    assert [p["text"] for p in client.posts] == [
+    assert [without_lead(p["text"], BOTH_LEADS) for p in client.posts] == [
         FakeWeatherText.TEXT + "\n\n" + slack_bot.CREDIT_CRASH_TEXT.format(kind="RuntimeError")
     ]
     assert SLACK_TOKEN not in caplog.text
@@ -2084,7 +2089,7 @@ def test_one_failing_half_of_the_combined_reply_is_a_short_note(tmp_path, monkey
     client.calls.clear()
     handler = make_handler(tmp_path, client=client, weather_text=FakeWeatherText(""), credit_text=FakeCredits())[0]
     asyncio.run(handler.handle_event(dm("날씨랑 토큰", ts="1700000000.000300"), event_id="Ev2", source="dm"))
-    assert [p["text"] for p in client.posts] == [
+    assert [without_lead(p["text"], BOTH_LEADS) for p in client.posts] == [
         slack_bot.WEATHER_CRASH_TEXT.format(kind="빈 응답") + "\n\n" + FakeCredits.TEXT
     ]
 
@@ -2098,7 +2103,7 @@ def test_token_means_the_credits(tmp_path, persona, text):
     handler, client, run = make_handler(tmp_path, persona=persona, weather_text=fake_weather, credit_text=fake_credits)
     asyncio.run(handler.handle_event(dm(text), event_id="Ev1", source="dm"))
     assert run.calls == [] and fake_weather.calls == 0 and fake_credits.calls == 1
-    assert [p["text"] for p in client.posts] == [FakeCredits.TEXT]
+    assert [without_lead(p["text"], CREDIT_LEADS, persona) for p in client.posts] == [FakeCredits.TEXT]
     assert handler.sessions.threads() == {}
 
 
@@ -2338,7 +2343,7 @@ def test_a_briefing_request_gets_the_full_code_driven_briefing(tmp_path, event, 
     # The usual placeholder in the thread, progress lines, then the briefing in its place.
     thread = event["ts"]
     placeholder = client.posts[0]
-    assert placeholder["text"] == PLACEHOLDER_TEXT
+    assert placeholder["text"] in PLACEHOLDER_POOLS["mungchi"]
     assert placeholder["channel"] == event["channel"] and placeholder["thread_ts"] == thread
     assert any("→ 업뎃에게 맡기는 중..." in update["text"] for update in client.updates[:-1])
     assert len(client.posts) == 1 and client.updates[-1]["ts"] == placeholder["_ts"]
@@ -3075,7 +3080,7 @@ def test_a_photo_in_a_dm_goes_to_the_agent_with_the_images_then_buttons(tmp_path
     assert fetcher.calls == [("https://files.slack.com/files-pri/T1-F1/download/poster.jpg", SLACK_TOKEN)]
     assert run.keys == [slack_conversation_key("update", DM, ROOT)] and run.calls[0]["persona"] == "update"
     placeholder, buttons = client.posts
-    assert placeholder["text"] == PLACEHOLDERS["update"] and client.updates[-1]["text"].startswith("• 10/22(목)")
+    assert placeholder["text"] in PLACEHOLDER_POOLS["update"] and client.updates[-1]["text"].startswith("• 10/22(목)")
     assert buttons["blocks"][1]["type"] == "actions"  # the same category buttons as for a pasted note
     # The same message delivered again (retry) is not downloaded twice.
     asyncio.run(handler.handle_event(photo_dm(ts=ROOT, client_msg_id="m-photo"), event_id="Ev1", source="dm"))

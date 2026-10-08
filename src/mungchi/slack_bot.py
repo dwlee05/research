@@ -33,6 +33,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import random
 import re
 import sys
 import time
@@ -47,13 +48,12 @@ import httpx
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 
-from . import briefing, config, credits, images, quick_info, version, weather
+from . import briefing, config, credits, images, phrases, quick_info, version, weather
 from .briefing import BRIEF_CRASH_TEXT, Briefing, build_briefing
 from .main import TurnResult, run_turn
 from .personas import MUNGCHI, PERSONA_LABELS, PERSONAS, SCHEDULE, SLACK_HANDLES, UPDATE, josa
 from .slack_format import (
     PLACEHOLDER_TEXT,
-    PLACEHOLDERS,
     SLACK_FORMAT_PROMPT,
     chunk_text,
     strip_mention,
@@ -153,7 +153,7 @@ class BotTexts:
     persona: str
     label: str
     handle: str
-    placeholder: str
+    placeholders: tuple[str, ...]  # the first reply while the agent works: one is picked at random
     empty_answer: str
     failed: str
     crash: str  # format with kind=<exception class name>
@@ -167,7 +167,7 @@ def bot_texts(persona: str) -> BotTexts:
         persona=persona,
         label=label,
         handle=SLACK_HANDLES[persona],
-        placeholder=PLACEHOLDERS[persona],
+        placeholders=phrases.PLACEHOLDER_POOLS[persona],
         empty_answer=f"{subject} 빈 답을 보냈어요. 다시 물어봐 주세요.",
         failed=f"⚠️ {subject} 답을 끝내지 못했어요.",
         crash=f"⚠️ {obj} 실행하지 못했어요 ({{kind}}). 잠시 후 다시 시도해 주세요.",
@@ -536,6 +536,7 @@ class SlackHandler:
         create_events: EventCreator | None = None,
         bot_token: str | None = None,
         file_fetcher: FileFetcher | None = None,
+        rng: random.Random | None = None,
     ):
         self.allowed_user_ids = frozenset(allowed_user_ids)
         if not self.allowed_user_ids:
@@ -565,6 +566,8 @@ class SlackHandler:
         # Photos are downloaded with this bot's own token (never logged).
         self.bot_token = bot_token if bot_token is not None else getattr(client, "token", None)
         self.file_fetcher = file_fetcher or download_slack_file
+        # Picks the varied lines (placeholders, shortcut lead-ins); seed it for repeatable tests.
+        self.rng = rng or random.Random()
         # Threads with an agent turn running or queued: a "네" sent meanwhile came
         # before its preview was shown, so it never confirms anything.
         self._turns: dict[str, int] = {}
@@ -925,20 +928,30 @@ class SlackHandler:
     #
     # The reply goes into the thread; the thread -> session map is not touched.
 
-    async def _shortcut_text(self, fetch: Callable[[], str], crash: str, failure: str) -> str:
-        """``fetch()`` in a worker thread, or ``crash`` (with the exception's class name) when it fails or is empty."""
+    async def _shortcut_text(self, fetch: Callable[[], str], crash: str, failure: str) -> tuple[str, bool]:
+        """``(fetch(), fetched)`` from a worker thread, or ``(crash, False)`` (with the exception's class name) when it fails or is empty.
+
+        ``fetched`` is False for a failure line, so ``_with_lead`` leaves it bare.
+        """
         try:
             text = await asyncio.to_thread(fetch)
         except Exception as exc:  # noqa: BLE001 - reported in Slack without details
             _log_exception(failure, exc)
-            return crash.format(kind=type(exc).__name__)
-        return text if (text or "").strip() else crash.format(kind="빈 응답")
+            return crash.format(kind=type(exc).__name__), False
+        if not (text or "").strip():
+            return crash.format(kind="빈 응답"), False
+        # The shortcut's own failure lines ("⚠️ ...", "🌤️ 서울 날씨: 가져오지 못했어요") get no cheerful lead-in.
+        return text, not (text.lstrip().startswith("⚠️") or weather.FAILED_NOTE in text)
 
-    async def _credit_text(self) -> str:
+    async def _credit_text(self) -> tuple[str, bool]:
         return await self._shortcut_text(self.credit_text, CREDIT_CRASH_TEXT, "크레딧을 확인하지 못했습니다.")
 
-    async def _weather_text(self) -> str:
+    async def _weather_text(self) -> tuple[str, bool]:
         return await self._shortcut_text(self.weather_text, WEATHER_CRASH_TEXT, "날씨를 가져오지 못했습니다.")
+
+    def _with_lead(self, leads: Mapping[str, Sequence[str]], body: str, fetched: bool) -> str:
+        """``body`` (code's data lines, unchanged) under one short line in this bot's voice; a failure stays bare."""
+        return f"{phrases.pick(leads[self.persona], self.rng)}\n{body}" if fetched else body
 
     async def _post_shortcut(self, channel: str, thread_ts: str, text: str) -> None:
         for chunk in to_slack_chunks(text):
@@ -947,18 +960,21 @@ class SlackHandler:
     async def _answer_credits(self, channel: str, thread_ts: str) -> None:
         """Reply with the credit summary."""
         log.info("%s: 스레드 %s:%s 크레딧 바로 답변 (에이전트 실행 없음)", self.texts.label, channel, thread_ts)
-        await self._post_shortcut(channel, thread_ts, await self._credit_text())
+        text, fetched = await self._credit_text()
+        await self._post_shortcut(channel, thread_ts, self._with_lead(phrases.CREDIT_LEADS, text, fetched))
 
     async def _answer_weather(self, channel: str, thread_ts: str) -> None:
         """Reply with today's weather line."""
         log.info("%s: 스레드 %s:%s 날씨 바로 답변 (에이전트 실행 없음)", self.texts.label, channel, thread_ts)
-        await self._post_shortcut(channel, thread_ts, await self._weather_text())
+        text, fetched = await self._weather_text()
+        await self._post_shortcut(channel, thread_ts, self._with_lead(phrases.WEATHER_LEADS, text, fetched))
 
     async def _answer_weather_and_credits(self, channel: str, thread_ts: str) -> None:
         """Reply with the weather line, a blank line, then the credit summary (both fetched at once)."""
         log.info("%s: 스레드 %s:%s 날씨·크레딧 바로 답변 (에이전트 실행 없음)", self.texts.label, channel, thread_ts)
-        weather_text, credit_text = await asyncio.gather(self._weather_text(), self._credit_text())
-        await self._post_shortcut(channel, thread_ts, f"{weather_text}\n\n{credit_text}")
+        (weather_text, weather_ok), (credit_text, credit_ok) = await asyncio.gather(self._weather_text(), self._credit_text())
+        body = f"{weather_text}\n\n{credit_text}"
+        await self._post_shortcut(channel, thread_ts, self._with_lead(phrases.BOTH_LEADS, body, weather_ok or credit_ok))
 
     # -- 고뭉치's briefing on request (the morning briefing's builder, in this thread)
 
@@ -979,12 +995,13 @@ class SlackHandler:
             channel,
             thread_ts,
         )
-        placeholder = await self._post(channel, thread_ts, self.texts.placeholder)
+        placeholder_text = phrases.pick_placeholder(self.persona, self.rng)
+        placeholder = await self._post(channel, thread_ts, placeholder_text)
         async with self._thread_lock(f"{self.persona}:{channel}:{thread_ts}"):
             async with self._semaphore:
                 updater = (
                     StatusUpdater(
-                        self.client, channel, placeholder, interval=self.status_interval, placeholder=self.texts.placeholder
+                        self.client, channel, placeholder, interval=self.status_interval, placeholder=placeholder_text
                     )
                     if placeholder
                     else None
@@ -1035,11 +1052,14 @@ class SlackHandler:
         # Counted before the first await, so a "네" arriving meanwhile sees it.
         self._turns[key] = self._turns.get(key, 0) + 1
         try:
-            placeholder = await self._post(channel, thread_ts, self.texts.placeholder)
+            placeholder_text = phrases.pick_placeholder(self.persona, self.rng)
+            placeholder = await self._post(channel, thread_ts, placeholder_text)
             # Messages in one thread run in order per bot; all bots share the cost cap.
             async with self._thread_lock(f"{self.persona}:{channel}:{thread_ts}"):
                 async with self._semaphore:
-                    await self._run_and_reply(channel, thread_ts, placeholder, prompt, files=files)
+                    await self._run_and_reply(
+                        channel, thread_ts, placeholder, prompt, files=files, placeholder_text=placeholder_text
+                    )
         finally:
             self._turns[key] -= 1
             if not self._turns[key]:
@@ -1053,6 +1073,7 @@ class SlackHandler:
         prompt: str,
         *,
         files: list[Mapping[str, Any]] | None = None,
+        placeholder_text: str = PLACEHOLDER_TEXT,
     ) -> None:
         persona, label = self.persona, self.texts.label
         # Photos: downloaded and shrunk here (in memory), sent with the text as image blocks.
@@ -1065,11 +1086,11 @@ class SlackHandler:
                 return
             run_extra["images"] = prepared
         resume = self.sessions.get(channel, thread_ts, persona=persona)
-        # Only 고뭉치 shows progress ("→ 업뎃에게 맡기는 중..."); 업뎃 and 일정
+        # Only 고뭉치 shows progress ("→ 업뎃이에게 물어보는 중..."); 업뎃 and 일정
         # keep their placeholder until the answer replaces it.
         updater = (
             StatusUpdater(
-                self.client, channel, placeholder, interval=self.status_interval, placeholder=self.texts.placeholder
+                self.client, channel, placeholder, interval=self.status_interval, placeholder=placeholder_text
             )
             if placeholder and persona == MUNGCHI
             else None

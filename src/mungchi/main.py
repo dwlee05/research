@@ -36,7 +36,7 @@ from .agents import (
     build_system_prompt,
     with_now_line,
 )
-from .personas import DIRECT_PERSONAS, MUNGCHI, PERSONA_LABELS, PERSONAS, SCHEDULE, UPDATE, josa
+from .personas import DIRECT_PERSONAS, MUNGCHI, PERSONA_LABELS, PERSONAS, SCHEDULE, UPDATE, call_name, josa
 from .state import StateStore, utcnow
 from .tools import DATA_TOOLS, MUNGCHI_TOOLS, PROPOSE_TOOL, SERVER_NAME, build_server, data_tools, tools_named
 from .tools import event_proposals
@@ -416,8 +416,8 @@ class Renderer:
                     continue
                 self._announced.add(block.id)
                 subagent = str(block.input.get("subagent_type", ""))
-                label = AGENT_LABELS.get(subagent, subagent or "담당자")
-                self._status_line(f"→ {label}에게 맡기는 중...")
+                name = call_name(subagent) if subagent in AGENT_LABELS else (subagent or "담당자")
+                self._status_line(f"→ {name}에게 물어보는 중...")
         self._streamed_text = False
 
     def _on_result(self, message: ResultMessage) -> None:
@@ -505,7 +505,7 @@ async def run_turn(
 
     Shared by the CLI (one-shot, ``--brief``, ``--agent``) and the Slack bots.
     ``on_status`` receives the same status lines the CLI prints, e.g.
-    "→ 업뎃에게 맡기는 중...". Without ``renderer`` nothing is printed.
+    "→ 업뎃이에게 물어보는 중...". Without ``renderer`` nothing is printed.
     The prompt is sent with the current time in front (``stamp_prompt``).
     ``briefing=True`` only for briefing runs; ``conversation_key`` is where a
     calendar proposal made in this turn waits for the user's answer (see ``build_options``).

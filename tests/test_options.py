@@ -186,7 +186,8 @@ def test_renderer_streams_text_once_and_announces_subagents():
         ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1, is_error=False, num_turns=2, session_id="s")
     )
     assert out.getvalue() == "확인할게요.\n\n브리핑 끝\n"
-    assert status.getvalue().splitlines() == ["→ 업뎃에게 맡기는 중...", "→ 일정에게 맡기는 중..."]
+    # Teammates by their friendly names (업뎃이, 일정이).
+    assert status.getvalue().splitlines() == ["→ 업뎃이에게 물어보는 중...", "→ 일정이에게 물어보는 중..."]
     assert not renderer.failed
 
 
@@ -274,7 +275,7 @@ def test_run_turn_resumes_reports_status_and_returns_answer(fake_sdk, capsys):
     assert result.text == "*① 공저자 업데이트*\n• 변경 없음"
     assert result.session_id == "sess-final"
     assert not result.failed and result.error is None
-    assert seen == ["→ 업뎃에게 맡기는 중..."]
+    assert seen == ["→ 업뎃이에게 물어보는 중..."]
     [client] = fake_sdk.instances
     assert [without_now_line(p) for p in client.prompts] == ["질문"]
     opts = client.options
@@ -294,7 +295,7 @@ def test_run_turn_resumes_reports_status_and_returns_answer(fake_sdk, capsys):
 def test_run_turn_accepts_sync_and_failing_status_callbacks(fake_sdk, capsys):
     seen: list[str] = []
     asyncio.run(run_turn("q", on_status=seen.append))
-    assert seen == ["→ 업뎃에게 맡기는 중..."]
+    assert seen == ["→ 업뎃이에게 물어보는 중..."]
 
     def broken(line):
         raise RuntimeError("display down")
@@ -315,7 +316,7 @@ def test_cli_one_shot_output_is_unchanged(fake_sdk, capsys):
     assert main(["어제 공저자들이 뭐 고쳤어?"]) == 0
     out, err = capsys.readouterr()
     assert out == "업뎃에게 맡길게요.\n*① 공저자 업데이트*\n• 변경 없음\n"
-    assert err == "→ 업뎃에게 맡기는 중...\n"
+    assert err == "→ 업뎃이에게 물어보는 중...\n"
     [client] = fake_sdk.instances
     assert [without_now_line(p) for p in client.prompts] == ["어제 공저자들이 뭐 고쳤어?"]
     assert client.options.resume is None
@@ -597,11 +598,15 @@ def test_direct_and_subagent_prompts_share_the_same_rules():
     assert "사용자에게 직접" in direct and "사용자에게 직접" not in sub
     rules = sub[sub.index("## 규칙") : sub.index("## 보고 형식")]
     assert rules.replace("고뭉치에게", "사용자에게") in direct
-    assert sub.split("## 보고 형식")[1] == direct.split("## 답 형식")[1]
+    # Same format; only the voice differs (plain report to 고뭉치 vs. 업뎃's own voice to the user).
+    assert sub.split("## 보고 형식")[1].split("\n## 말투")[0] == direct.split("## 답 형식")[1].split("\n## 말투")[0]
 
     sub, direct = build_schedule_prompt(), build_schedule_prompt(direct=True)
     assert "고뭉치에게 한국어로 짧게 보고" in sub and "사용자에게 직접 한국어로 짧게 답한다" in direct
-    assert sub.split("## 보고 형식 (짧게)")[1] == direct.split("## 답 형식 (짧게)")[1]
+    assert (
+        sub.split("## 보고 형식 (짧게)")[1].split("\n## 말투")[0]
+        == direct.split("## 답 형식 (짧게)")[1].split("\n## 말투")[0]
+    )
     assert "'일정' 에이전트" in sub and "'일정' 에이전트" in direct
 
 
@@ -1089,7 +1094,7 @@ def test_renderer_answer_starts_after_mungchis_own_tool_calls():
     )
     renderer.handle(AssistantMessage(content=[TextBlock(text="남은 크레딧은 9,050.5예요.")], model="m"))
     assert renderer.result().text == "남은 크레딧은 9,050.5예요."
-    assert renderer.status_lines == []  # no "→ ...에게 맡기는 중" for its own tools
+    assert renderer.status_lines == []  # no "→ ...에게 물어보는 중" for its own tools
 
 
 def test_help_says_mungchi_checks_tokens_and_weather_itself():
