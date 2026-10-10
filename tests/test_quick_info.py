@@ -7,7 +7,7 @@ import unicodedata
 import pytest
 
 from mungchi import credits, weather
-from mungchi.quick_info import CREDITS, WEATHER, is_briefing_request, parse_quick_info, query_text
+from mungchi.quick_info import CREDIT_DETAIL, CREDITS, WEATHER, is_briefing_request, parse_quick_info, query_text
 from mungchi.slack_bot import quick_info_request
 
 BOTH = {WEATHER, CREDITS}
@@ -47,6 +47,35 @@ BOTH = {WEATHER, CREDITS}
 def test_quick_info_questions(text, expected):
     assert parse_quick_info(text, "서울") == expected
     assert parse_quick_info(text) == expected  # 서울 is always a place
+    assert quick_info_request(text, "서울") == expected
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        # The agreed examples: a detail word with a credit keyword asks for the detailed credits.
+        ("크레딧 자세히", {CREDITS, CREDIT_DETAIL}),
+        ("토큰 내역", {CREDITS, CREDIT_DETAIL}),
+        # Same shape, other detail words and fillers.
+        ("크레딧 상세", {CREDITS, CREDIT_DETAIL}),
+        ("크레딧 상세 내역 보여줘", {CREDITS, CREDIT_DETAIL}),
+        ("모델별 토큰 사용량", {CREDITS, CREDIT_DETAIL}),
+        ("토큰 사용 내역 알려줘", {CREDITS, CREDIT_DETAIL}),
+        ("뭉치야 크레딧 자세하게 알려줘!", {CREDITS, CREDIT_DETAIL}),
+        ("토큰 좀 자세히", {CREDITS, CREDIT_DETAIL}),
+        ("잔액 상세히", {CREDITS, CREDIT_DETAIL}),
+        # Combined: short unless a detail word is there too.
+        ("날씨랑 크레딧", BOTH),
+        ("날씨랑 크레딧 자세히", {WEATHER, CREDITS, CREDIT_DETAIL}),
+        # A detail word without a credit keyword needs the agent.
+        ("날씨 자세히", set()),
+        ("자세히", set()),
+        ("내역", set()),
+        ("모델별로 알려줘", set()),
+    ],
+)
+def test_detailed_credit_requests(text, expected):
+    assert parse_quick_info(text, "서울") == expected
     assert quick_info_request(text, "서울") == expected
 
 

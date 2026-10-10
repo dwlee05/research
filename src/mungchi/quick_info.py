@@ -6,12 +6,15 @@ only asks for today's weather, the Chat KHU credits, or both at once:
     뭉치야 날씨랑 토큰 좀 말해봐   -> {"weather", "credits"}
     토큰 좀 알려줘                -> {"credits"}   ("토큰" is what the user calls the credits)
     날씨 알려줘                   -> {"weather"}
+    크레딧 자세히 / 토큰 내역      -> {"credits", "credit_detail"}   (the detailed credits)
 
 Everything in such a message is either a keyword (날씨; 크레딧, 토큰, 잔액,
-사용량) or filler from a small closed list (vocatives, connectors, time and
-place words, a few particles and request tails), with or without spaces. Any
-other word ("내일", "아끼려면", "Dropbox", ...) means the message needs the
-agent, so the result is empty.
+사용량; with a credit keyword also 자세히, 상세, 모델별, 내역) or filler from
+a small closed list (vocatives, connectors, time and place words, a few
+particles and request tails), with or without spaces. Any other word
+("내일", "아끼려면", "Dropbox", ...) means the message needs the agent, so
+the result is empty. A detail word without a credit keyword ("날씨 자세히")
+needs the agent too.
 
 ``is_briefing_request`` reads a short request for today's briefing the same
 way (keyword 브리핑, its own closed filler list):
@@ -31,6 +34,8 @@ import unicodedata
 
 WEATHER = "weather"
 CREDITS = "credits"
+# Asks for the detailed credits (with the models), only together with CREDITS.
+CREDIT_DETAIL = "credit_detail"
 
 # Slack sends emoji as ":name:" (":pray:", ":+1::skin-tone-2:").
 _TRAILING_SHORTCODES_RE = re.compile(r"(?:\s*:[a-z0-9_+'.-]+:)+\s*$")
@@ -62,6 +67,14 @@ KEYWORDS: dict[str, str] = {
     "토큰": CREDITS,  # the user's word for the Chat KHU credits
     "잔액": CREDITS,
     "사용량": CREDITS,
+    # "크레딧 자세히", "토큰 내역", "모델별 사용량": the detailed credits.
+    "자세히": CREDIT_DETAIL,
+    "자세하게": CREDIT_DETAIL,
+    "상세": CREDIT_DETAIL,
+    "상세히": CREDIT_DETAIL,
+    "모델별": CREDIT_DETAIL,
+    "내역": CREDIT_DETAIL,
+    "사용 내역": CREDIT_DETAIL,
 }
 
 # Filler, deliberately a small closed list. The configured WEATHER_LABEL counts as a place too.
@@ -102,22 +115,27 @@ def _vocabulary(label: str) -> tuple[tuple[str, str | None], ...]:
     place = _word(label)
     if place:
         words.setdefault(place, None)
-    words.update(KEYWORDS)
+    words.update({_word(word): kind for word, kind in KEYWORDS.items()})
     return tuple(sorted(((w, k) for w, k in words.items() if w), key=lambda item: (-len(item[0]), item[0])))
 
 
 def parse_quick_info(text: str | None, label: str | None = None) -> set[str]:
-    """What a short message asks for: a subset of ``{"weather", "credits"}``, empty when it needs the agent.
+    """What a short message asks for: a subset of ``{"weather", "credits", "credit_detail"}``, empty when it needs the agent.
 
     The message (mention already removed) is normalized like
     ``weather.is_weather_query`` does and must consist only of keywords and
     filler, in any order and with or without spaces. ``label`` is the
-    configured ``WEATHER_LABEL`` (서울 and 여기 always count). Pure.
+    configured ``WEATHER_LABEL`` (서울 and 여기 always count).
+    ``"credit_detail"`` ("자세히", "상세", "모델별", "내역") only counts
+    with a credit keyword; without one the message needs the agent. Pure.
     """
     compact = query_text(text).replace(" ", "")
     if not compact:
         return set()
-    return set(_keywords(compact, _vocabulary(label or "")) or ())
+    kinds = set(_keywords(compact, _vocabulary(label or "")) or ())
+    if CREDIT_DETAIL in kinds and CREDITS not in kinds:
+        return set()
+    return kinds
 
 
 def _keywords(compact: str, vocabulary: tuple[tuple[str, str | None], ...]) -> frozenset[str] | None:

@@ -2,7 +2,11 @@
 
 ``python -m mungchi --credits``, the Slack shortcut ("@고뭉치 크레딧", "토큰"),
 고뭉치's ``get_credits`` tool (``credit_payload``: compact JSON) and the
-running bots' low-credit alert all go through here. Only two read-only
+running bots' low-credit alert all go through here. The briefing, the
+Slack shortcut and the alert show the short summary (two lines: the
+balance, then this month's use and the projection); ``--credits`` and a
+detailed Slack request ("크레딧 자세히", "토큰 내역") the detailed one, with
+the call count, the dates and the models. Only two read-only
 gateway endpoints are called, ``GET {root}/credits/`` and ``GET {root}/usage/``;
 no model is used, so checking costs nothing. The key travels only in request
 headers, and every message that leaves this module is scrubbed.
@@ -390,6 +394,18 @@ def _bucket_line(label: str, bucket: Bucket) -> str:
     return f"{label}: {left} 남음 / {quota}"
 
 
+def _projection_text(balance: Balance, usage: Usage | None, now: datetime, tz: tzinfo, *, verb: str) -> str | None:
+    """``이 속도면 이번 달 약 4,200 {verb} (한도의 42%)``, or None before there is a projection."""
+    expected = projection(balance, usage, now, tz)
+    if expected is None:
+        return None
+    projected, share = expected
+    text = f"이 속도면 이번 달 약 {fmt_number(approx(projected))} {verb}"
+    if share is not None:
+        text += f" (한도의 {round(share):,}%)"
+    return text
+
+
 def format_summary(
     balance: Balance,
     usage: Usage | None = None,
@@ -398,12 +414,21 @@ def format_summary(
     tz: tzinfo,
     slack: bool = False,
     usage_error: str | None = None,
+    detailed: bool = True,
 ) -> str:
     """The Korean credit summary (Slack mrkdwn with ``slack=True``).
 
     ``💳 Chat KHU 크레딧: 9,050.5 남음 / 10,000 (90.5%) · 11/01 갱신``, then the
-    other credit sources (only when granted), this month's use, the top
-    models and a projection (once a full day of the cycle has passed).
+    other credit sources (only when granted), then:
+
+    * ``detailed`` (``--credits``, "크레딧 자세히"): this month's use with the
+      dates and the call count, the top models and a projection (once a
+      full day of the cycle has passed), each on its own line;
+    * short (the briefing, the Slack shortcut, the low-credit alert): one line,
+      ``이번 달 사용 949.5 · 이 속도면 이번 달 약 4,200 예상 (한도의 42%)``, the
+      projection left out while there is none.
+
+    A missing usage part is noted on its own line in both.
     """
     total = balance.total
     label = "*Chat KHU 크레딧*" if slack else "Chat KHU 크레딧"
@@ -433,6 +458,16 @@ def format_summary(
     used = _used(balance)
     if used is None and usage is not None:
         used = usage.credits
+    if not detailed:
+        parts = [f"이번 달 사용 {fmt_number(used)}"] if used is not None else []
+        expected = _projection_text(balance, usage, now, tz, verb="예상")
+        if expected:
+            parts.append(expected)
+        if parts:
+            lines.append(" · ".join(parts))
+        if usage_error:
+            lines.append(USAGE_MISSING_TEXT.format(reason=usage_error))
+        return "\n".join(lines)
     if used is not None:
         details = []
         if usage is not None and usage.start is not None and usage.end is not None:
@@ -457,13 +492,9 @@ def format_summary(
     if usage_error:
         lines.append(USAGE_MISSING_TEXT.format(reason=usage_error))
 
-    expected = projection(balance, usage, now, tz)
-    if expected is not None:
-        projected, share = expected
-        line = f"이 속도면 이번 달 약 {fmt_number(approx(projected))} 사용 예상"
-        if share is not None:
-            line += f" (한도의 {round(share):,}%)"
-        lines.append(line)
+    expected = _projection_text(balance, usage, now, tz, verb="사용 예상")
+    if expected:
+        lines.append(expected)
     return "\n".join(lines)
 
 
@@ -536,14 +567,17 @@ def summary_text(
     env: Mapping[str, str] | None = None,
     now: datetime | None = None,
     slack: bool = False,
+    detailed: bool = True,
 ) -> str:
-    """The summary for a successful report, else its error (with ``⚠️`` in Slack)."""
+    """The summary (``format_summary``, detailed or short) for a successful report, else its error (with ``⚠️`` in Slack)."""
     if not report.ok or report.balance is None:
         error = report.error or READ_ERROR_TEXT.format(kind="응답 없음")
         return ("⚠️ " if slack else "") + error
     tz = config.get_timezone(env)
     now = now or datetime.now(tz)
-    return format_summary(report.balance, report.usage, now=now, tz=tz, slack=slack, usage_error=report.usage_error)
+    return format_summary(
+        report.balance, report.usage, now=now, tz=tz, slack=slack, usage_error=report.usage_error, detailed=detailed
+    )
 
 
 def slack_credit_text(
@@ -551,9 +585,20 @@ def slack_credit_text(
     *,
     transport: httpx.BaseTransport | None = None,
     now: datetime | None = None,
+    detailed: bool = False,
 ) -> str:
-    """What the Slack shortcut posts: the summary in mrkdwn, or a short Korean error."""
-    return summary_text(fetch_report(env, transport=transport), env=env, now=now, slack=True)
+    """What the Slack shortcut posts: the short summary in mrkdwn (``detailed``: the detailed one), or a short Korean error."""
+    return summary_text(fetch_report(env, transport=transport), env=env, now=now, slack=True, detailed=detailed)
+
+
+def slack_credit_detail_text(
+    env: Mapping[str, str] | None = None,
+    *,
+    transport: httpx.BaseTransport | None = None,
+    now: datetime | None = None,
+) -> str:
+    """The Slack shortcut for a detailed request ("크레딧 자세히", "토큰 내역"): the detailed summary, with the models."""
+    return slack_credit_text(env, transport=transport, now=now, detailed=True)
 
 
 # ---------------------------------------------------------------- the get_credits tool (고뭉치)
@@ -576,7 +621,9 @@ def report_payload(
 ) -> dict[str, Any]:
     """Compact JSON for 고뭉치's get_credits tool: the same data as the summary.
 
-    ``summary`` is the Korean summary (``--credits``' text); ``total`` and
+    ``short_summary`` is the short Korean summary (the briefing's, the one to
+    pass on unless details are asked for), ``summary`` the detailed one
+    (``--credits``' text, with the models); ``total`` and
     ``monthly`` (quota / used / remaining), ``renewal_date`` (local
     YYYY-MM-DD), ``usage`` (this cycle, with the top models) and
     ``projection`` (credits expected by the end of the cycle at the current
@@ -602,6 +649,7 @@ def report_payload(
     payload = {
         "configured": True,
         "ok": True,
+        "short_summary": format_summary(balance, usage, now=now, tz=tz, usage_error=report.usage_error, detailed=False),
         "summary": format_summary(balance, usage, now=now, tz=tz, usage_error=report.usage_error),
         "total": total,
         "monthly": _bucket_payload(balance.monthly),
@@ -671,13 +719,13 @@ def alert_period(balance: Balance, now: datetime) -> str:
 
 
 def alert_text(report: CreditReport, threshold: float, *, env: Mapping[str, str] | None = None, now: datetime | None = None) -> str:
-    """The DM sent when the credits run low: a warning line, then the summary."""
+    """The DM sent when the credits run low: a warning line, then the short summary."""
     share = remaining_percent(report.balance) if report.balance is not None else None
     left = f"{fmt_number(share)}%" if share is not None else "알 수 없음"
     return (
         f"⚠️ *Chat KHU 크레딧이 얼마 남지 않았어요* (남은 비율 {left}, 알림 기준 {fmt_number(threshold)}%)\n"
         "이번 갱신 주기에는 이 알림을 한 번만 보내요. 봇에게 '크레딧'이라고 보내면 언제든 다시 확인할 수 있어요.\n\n"
-        + summary_text(report, env=env, now=now, slack=True)
+        + summary_text(report, env=env, now=now, slack=True, detailed=False)
     )
 
 
@@ -692,7 +740,10 @@ def run_credits_cli(
     out: TextIO | None = None,
     err: TextIO | None = None,
 ) -> int:
-    """``python -m mungchi --credits``: print the summary (stdout) or a Korean error (stderr)."""
+    """``python -m mungchi --credits``: print the detailed summary (stdout) or a Korean error (stderr).
+
+    A terminal diagnostic, so always the detailed form (dates, call count, models).
+    """
     out = out or sys.stdout
     err = err or sys.stderr
     secrets = config.secret_values(env)
@@ -702,5 +753,5 @@ def run_credits_cli(
         if not report.supported:
             print(UNSUPPORTED_HINT, file=err)
         return 1
-    print(scrub(summary_text(report, env=env, now=now), secrets), file=out)
+    print(scrub(summary_text(report, env=env, now=now, detailed=True), secrets), file=out)
     return 0

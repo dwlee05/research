@@ -115,6 +115,17 @@ def test_schedule_never_adds_holidays_or_solar_terms_of_its_own():
         assert not re.search(r"20\d\d-\d\d-\d\d|\d{1,2}월 \d{1,2}일", first)
 
 
+def test_mungchi_passes_on_the_short_credits_unless_details_are_asked_for():
+    rule = (
+        "크레딧은 짧게 전한다: 자세히 묻지 않으면 short_summary(남은 양·한도·갱신일 한 줄, 이번 달 사용과 예상 한 줄)를 그대로 옮기고, "
+        "모델별 사용·호출 횟수·기간은 '자세히', '상세', '모델별', '내역'처럼 자세히 물을 때만 summary로 전한다."
+    )
+    assert rule in MUNGCHI_SYSTEM_PROMPT
+    assert "  💳 크레딧: get_credits의 short_summary 그대로" in MUNGCHI_SYSTEM_PROMPT  # the briefing in a conversation too
+    first, again = build_options(env={}).system_prompt, build_options(env={}).system_prompt
+    assert first.encode("utf-8") == again.encode("utf-8")
+
+
 def test_call_names_take_i_after_a_final_consonant():
     assert [call_name(p) for p in PERSONAS] == ["고뭉치", "업뎃이", "일정이"]
 

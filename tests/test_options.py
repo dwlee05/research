@@ -459,7 +459,7 @@ def test_a_briefing_in_conversation_has_all_four_parts():
     assert "② Dropbox 업데이트는 업뎃에게 맡긴다" in section
     assert "💳 크레딧은 get_credits로 직접 확인한다." in section
     # The format, in the order of the code-driven briefing: weather, ①, ②, credits.
-    lines = ["  🌤️ 날씨: get_weather의 summary 한 줄", "  ① 오늘의 일정: 아래 규칙대로", "  ② Dropbox 업데이트: 아래 규칙대로", "  💳 크레딧: get_credits의 summary를 짧게"]
+    lines = ["  🌤️ 날씨: get_weather의 summary 한 줄", "  ① 오늘의 일정: 아래 규칙대로", "  ② Dropbox 업데이트: 아래 규칙대로", "  💳 크레딧: get_credits의 short_summary 그대로"]
     assert "\n".join(lines) in section
     # No blanket "never in a briefing" rule; and since the morning briefing became a relay (each bot
     # reports its own part), 고뭉치 has no program-made briefing run left to special-case.

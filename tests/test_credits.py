@@ -74,6 +74,13 @@ EXPECTED_SUMMARY = "\n".join(
         "이 속도면 이번 달 약 4,200 사용 예상 (한도의 42%)",
     ]
 )
+# The short form (briefing, Slack shortcut, low-credit alert): no models, call count or dates.
+EXPECTED_SHORT = "\n".join(
+    [
+        "💳 Chat KHU 크레딧: 9,050.5 남음 / 10,000 (90.5%) · 11/01 갱신",
+        "이번 달 사용 949.5 · 이 속도면 이번 달 약 4,200 예상 (한도의 42%)",
+    ]
+)
 
 
 def gateway_env(**extra):
@@ -95,9 +102,9 @@ def routes(credits_response=None, usage_response=None):
     return httpx.MockTransport(handle), requests
 
 
-def summary(balance_json=CREDITS_JSON, usage_json=USAGE_JSON, *, now=SEVEN_DAYS_IN, slack=False):
+def summary(balance_json=CREDITS_JSON, usage_json=USAGE_JSON, *, now=SEVEN_DAYS_IN, slack=False, detailed=True):
     usage = parse_usage(usage_json) if usage_json is not None else None
-    return format_summary(parse_balance(balance_json), usage, now=now, tz=SEOUL, slack=slack)
+    return format_summary(parse_balance(balance_json), usage, now=now, tz=SEOUL, slack=slack, detailed=detailed)
 
 
 # ---------------------------------------------------------------- parsing
@@ -277,6 +284,40 @@ def test_top_five_models_by_credits_then_a_count_of_the_rest():
     ]
 
 
+def test_the_short_form_drops_models_call_count_and_dates():
+    assert summary(detailed=False) == EXPECTED_SHORT
+    assert summary(slack=True, detailed=False) == EXPECTED_SHORT.replace("Chat KHU 크레딧", "*Chat KHU 크레딧*", 1)
+    short = summary(detailed=False)
+    assert "claude-" not in short and "회" not in short and "10/01" not in short and "10/07" not in short
+    assert "· claude" not in short and "• " not in short and "모델" not in short
+    # The agreed example: 7,214.9 left, 2,785.1 used, ten days into the cycle.
+    used = {**CREDITS_JSON, "total": {"quota": 10000.0, "used": 2785.1, "remaining": 7214.9}}
+    assert summary(used, now=datetime(2026, 10, 11, 0, 0, tzinfo=SEOUL), detailed=False) == (
+        "💳 Chat KHU 크레딧: 7,214.9 남음 / 10,000 (72.1%) · 11/01 갱신\n"
+        "이번 달 사용 2,785.1 · 이 속도면 이번 달 약 8,600 예상 (한도의 86%)"
+    )
+
+
+def test_the_short_form_keeps_the_numbers_and_the_missing_data_lines():
+    # The same numbers as the detailed form.
+    assert summary(detailed=False).splitlines()[0] == EXPECTED_SUMMARY.splitlines()[0]
+    # No projection yet: just this month's use.
+    early = datetime(2026, 10, 1, 23, 0, tzinfo=SEOUL)
+    assert summary(now=early, detailed=False).splitlines()[1] == "이번 달 사용 949.5"
+    # Nothing known: the head line only, as in the detailed form.
+    assert format_summary(parse_balance({}), None, now=SEVEN_DAYS_IN, tz=SEOUL, detailed=False) == "💳 Chat KHU 크레딧: 남은 양을 알 수 없음"
+    # Other granted sources and a missing usage part are still there.
+    extra = {**CREDITS_JSON, "purchased": {"quota": 1000, "used": 200, "remaining": 800}, "total": {"quota": 11000.0, "used": 1149.49, "remaining": 9850.51}}
+    assert summary(extra, detailed=False).splitlines()[1:3] == ["월 기본 크레딧: 9,050.5 남음 / 10,000", "구매 크레딧: 800 남음 / 1,000"]
+    transport, _ = routes(usage_response=httpx.Response(500, text="oops"))
+    text = credits.summary_text(fetch_report(gateway_env(), transport=transport), now=SEVEN_DAYS_IN, detailed=False)
+    assert text.splitlines() == [
+        "💳 Chat KHU 크레딧: 9,050.5 남음 / 10,000 (90.5%) · 11/01 갱신",
+        "이번 달 사용 949.5 · 이 속도면 이번 달 약 4,200 예상 (한도의 42%)",
+        "(사용 내역은 받지 못했습니다: HTTP 500)",
+    ]
+
+
 def test_without_usage_the_balance_still_reads_well():
     text = summary(usage_json=None)
     assert text.splitlines()[:2] == [
@@ -384,7 +425,10 @@ def test_non_json_balance_is_explained():
 
 def test_slack_text_is_the_mrkdwn_summary_or_a_warning():
     transport, _ = routes()
-    assert slack_credit_text(gateway_env(), transport=transport, now=SEVEN_DAYS_IN) == summary(slack=True)
+    # The shortcut is short by default; a detailed request gets the detailed form.
+    assert slack_credit_text(gateway_env(), transport=transport, now=SEVEN_DAYS_IN) == summary(slack=True, detailed=False)
+    assert credits.slack_credit_detail_text(gateway_env(), transport=transport, now=SEVEN_DAYS_IN) == summary(slack=True)
+    assert "• claude-sonnet-5: 71회 · 536.7" in credits.slack_credit_detail_text(gateway_env(), transport=transport, now=SEVEN_DAYS_IN)
     transport, _ = routes(credits_response=httpx.Response(401, json={}))
     assert slack_credit_text(gateway_env(), transport=transport).startswith("⚠️ 크레딧을 확인하지 못했습니다 (HTTP 401).")
 
@@ -495,6 +539,7 @@ def test_get_credits_tool_returns_compact_json_with_the_summary(monkeypatch):
     assert data == {
         "configured": True,
         "ok": True,
+        "short_summary": EXPECTED_SHORT,  # the briefing's short form: what 고뭉치 passes on by default
         "summary": EXPECTED_SUMMARY,  # the same Korean text as --credits
         "total": {"quota": 10000.0, "used": 949.5, "remaining": 9050.5, "remaining_percent": 90.5},
         "monthly": {"quota": 10000.0, "used": 949.5, "remaining": 9050.5},
@@ -607,7 +652,9 @@ def test_run_credits_cli_prints_the_summary_and_never_the_key():
     transport, _ = routes()
     out, err = io.StringIO(), io.StringIO()
     assert run_credits_cli(gateway_env(), transport=transport, now=SEVEN_DAYS_IN, out=out, err=err) == 0
+    # A terminal diagnostic: always the detailed form, with the dates, call count and models.
     assert out.getvalue() == EXPECTED_SUMMARY + "\n"
+    assert "(10/01–10/07, 94회)" in out.getvalue() and "· claude-sonnet-5: 71회 · 536.7" in out.getvalue()
     assert err.getvalue() == ""
 
 
@@ -696,6 +743,9 @@ def test_alert_text_is_a_korean_warning_then_the_summary():
     assert first == "⚠️ *Chat KHU 크레딧이 얼마 남지 않았어요* (남은 비율 8.5%, 알림 기준 10%)"
     assert "한 번만" in second and blank == ""
     assert header == "💳 *Chat KHU 크레딧*: 850 남음 / 10,000 (8.5%) · 11/01 갱신"
+    # The short form: no per-model lines, call count or dates.
+    assert text.splitlines()[4:] == ["이번 달 사용 9,150 · 이 속도면 이번 달 약 40,500 예상 (한도의 405%)"]
+    assert "claude-" not in text and "94회" not in text and "10/01–10/07" not in text
     assert credits.alert_period(report.balance, SEVEN_DAYS_IN) == "2026-11-01T00:00:00+09:00"
     assert credits.alert_period(Balance(total=Bucket()), SEVEN_DAYS_IN) == "month:2026-10"
 

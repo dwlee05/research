@@ -209,7 +209,8 @@ def credit_section(
     now: datetime | None = None,
     slack: bool = False,
 ) -> str:
-    """The credit summary (``credits.summary_text``), or a one-line Korean note. Never raises.
+    """The short credit summary (``credits.summary_text``, no models, call count or dates), or a one-line
+    Korean note. Never raises.
 
     Only the gateway's credit endpoints are called, never a model. Blocking:
     run it in a worker thread from async code.
@@ -225,7 +226,7 @@ def credit_section(
             match = _CREDIT_ERROR_RE.match(reason)
             reason = match.group(1) if match else reason.rstrip(".")
             return f"💳 {label}: " + CREDIT_FAILED_NOTE.format(reason=scrub(reason)[:200])
-        return credits.summary_text(report, env=env, now=now, slack=slack)
+        return credits.summary_text(report, env=env, now=now, slack=slack, detailed=False)
     except Exception as exc:  # noqa: BLE001 - the briefing goes out anyway
         return f"💳 {label}: " + CREDIT_FAILED_NOTE.format(reason=type(exc).__name__)
 

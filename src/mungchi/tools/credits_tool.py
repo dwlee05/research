@@ -28,7 +28,8 @@ def run_credits() -> dict[str, Any]:
     "get_credits",
     (
         "Chat KHU(Mindlogic) API 크레딧을 돌려준다. 사용자가 말하는 '토큰'·'크레딧'은 이것이다(암호화폐 아님). "
-        "summary: 한국어 요약(그대로 써도 됨). total·monthly: quota(한도), used(사용), remaining(남음), "
+        "short_summary: 짧은 한국어 요약 두 줄(평소에는 이것을 그대로 쓴다). "
+        "summary: 모델별 사용까지 담은 자세한 요약(자세히 물을 때). total·monthly: quota(한도), used(사용), remaining(남음), "
         "total.remaining_percent(남은 비율 %). renewal_date: 갱신일(YYYY-MM-DD). "
         "usage: 이번 주기 사용(start, end, calls, credits, models: 많이 쓴 모델 순). "
         "projection: 이 속도면 이번 주기 끝까지 쓸 양(credits, percent_of_quota), 아직 모르면 null. "

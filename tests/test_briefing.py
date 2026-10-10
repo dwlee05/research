@@ -965,6 +965,28 @@ def test_credit_failures_become_a_one_line_note(fetch, note):
     assert asyncio.run(go()).text().endswith(f"\n\n💳 Chat KHU 크레딧: {note}")
 
 
+def test_the_briefing_credit_block_is_the_short_form():
+    def with_usage():
+        payload = {
+            "start_date": "2026-10-01",
+            "end_date": "2026-10-07",
+            "total": {"call_count": 260, "credits": 949.5},
+            "rows": [{"key": "claude-sonnet-5", "call_count": 260, "credits": 2427.7}, {"key": "claude-opus-5-5", "call_count": 3, "credits": 1.2}],
+        }
+        return credits.CreditReport(balance=report().balance, usage=credits.parse_usage(payload))
+
+    for slack in (False, True):
+        text = credit_section(fetch=with_usage, now=seoul(8, 0), slack=slack)  # exactly seven days into the cycle
+        label = "*Chat KHU 크레딧*" if slack else "Chat KHU 크레딧"
+        assert text.splitlines() == [
+            f"💳 {label}: 9,050.5 남음 / 10,000 (90.5%) · 11/01 갱신",
+            "이번 달 사용 949.5 · 이 속도면 이번 달 약 4,200 예상 (한도의 42%)",
+        ]
+        assert "claude-" not in text and "회" not in text and "10/01" not in text  # no models, call count or dates
+    head, _reports = _relay(PersonaRun())  # 07:00: seven days and seven hours in
+    assert head.credits == f"{CREDIT_LINE}\n이번 달 사용 949.5 · 이 속도면 이번 달 약 4,000 예상 (한도의 40%)"
+
+
 def test_credit_section_without_a_gateway_never_touches_the_network():
     # conftest removed every ANTHROPIC_* setting: Anthropic's own API has no credit endpoint.
     assert credit_section() == "💳 Chat KHU 크레딧: 확인 안 함 (Chat KHU 게이트웨이를 쓰지 않아요)"

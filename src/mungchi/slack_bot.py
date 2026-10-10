@@ -2,7 +2,8 @@
 scheduled morning briefing they send (``BRIEF_TIME``) and briefing delivery
 (``python -m mungchi --brief --slack``). Short credit ("토큰") and weather
 questions, alone or together ("날씨랑 토큰 좀 말해봐"), are answered by code,
-without an agent turn. A short briefing request to 고뭉치 ("오늘 건너뛴 브리핑
+without an agent turn: the credits in the short form, or the detailed one
+for "크레딧 자세히", "토큰 내역" and the like. A short briefing request to 고뭉치 ("오늘 건너뛴 브리핑
 좀 해봐", or a bare ``@고뭉치``) gets the same relay briefing as the morning
 one (``post_briefing``): 고뭉치 greets with the weather and the credits and
 hands off, then 업뎃 and 일정 post their own parts as their own bots; its
@@ -76,7 +77,7 @@ from .tools.common import safe_error, scrub
 log = logging.getLogger("mungchi.slack")
 
 RunTurn = Callable[..., Awaitable[TurnResult]]
-# Returns the Slack text for the credit shortcut (blocking: run in a worker thread).
+# Returns the Slack text for the credit shortcut, short or detailed (blocking: run in a worker thread).
 CreditText = Callable[[], str]
 # Returns the Slack text for the weather shortcut (blocking: run in a worker thread).
 WeatherText = Callable[[], str]
@@ -358,10 +359,11 @@ def button_answer(value: Mapping[str, Any], proposal: Mapping[str, Any]) -> even
 
 
 def quick_info_request(text: str, label: str | None = None) -> set[str]:
-    """What a message asks the code-only shortcuts for: a subset of ``{"weather", "credits"}``.
+    """What a message asks the code-only shortcuts for: a subset of ``{"weather", "credits", "credit_detail"}``.
 
     ``quick_info.parse_quick_info`` first (one or both, e.g. "날씨랑 토큰 좀
-    말해봐"), then the single-purpose matchers (``credits.is_credit_query``,
+    말해봐"; ``"credit_detail"`` for "크레딧 자세히", "토큰 내역"), then the
+    single-purpose matchers (``credits.is_credit_query``,
     ``weather.is_weather_query``) so every phrasing they know still works.
     Empty: the message goes to the agent. Pure.
     """
@@ -562,6 +564,7 @@ class SlackHandler:
         credit_text: CreditText | None = None,
         weather_text: WeatherText | None = None,
         briefing_relay: BriefingRelay | None = None,
+        credit_detail_text: CreditText | None = None,
         brief_bots: Mapping[str, "BriefBot"] | None = None,
         proposals: StateStore | None = None,
         create_events: EventCreator | None = None,
@@ -587,8 +590,10 @@ class SlackHandler:
         # User ids of all bots in this process; their messages are never answered.
         self.our_bot_user_ids = our_bot_user_ids if our_bot_user_ids is not None else set()
         self.status_interval = status_interval
-        # The credit shortcut: gateway endpoints only, never an agent turn.
+        # The credit shortcut: gateway endpoints only, never an agent turn. Short by default,
+        # detailed (with the models) for "크레딧 자세히", "토큰 내역" and the like.
         self.credit_text = credit_text or credits.slack_credit_text
+        self.credit_detail_text = credit_detail_text or credits.slack_credit_detail_text
         # The weather shortcut: Open-Meteo only, never an agent turn.
         self.weather_text = weather_text or weather.slack_weather_text
         # 고뭉치's briefing on request: the relay (None means ``post_briefing``, looked up when used),
@@ -708,11 +713,12 @@ class SlackHandler:
         if await self._answer_proposal(channel, thread_ts, request):
             return
         wanted = quick_info_request(request, weather.configured_label())
+        detailed = quick_info.CREDIT_DETAIL in wanted
         if wanted >= {quick_info.WEATHER, quick_info.CREDITS}:
-            await self._answer_weather_and_credits(channel, thread_ts)
+            await self._answer_weather_and_credits(channel, thread_ts, detailed=detailed)
             return
         if quick_info.CREDITS in wanted:
-            await self._answer_credits(channel, thread_ts)
+            await self._answer_credits(channel, thread_ts, detailed=detailed)
             return
         if quick_info.WEATHER in wanted:
             await self._answer_weather(channel, thread_ts)
@@ -1006,8 +1012,9 @@ class SlackHandler:
         # The shortcut's own failure lines ("⚠️ ...", "🌤️ 서울 날씨: 가져오지 못했어요") get no cheerful lead-in.
         return text, not (text.lstrip().startswith("⚠️") or weather.FAILED_NOTE in text)
 
-    async def _credit_text(self) -> tuple[str, bool]:
-        return await self._shortcut_text(self.credit_text, CREDIT_CRASH_TEXT, "크레딧을 확인하지 못했습니다.")
+    async def _credit_text(self, *, detailed: bool = False) -> tuple[str, bool]:
+        fetch = self.credit_detail_text if detailed else self.credit_text
+        return await self._shortcut_text(fetch, CREDIT_CRASH_TEXT, "크레딧을 확인하지 못했습니다.")
 
     async def _weather_text(self) -> tuple[str, bool]:
         return await self._shortcut_text(self.weather_text, WEATHER_CRASH_TEXT, "날씨를 가져오지 못했습니다.")
@@ -1020,10 +1027,12 @@ class SlackHandler:
         for chunk in to_slack_chunks(text):
             await self._post(channel, thread_ts, chunk)
 
-    async def _answer_credits(self, channel: str, thread_ts: str) -> None:
-        """Reply with the credit summary."""
-        log.info("%s: 스레드 %s:%s 크레딧 바로 답변 (에이전트 실행 없음)", self.texts.label, channel, thread_ts)
-        text, fetched = await self._credit_text()
+    async def _answer_credits(self, channel: str, thread_ts: str, *, detailed: bool = False) -> None:
+        """Reply with the credit summary: short, or ``detailed`` (with the models)."""
+        log.info(
+            "%s: 스레드 %s:%s 크레딧 바로 답변%s (에이전트 실행 없음)", self.texts.label, channel, thread_ts, " (자세히)" if detailed else ""
+        )
+        text, fetched = await self._credit_text(detailed=detailed)
         await self._post_shortcut(channel, thread_ts, self._with_lead(phrases.CREDIT_LEADS, text, fetched))
 
     async def _answer_weather(self, channel: str, thread_ts: str) -> None:
@@ -1032,10 +1041,12 @@ class SlackHandler:
         text, fetched = await self._weather_text()
         await self._post_shortcut(channel, thread_ts, self._with_lead(phrases.WEATHER_LEADS, text, fetched))
 
-    async def _answer_weather_and_credits(self, channel: str, thread_ts: str) -> None:
-        """Reply with the weather line, a blank line, then the credit summary (both fetched at once)."""
+    async def _answer_weather_and_credits(self, channel: str, thread_ts: str, *, detailed: bool = False) -> None:
+        """Reply with the weather line, a blank line, then the credit summary (both fetched at once; short unless ``detailed``)."""
         log.info("%s: 스레드 %s:%s 날씨·크레딧 바로 답변 (에이전트 실행 없음)", self.texts.label, channel, thread_ts)
-        (weather_text, weather_ok), (credit_text, credit_ok) = await asyncio.gather(self._weather_text(), self._credit_text())
+        (weather_text, weather_ok), (credit_text, credit_ok) = await asyncio.gather(
+            self._weather_text(), self._credit_text(detailed=detailed)
+        )
         body = f"{weather_text}\n\n{credit_text}"
         await self._post_shortcut(channel, thread_ts, self._with_lead(phrases.BOTH_LEADS, body, weather_ok or credit_ok))
 

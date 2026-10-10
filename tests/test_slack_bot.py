@@ -1206,6 +1206,69 @@ def test_credit_shortcut_failure_is_a_short_korean_note_without_secrets(tmp_path
     assert SLACK_TOKEN not in caplog.text
 
 
+class FakeDetailedCredits(FakeCredits):
+    """Stands in for ``credits.slack_credit_detail_text``."""
+
+    TEXT = FakeCredits.TEXT + "\n• claude-sonnet-5: 71회 · 536.7"
+
+
+@pytest.mark.parametrize("persona", ["mungchi", "update", "schedule"])
+@pytest.mark.parametrize(
+    "text, detailed",
+    [
+        ("크레딧", False),
+        ("토큰 얼마나 남았어?", False),
+        ("크레딧 자세히", True),
+        ("토큰 내역", True),
+        ("모델별 크레딧 보여줘", True),
+    ],
+)
+def test_credit_shortcut_is_short_unless_details_are_asked_for(tmp_path, persona, text, detailed):
+    short, detail = FakeCredits(), FakeDetailedCredits()
+    handler, client, run = make_handler(tmp_path, persona=persona, credit_text=short, credit_detail_text=detail)
+    asyncio.run(handler.handle_event(dm(text), event_id="Ev1", source="dm"))
+    assert run.calls == []  # no LLM either way
+    assert (short.calls, detail.calls) == ((0, 1) if detailed else (1, 0))
+    [post] = client.posts
+    assert without_lead(post["text"], CREDIT_LEADS, persona) == (FakeDetailedCredits.TEXT if detailed else FakeCredits.TEXT)
+
+
+def test_a_combined_request_uses_the_short_credits(tmp_path):
+    short, detail = FakeCredits(), FakeDetailedCredits()
+    handler, client, run = make_handler(tmp_path, weather_text=lambda: "🌤️ *서울 날씨*: 맑음", credit_text=short, credit_detail_text=detail)
+    asyncio.run(handler.handle_event(dm("날씨랑 크레딧"), event_id="Ev1", source="dm"))
+    assert (short.calls, detail.calls) == (1, 0) and run.calls == []
+    assert client.posts[0]["text"].endswith(f"🌤️ *서울 날씨*: 맑음\n\n{FakeCredits.TEXT}")
+
+
+def test_default_credit_texts_are_short_and_detailed(tmp_path, monkeypatch):
+    import httpx
+
+    from mungchi import credits
+
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://factchat-cloud.mindlogic.ai/v1/gateway/claude")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "gw-slack-test-token-0123456789")
+
+    def handle(request):
+        if request.url.path.endswith("/credits/"):
+            return httpx.Response(200, json={"total": {"quota": 100, "used": 25, "remaining": 75}})
+        return httpx.Response(
+            200,
+            json={"start_date": "2026-10-01", "end_date": "2026-10-07", "total": {"call_count": 9, "credits": 25}, "rows": [{"key": "claude-sonnet-5", "call_count": 9, "credits": 25}]},
+        )
+
+    real_client = httpx.Client
+    monkeypatch.setattr(credits.httpx, "Client", lambda **kw: real_client(transport=httpx.MockTransport(handle), timeout=kw.get("timeout")))
+    handler, client, run = make_handler(tmp_path)  # the default credit texts
+    asyncio.run(handler.handle_event(dm("크레딧"), event_id="Ev1", source="dm"))
+    asyncio.run(handler.handle_event(dm("크레딧 자세히", ts="1700000000.000300"), event_id="Ev2", source="dm"))
+    short, detailed = (without_lead(post["text"], CREDIT_LEADS) for post in client.posts)
+    assert short.startswith("💳 *Chat KHU 크레딧*: 75 남음 / 100 (75%)") and "claude-sonnet-5" not in short and "9회" not in short
+    assert detailed.startswith("💳 *Chat KHU 크레딧*: 75 남음 / 100 (75%)")
+    assert "• claude-sonnet-5: 9회 · 25" in detailed and "(10/01–10/07, 9회)" in detailed
+    assert run.calls == []
+
+
 def test_default_credit_text_calls_only_the_gateway(tmp_path, monkeypatch):
     import httpx
 
