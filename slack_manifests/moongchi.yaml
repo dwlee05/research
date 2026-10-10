@@ -1,0 +1,42 @@
+# 비서실 고뭉치 Slack 앱 매니페스트 (@moongchi)
+# api.slack.com/apps → Create New App → From an app manifest → 워크스페이스 선택 → 이 내용을 붙여 넣기.
+# Socket Mode를 쓰므로 공개 URL(Request URL)이 필요 없습니다.
+# 토큰은 SLACK_BOT_TOKEN(xoxb-)과 SLACK_APP_TOKEN(xapp-)에 넣습니다.
+display_information:
+  name: 비서실 고뭉치
+  description: 업뎃과 '일정'에게 일을 맡겨 Dropbox 업데이트와 캘린더를 함께 브리핑해 주는 연구 비서실장
+  background_color: "#3b4a5a"
+features:
+  app_home:
+    home_tab_enabled: false
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+  bot_user:
+    # display_name은 ASCII여야 합니다. Slack이 여기서 @멘션 핸들(@moongchi)을 만들기 때문입니다.
+    # 그래도 `@고뭉치`라고 입력하면 Slack 자동완성에서 봇을 찾을 수 있습니다(Slack은 앱 이름도 함께 검색합니다).
+    # 나중에 App Home → "Your App's Presence in Slack" → Edit에서 표시 이름을 "고뭉치"로 바꿀 수 있습니다
+    # (Slack이 받아 주는 경우).
+    display_name: moongchi
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read
+      - chat:write
+      # 사진 속 일정 등록은 업뎃·일정 봇이 합니다(고뭉치는 사진을 내려받지 않고 안내만). 세 앱의 권한을 같게 둡니다.
+      - files:read
+      - im:history
+      - im:read
+      - im:write
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      - message.im
+  # 캘린더 추가 제안의 카테고리 버튼(Family, Teaching, …)을 누르려면 켜야 합니다.
+  # Socket Mode라서 Request URL은 필요 없습니다.
+  interactivity:
+    is_enabled: true
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false

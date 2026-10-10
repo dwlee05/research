@@ -1,13 +1,16 @@
-"""CLI entry point: options for 뭉치 and the terminal front end."""
+"""CLI entry point: agent options per persona, the shared turn runner and the terminal front end."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import os
+import re
 import sys
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Mapping, Sequence, TextIO
+from typing import Any, AsyncIterator, Awaitable, Callable, Mapping, MutableMapping, Sequence, TextIO
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -16,25 +19,32 @@ from claude_agent_sdk import (
     HookMatcher,
     ResultMessage,
     StreamEvent,
+    SystemMessage,
     TextBlock,
     ToolUseBlock,
 )
 
-from . import config
+from . import config, images as image_prep
 from .agents import (
     AGENT_LABELS,
+    PERSONA_TOOLS,
     SUBAGENT_TOOL,
     SUBAGENT_TOOL_NAMES,
+    TOOL_GATES,
     build_agents,
+    build_direct_prompt,
     build_system_prompt,
-    korean_date,
-    tool_gate,
+    with_now_line,
 )
-from .tools import SERVER_NAME, build_server
+from .personas import DIRECT_PERSONAS, MUNGCHI, PERSONA_LABELS, PERSONAS, SCHEDULE, UPDATE, call_name, josa
+from .state import StateStore, utcnow
+from .tools import DATA_TOOLS, MUNGCHI_TOOLS, PROPOSE_TOOL, SERVER_NAME, build_server, data_tools, tools_named
+from .tools import event_proposals
 from .tools.common import scrub
 
 # Built-in tools that must never be reachable (belt and braces: ``tools``
-# already limits the built-in set to the Agent tool).
+# already limits the built-in set to the Agent tool, or to nothing at all for
+# 업뎃 / 일정 answering directly).
 BLOCKED_BUILTINS = [
     "Bash",
     "Write",
@@ -49,78 +59,313 @@ BLOCKED_BUILTINS = [
 
 # Runtime switches for the bundled Claude Code CLI.
 CLI_ENV = {
-    # No general-purpose/Explore/Plan agents: only 업뎃 and 빠릿 can be spawned.
+    # No general-purpose/Explore/Plan agents: only 업뎃 and 일정 can be spawned.
     "CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS": "1",
     # Run subagents in the foreground so a turn ends only after both reports
     # are in (parallel Agent calls in one message still run concurrently).
     "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
     # Subagents must not spawn further subagents.
     "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": "1",
-    # Only three small tools: load their schemas upfront instead of deferring.
+    # Only a few small tools: load their schemas upfront instead of deferring.
     "ENABLE_TOOL_SEARCH": "false",
 }
 
-BRIEFING_PROMPT = "업뎃과 빠릿에게 일을 맡겨서 오늘({today}) 브리핑을 해줘."
 EXIT_WORDS = {"exit", "quit", "종료"}
+# A positional prompt that is exactly this word starts the Slack bot.
+SLACK_COMMAND = "slack"
+# A first argument that is exactly this word is a background-service command
+# (``python -m mungchi service install`` etc., see ``service.py``), not a question.
+SERVICE_COMMAND = "service"
+
+CHAT_GREETINGS = {
+    MUNGCHI: "고뭉치 비서실입니다. 무엇을 도와드릴까요? (끝내려면 exit 또는 종료)",
+    UPDATE: "업뎃입니다. Dropbox 업데이트를 확인해 드릴게요. (끝내려면 exit 또는 종료)",
+    SCHEDULE: "'일정'입니다. 캘린더 일정과 오늘·내일 날씨를 확인해 드릴게요. (끝내려면 exit 또는 종료)",
+}
 
 ERROR_MESSAGES = {
-    "authentication_failed": "인증에 실패했습니다. ANTHROPIC_API_KEY 또는 Claude 로그인을 확인하세요.",
+    "authentication_failed": "인증에 실패했습니다.",
     "billing_error": "결제/사용 한도 문제로 요청이 거절되었습니다.",
     "rate_limit": "요청 한도에 걸렸습니다. 잠시 후 다시 시도하세요.",
-    "invalid_request": "잘못된 요청입니다. MUNGCHI_MODEL 값을 확인하세요.",
+    "invalid_request": "잘못된 요청입니다.",
     "server_error": "API 서버 오류입니다. 잠시 후 다시 시도하세요.",
     "unknown": "알 수 없는 오류가 발생했습니다.",
 }
 
+# ResultMessage subtypes that explain a failed turn (never shown raw; "success"
+# with is_error=True means an API error and has no note of its own).
+RESULT_SUBTYPE_NOTES = {
+    "error_max_turns": "최대 턴 수 도달",
+    "error_during_execution": "실행 중 오류",
+    "error_max_budget_usd": "비용 한도 도달",
+    "error_max_structured_output_retries": "구조화된 출력 재시도 한도 도달",
+}
+
+# Problems we can point at a setting for: wrong model / base URL, or wrong key.
+_AUTH_ERROR_RE = re.compile(
+    r"(?i)\b401\b|authenticat|unauthori[sz]ed|invalid[\s_-]*(?:x-)?api[\s_-]*key"
+    r"|invalid[\s_-]*(?:bearer|auth(?:entication)?)[\s_-]*token"
+)
+_MODEL_ERROR_RE = re.compile(
+    r"(?i)issue with the selected model|\b404\b|not_found_error"
+    r"|model\b[^.\n]{0,60}?(?:not found|does not exist|may not exist|not available|unavailable|not supported)"
+    r"|\b(?:unknown|invalid|unsupported)[\s_-]*model\b"
+)
+ERROR_HINTS = {"auth": config.AUTH_HINT, "model": config.MODEL_HINT}
+# What a recognised problem is called when the SDK only says "unknown".
+CATEGORY_MESSAGES = {"auth": ERROR_MESSAGES["authentication_failed"], "model": "모델 설정에 문제가 있습니다."}
+# SDK error kinds that already name the problem.
+KIND_CATEGORIES = {"authentication_failed": "auth", "invalid_request": "model"}
+MAX_ERROR_DETAIL_CHARS = 200
+
+
+StatusCallback = Callable[[str], "Awaitable[None] | None"]
+# Returns the current time; injectable so tests can pin the per-turn time line.
+Clock = Callable[[], datetime]
+
+
+@dataclass
+class TurnResult:
+    """Outcome of one turn.
+
+    ``error`` is a short Korean message, already scrubbed: a reason, then
+    possibly an excerpt of the API's own error text and a "→ ..." hint, one
+    per line.
+    """
+
+    text: str
+    session_id: str | None = None
+    failed: bool = False
+    error: str | None = None
+    # The agent (or a subagent) called propose_calendar_events in this turn.
+    proposed: bool = False
+
+
+# ---------------------------------------------------------------- error messages
+
+
+def _flatten(text: str | None) -> str:
+    return " ".join((text or "").split())
+
+
+def error_excerpt(text: str | None, limit: int = MAX_ERROR_DETAIL_CHARS) -> str:
+    """One scrubbed line of the API's error text, at most ``limit`` characters."""
+    flat = scrub(_flatten(text))  # scrub before cutting so no partial secret survives
+    return flat if len(flat) <= limit else flat[: limit - 1].rstrip() + "…"
+
+
+def error_category(text: str | None, status: int | None = None) -> str | None:
+    """``"auth"`` or ``"model"`` when the error points at a setting, else None."""
+    if status == 401:
+        return "auth"
+    if status == 404:
+        return "model"
+    text = text or ""
+    if _AUTH_ERROR_RE.search(text):
+        return "auth"
+    if _MODEL_ERROR_RE.search(text):
+        return "model"
+    return None
+
+
+def describe_error(
+    reason: str, detail: str | None = None, *, kind: str | None = None, status: int | None = None
+) -> str:
+    """Korean error text: ``reason``, an excerpt of ``detail`` and a hint, one per line."""
+    lines = [reason]
+    excerpt = error_excerpt(detail)
+    if excerpt:
+        lines.append(excerpt)
+    category = error_category(detail, status) or KIND_CATEGORIES.get(kind or "")
+    if category:
+        lines.append(ERROR_HINTS[category])
+    return scrub("\n".join(lines))
+
+
+def describe_assistant_error(kind: str, text: str | None = None) -> str:
+    """Message for an assistant message flagged with an SDK error ``kind``.
+
+    ``text`` is the API error text the CLI put in that message, e.g.
+    "There's an issue with the selected model (...)".
+    """
+    reason = ERROR_MESSAGES.get(kind, ERROR_MESSAGES["unknown"])
+    if kind not in ERROR_MESSAGES or kind in ("unknown", "invalid_request"):
+        category = error_category(text)
+        if category:
+            reason = CATEGORY_MESSAGES[category]
+    return describe_error(reason, text, kind=kind)
+
+
+def describe_result_error(subtype: str | None, detail: str | None = None, status: int | None = None) -> str:
+    """Message for a failed ``ResultMessage``; the bare subtype is never shown."""
+    notes = [note for note in (RESULT_SUBTYPE_NOTES.get(subtype or ""), f"HTTP {status}" if status else "") if note]
+    reason = "응답을 마치지 못했습니다" + (f"({', '.join(notes)})" if notes else "") + "."
+    return describe_error(reason, detail, status=status)
+
+
+def stamp_prompt(prompt: str, clock: Clock | None = None, env: Mapping[str, str] | None = None) -> str:
+    """``prompt`` with the current local time in front, e.g. ``[지금: 2026-10-06(화) 14:20 KST]``.
+
+    The time goes in the user message, never the system prompt, so the system
+    prompt stays byte-identical and cached across the turns of a conversation.
+    ``clock`` defaults to the wall clock; the result is shown in ``TIMEZONE``.
+    """
+    tz = config.get_timezone(env)
+    now = clock() if clock is not None else datetime.now(tz)
+    return with_now_line(prompt, now.astimezone(tz))
+
 
 def build_options(
-    env: Mapping[str, str] | None = None, now: datetime | None = None
+    env: Mapping[str, str] | None = None,
+    *,
+    resume: str | None = None,
+    extra_system_prompt: str = "",
+    persona: str = MUNGCHI,
+    briefing: bool = False,
+    conversation_key: str | None = None,
 ) -> ClaudeAgentOptions:
-    tz = config.get_timezone(env)
-    now = (now or datetime.now(tz)).astimezone(tz)
+    """The single place where agent options are built (CLI and Slack).
+
+    ``persona="mungchi"`` is 고뭉치 with the 업뎃 / 일정 subagents.
+    ``persona="update"`` or ``"schedule"`` makes 업뎃 or 일정 the top-level
+    agent answering the user directly: it gets only its own data tools, no
+    Agent tool, no subagents and no built-in tools.
+
+    ``resume`` continues an earlier session by id; ``extra_system_prompt`` is
+    appended to the system prompt (e.g. Slack formatting rules).
+
+    ``briefing=True`` (only 업뎃's report run in the relay briefing,
+    ``briefing.run_report``: ``--brief``, the morning briefing, a briefing
+    asked for in Slack) builds this run's Dropbox
+    tool in briefing mode: it looks at the time since the last briefing and
+    moves that checkpoint. The mode is bound to the tool objects of these
+    options, so it is fixed per run, never chosen by the model, and never
+    leaks into other runs of the same process.
+
+    ``conversation_key`` (``event_proposals.slack_conversation_key`` for a
+    Slack thread, ``cli_conversation_key`` for a terminal chat) is where this
+    run's calendar proposal is kept, so the user's "네" in that same thread or
+    chat can confirm it. Like ``briefing`` it is bound into this run's own
+    tool objects (also for 일정 as 고뭉치's subagent, which shares the run's
+    server), never global and never chosen by the model. ``None`` (one-shot
+    questions, briefings): a proposal is shown but cannot be confirmed.
+
+    Nothing here depends on the clock: the system prompts carry no date or
+    time, so they can be cached. The time is added per turn (``stamp_prompt``).
+    """
+    if persona not in PERSONAS:
+        raise ValueError(f"unknown persona: {persona!r}")
+    if persona == MUNGCHI:
+        system_prompt = build_system_prompt()
+        # Built-in tool availability: only the subagent-invocation tool.
+        builtin_tools = [SUBAGENT_TOOL]
+        # 고뭉치's pre-approved tools: Agent and its two read-only tools
+        # (get_credits, get_weather). The PreToolUse hook (``tool_gate``)
+        # allows exactly these for 고뭉치 itself, approves the other data
+        # tools only inside the subagent that owns them, and denies the rest.
+        allowed_tools = [SUBAGENT_TOOL, *MUNGCHI_TOOLS]
+        disallowed_tools = list(BLOCKED_BUILTINS)
+        server = build_server(data_tools(briefing=briefing, conversation_key=conversation_key))
+        agents = build_agents()
+    else:
+        system_prompt = build_direct_prompt(persona)
+        # No built-in tools at all, not even the Agent tool.
+        builtin_tools = []
+        # Only this persona's data tools exist (server) and are pre-approved;
+        # the persona's PreToolUse gate denies everything else.
+        allowed_tools = list(PERSONA_TOOLS[persona])
+        disallowed_tools = [*BLOCKED_BUILTINS, SUBAGENT_TOOL]
+        server = build_server(tools_named(allowed_tools, briefing=briefing, conversation_key=conversation_key))
+        agents = None
+    if extra_system_prompt.strip():
+        system_prompt += "\n" + extra_system_prompt.strip() + "\n"
     return ClaudeAgentOptions(
         model=config.get_model(env),
-        system_prompt=build_system_prompt(now, config.get_timezone_name(env)),
-        # Built-in tool availability: only the subagent-invocation tool.
-        tools=[SUBAGENT_TOOL],
-        # 뭉치's only pre-approved tool. Data tools are approved per subagent
-        # by the PreToolUse hook (``tool_gate``) and denied for 뭉치 itself.
-        allowed_tools=[SUBAGENT_TOOL],
-        disallowed_tools=list(BLOCKED_BUILTINS),
+        system_prompt=system_prompt,
+        tools=builtin_tools,
+        allowed_tools=allowed_tools,
+        disallowed_tools=disallowed_tools,
         permission_mode="dontAsk",
-        mcp_servers={SERVER_NAME: build_server()},
-        agents=build_agents(),
-        hooks={"PreToolUse": [HookMatcher(matcher=None, hooks=[tool_gate])]},
+        mcp_servers={SERVER_NAME: server},
+        agents=agents,
+        hooks={"PreToolUse": [HookMatcher(matcher=None, hooks=[TOOL_GATES[persona]])]},
         # Ignore user/project settings files so the tool surface stays fixed.
         setting_sources=[],
         include_partial_messages=True,
         env=dict(CLI_ENV),
+        resume=resume or None,
     )
 
 
 class Renderer:
-    """Streams 뭉치's text to ``out`` and short status lines to ``status``."""
+    """Streams the top-level agent's text to ``out`` and short status lines to ``status``.
 
-    def __init__(self, out: TextIO | None = None, status: TextIO | None = None):
+    It also records what a non-terminal front end needs: the status lines,
+    the answer text, the session id and a short Korean error. With
+    ``echo=False`` nothing is written.
+    """
+
+    def __init__(self, out: TextIO | None = None, status: TextIO | None = None, *, echo: bool = True):
         self.out = out or sys.stdout
         self.status = status or sys.stderr
+        self.echo = echo
         self._streamed_text = False
         self._at_line_start = True
         self._announced: set[str] = set()
         self.failed = False
+        self.error: str | None = None
+        # API error texts already shown, so the closing ResultMessage does not repeat them.
+        self._reported_details: list[str] = []
+        self.session_id: str | None = None
+        # propose_calendar_events was called (by the agent or inside a subagent).
+        self.proposed = False
+        self.status_lines: list[str] = []
+        self._texts: list[str] = []
+        # Index into ``_texts`` where the final answer starts: text written
+        # before the last delegation ("업뎃에게 맡길게요") or, for 업뎃 / 일정
+        # answering directly, before the last data tool call is not part of it.
+        self._answer_start = 0
 
     def _write(self, text: str) -> None:
-        if not text:
+        if not text or not self.echo:
             return
         self.out.write(text)
         self.out.flush()
         self._at_line_start = text.endswith("\n")
 
     def _status_line(self, text: str) -> None:
+        self.status_lines.append(text)
+        if not self.echo:
+            return
         if not self._at_line_start:
             self._write("\n")
         self.status.write(text + "\n")
         self.status.flush()
+
+    def _fail(self, error: str, detail: str | None = None) -> None:
+        self.failed = True
+        if self.error is None:
+            self.error = error
+        flat = _flatten(detail)
+        if flat:
+            self._reported_details.append(flat)
+        self._status_line("[오류] " + error)
+
+    def _already_reported(self, detail: str | None) -> bool:
+        flat = _flatten(detail)
+        if not flat:
+            return True
+        return any(flat in seen or seen in flat for seen in self._reported_details)
+
+    @property
+    def answer(self) -> str:
+        parts = self._texts[self._answer_start:] or self._texts
+        return "\n\n".join(part.strip() for part in parts if part.strip())
+
+    def result(self) -> TurnResult:
+        return TurnResult(
+            text=self.answer, session_id=self.session_id, failed=self.failed, error=self.error, proposed=self.proposed
+        )
 
     def handle(self, message: Any) -> None:
         if isinstance(message, StreamEvent):
@@ -129,6 +374,10 @@ class Renderer:
             self._on_assistant(message)
         elif isinstance(message, ResultMessage):
             self._on_result(message)
+        elif isinstance(message, SystemMessage) and message.subtype == "init":
+            session_id = (message.data or {}).get("session_id")
+            if isinstance(session_id, str) and session_id:
+                self.session_id = session_id
 
     def _on_stream_event(self, message: StreamEvent) -> None:
         if message.parent_tool_use_id:  # inside a subagent
@@ -142,69 +391,302 @@ class Renderer:
             self._write(delta.get("text", ""))
 
     def _on_assistant(self, message: AssistantMessage) -> None:
-        if message.parent_tool_use_id:  # subagent output reaches the user via 뭉치
+        if any(isinstance(block, ToolUseBlock) and block.name == PROPOSE_TOOL for block in message.content):
+            self.proposed = True
+        if message.parent_tool_use_id:  # subagent output reaches the user via 고뭉치
             return
+        if message.session_id:
+            self.session_id = message.session_id
         if message.error:
-            self.failed = True
-            self._status_line("[오류] " + ERROR_MESSAGES.get(message.error, ERROR_MESSAGES["unknown"]))
+            # The text of an error message is the API's error, not an answer:
+            # it is shown once, inside the [오류] lines, with a hint.
+            raw = "\n".join(block.text for block in message.content if isinstance(block, TextBlock))
+            self._fail(describe_assistant_error(message.error, raw), detail=raw)
         for block in message.content:
             if isinstance(block, TextBlock):
+                if message.error:
+                    continue
+                self._texts.append(block.text)
                 if not self._streamed_text:  # not already shown via partial messages
                     self._write(block.text)
+            elif isinstance(block, ToolUseBlock) and block.name in DATA_TOOLS:
+                self._answer_start = len(self._texts)
             elif isinstance(block, ToolUseBlock) and block.name in SUBAGENT_TOOL_NAMES:
+                self._answer_start = len(self._texts)
                 if block.id in self._announced:
                     continue
                 self._announced.add(block.id)
                 subagent = str(block.input.get("subagent_type", ""))
-                label = AGENT_LABELS.get(subagent, subagent or "담당자")
-                self._status_line(f"→ {label}에게 맡기는 중...")
+                name = call_name(subagent) if subagent in AGENT_LABELS else (subagent or "담당자")
+                self._status_line(f"→ {name}에게 물어보는 중...")
         self._streamed_text = False
 
     def _on_result(self, message: ResultMessage) -> None:
+        if message.session_id:
+            self.session_id = message.session_id
         if not self._at_line_start:
             self._write("\n")
         if message.is_error:
-            self.failed = True
-            details = "; ".join(message.errors or []) or message.subtype
-            self._status_line(f"[오류] 응답을 마치지 못했습니다: {scrub(details)}")
+            # On an API error the CLI reports subtype "success" with the error
+            # text in ``result``; ``errors`` is filled for execution errors.
+            detail = "; ".join(e for e in (message.errors or []) if e) or (message.result or "")
+            status = getattr(message, "api_error_status", None)
+            if self.failed and message.subtype not in RESULT_SUBTYPE_NOTES and self._already_reported(detail):
+                return  # the assistant error above already said all of this
+            self._fail(describe_result_error(message.subtype, detail, status), detail=detail)
 
 
-async def run_turn(client: ClaudeSDKClient, prompt: str, renderer: Renderer) -> None:
-    await client.query(prompt)
+async def _notify(on_status: StatusCallback, line: str) -> None:
+    try:
+        outcome = on_status(line)
+        if inspect.isawaitable(outcome):
+            await outcome
+    except Exception as exc:  # noqa: BLE001 - a status display must never abort the turn
+        print(f"[경고] 진행 상황을 전하지 못했습니다: {scrub(f'{type(exc).__name__}: {exc}')}", file=sys.stderr)
+
+
+def image_message(text: str, images: Sequence[image_prep.ImageInput]) -> dict[str, Any]:
+    """One user message with image content blocks (base64) first, then ``text``.
+
+    The streaming-input format of the Agent SDK (``ClaudeSDKClient.query``
+    with an async iterable of messages): ``{"type": "user", "message":
+    {"role": "user", "content": [image blocks..., {"type": "text", ...}]}}``.
+    """
+    content: list[dict[str, Any]] = [
+        {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_prep.to_base64(data)}}
+        for media_type, data in images
+    ]
+    content.append({"type": "text", "text": text})
+    return {"type": "user", "message": {"role": "user", "content": content}, "parent_tool_use_id": None}
+
+
+async def _one_message(message: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
+    # Built before the client reads it: an exception inside this generator would
+    # only be logged by the SDK and the turn would hang.
+    yield message
+
+
+async def stream_turn(
+    client: ClaudeSDKClient,
+    prompt: str,
+    renderer: Renderer,
+    on_status: StatusCallback | None = None,
+    *,
+    images: Sequence[image_prep.ImageInput] | None = None,
+) -> TurnResult:
+    """Send one prompt (with ``images``, as image content blocks) on an open client and feed the reply through ``renderer``."""
+    if images:
+        await client.query(_one_message(image_message(prompt, images)))
+    else:
+        await client.query(prompt)
+    seen = len(renderer.status_lines)
     async for message in client.receive_response():
         renderer.handle(message)
+        while seen < len(renderer.status_lines):
+            if on_status is not None:
+                await _notify(on_status, renderer.status_lines[seen])
+            seen += 1
+    return renderer.result()
 
 
-async def run_once(prompt: str, options: ClaudeAgentOptions) -> int:
-    renderer = Renderer()
+async def run_turn(
+    prompt: str,
+    *,
+    resume: str | None = None,
+    on_status: StatusCallback | None = None,
+    extra_system_prompt: str = "",
+    renderer: Renderer | None = None,
+    persona: str = MUNGCHI,
+    clock: Clock | None = None,
+    briefing: bool = False,
+    conversation_key: str | None = None,
+    images: Sequence[image_prep.ImageInput] | None = None,
+) -> TurnResult:
+    """Run one turn of ``persona`` in a fresh session (or ``resume`` an earlier one).
+
+    Shared by the CLI (one-shot, ``--brief``, ``--agent``) and the Slack bots.
+    ``on_status`` receives the same status lines the CLI prints, e.g.
+    "→ 업뎃이에게 물어보는 중...". Without ``renderer`` nothing is printed.
+    The prompt is sent with the current time in front (``stamp_prompt``).
+    ``briefing=True`` only for briefing runs; ``conversation_key`` is where a
+    calendar proposal made in this turn waits for the user's answer (see ``build_options``).
+
+    ``images`` (``(media type, bytes)``, already prepared by
+    ``images.prepare_image``, at most 5) go with the text as image content
+    blocks; only 업뎃 and 일정 answering directly take them. An empty prompt
+    with images asks for the events in them (``images.DEFAULT_IMAGE_PROMPT``).
+    """
+    if images:
+        if persona not in DIRECT_PERSONAS:
+            raise ValueError("사진은 업뎃이나 일정에게만 보낼 수 있습니다.")
+        if len(images) > image_prep.MAX_IMAGES:
+            raise ValueError(f"사진은 한 번에 {image_prep.MAX_IMAGES}장까지만 보낼 수 있습니다.")
+        prompt = prompt.strip() or image_prep.DEFAULT_IMAGE_PROMPT
+    options = build_options(
+        resume=resume,
+        extra_system_prompt=extra_system_prompt,
+        persona=persona,
+        briefing=briefing,
+        conversation_key=conversation_key,
+    )
+    renderer = renderer or Renderer(echo=False)
     async with ClaudeSDKClient(options=options) as client:
-        await run_turn(client, prompt, renderer)
-    return 1 if renderer.failed else 0
+        return await stream_turn(client, stamp_prompt(prompt, clock), renderer, on_status, images=images)
 
 
-async def run_chat(options: ClaudeAgentOptions) -> int:
-    print("뭉치 비서실입니다. 무엇을 도와드릴까요? (끝내려면 exit 또는 종료)")
+def build_plain_options(system_prompt: str, env: Mapping[str, str] | None = None) -> ClaudeAgentOptions:
+    """Options for one small turn with no tools at all (e.g. 고뭉치's morning greeting).
+
+    No built-in tools, no MCP server, no subagents, no settings files, one
+    turn; the model is ``MUNGCHI_MODEL`` like every other run.
+    """
+    return ClaudeAgentOptions(
+        model=config.get_model(env),
+        system_prompt=system_prompt,
+        tools=[],
+        allowed_tools=[],
+        disallowed_tools=[*BLOCKED_BUILTINS, SUBAGENT_TOOL],
+        permission_mode="dontAsk",
+        mcp_servers={},
+        setting_sources=[],
+        max_turns=1,
+        env=dict(CLI_ENV),
+    )
+
+
+async def run_plain_turn(prompt: str, *, system_prompt: str, env: Mapping[str, str] | None = None) -> TurnResult:
+    """One tool-less turn with ``system_prompt`` (``build_plain_options``); the prompt is sent as it is."""
+    renderer = Renderer(echo=False)
+    async with ClaudeSDKClient(options=build_plain_options(system_prompt, env)) as client:
+        return await stream_turn(client, prompt, renderer)
+
+
+async def run_once(
+    prompt: str, persona: str = MUNGCHI, images: Sequence[image_prep.ImageInput] | None = None
+) -> int:
+    # No conversation key: a calendar proposal is shown but never stored, since
+    # nobody can answer "네" to a one-shot question.
+    result = await run_turn(prompt, renderer=Renderer(), persona=persona, images=images)
+    if result.proposed:
+        print(f"[참고] {event_proposals.ONE_SHOT_NOTE}", file=sys.stderr)
+    return 1 if result.failed else 0
+
+
+# What ``confirm_in_terminal`` returns when the user ended the chat at the question.
+CHAT_EXIT = object()
+Creator = Callable[[Mapping[str, Any]], "event_proposals.CreationOutcome"]
+
+
+async def confirm_in_terminal(
+    store: StateStore,
+    conversation_key: str,
+    *,
+    create: Creator | None = None,
+    now: Clock | None = None,
+) -> Any:
+    """After a chat turn: if it left a calendar proposal, ask for the answer.
+
+    With categories the prompt lists them by number
+    (``카테고리를 골라주세요 (추천: Event-KHU) [1 Family · 2 Teaching · … / 네 / 아니요]``):
+    a number, a name, "네" (the suggestion) creates the events (code, never
+    the agent), "아니요" cancels, a reply that fits several categories is
+    asked about again. Without categories: ``캘린더에 추가할까요? [네/아니요]``.
+    Anything else cancels the proposal and is returned, to be sent to the
+    agent as the next message (e.g. "시간은 1시로 바꿔줘").
+    Returns None when nothing more is to be sent, ``CHAT_EXIT`` on end of input.
+    """
+    pending = store.pending_proposal(conversation_key, (now or utcnow)())
+    if pending is None:
+        return None
+    while True:
+        try:
+            reply = (await asyncio.to_thread(input, event_proposals.cli_prompt(pending))).strip()
+        except EOFError:
+            print()
+            store.clear_pending_proposal(conversation_key)
+            return CHAT_EXIT
+        if not reply:
+            continue
+        answer = event_proposals.parse_answer(reply, pending)
+        if answer.kind != event_proposals.CLARIFY:
+            break
+        print(answer.message)
+    if answer.kind is None:
+        store.clear_pending_proposal(conversation_key)  # replaced by whatever the agent does next
+        return reply
+    result = await asyncio.to_thread(
+        event_proposals.confirm_proposal,
+        store,
+        conversation_key,
+        answer.kind,
+        now=(now or utcnow)(),
+        create=create,
+        category=answer.category,
+        proposal_id=pending.get("id"),
+    )
+    print(result or event_proposals.CANCELLED_TEXT)
+    return None
+
+
+async def run_chat(
+    options: ClaudeAgentOptions,
+    persona: str = MUNGCHI,
+    *,
+    clock: Clock | None = None,
+    conversation_key: str | None = None,
+    store: StateStore | None = None,
+    create: Creator | None = None,
+    images: Sequence[image_prep.ImageInput] | None = None,
+) -> int:
+    """The terminal chat. With ``conversation_key`` (the one bound into ``options``),
+    a turn that proposes calendar events is followed by the category (or yes/no) question.
+    ``images`` (``--image``) go with the first message; an empty first line
+    sends ``images.DEFAULT_IMAGE_PROMPT`` (the events in them)."""
+    # One long-lived client keeps the whole conversation in a single session;
+    # every line the user types is sent with the current time in front.
+    print(CHAT_GREETINGS[persona])
+    if conversation_key and store is None:
+        store = StateStore(config.get_state_path())
+    queued: str | None = None
+    pending_images = list(images or [])
+    if pending_images:
+        print(
+            f"사진 {len(pending_images)}장을 첫 메시지와 함께 보냅니다. "
+            f"그냥 Enter를 누르면 \"{image_prep.DEFAULT_IMAGE_PROMPT}\"로 보냅니다."
+        )
     async with ClaudeSDKClient(options=options) as client:
         while True:
-            try:
-                line = await asyncio.to_thread(input, "\n나> ")
-            except EOFError:
-                print()
-                break
-            prompt = line.strip()
+            if queued is not None:
+                prompt, queued = queued, None
+            else:
+                try:
+                    line = await asyncio.to_thread(input, "\n나> ")
+                except EOFError:
+                    print()
+                    break
+                prompt = line.strip()
+                if not prompt and pending_images:
+                    prompt = image_prep.DEFAULT_IMAGE_PROMPT
             if not prompt:
                 continue
             if prompt.lower() in EXIT_WORDS:
                 break
             print()
-            await run_turn(client, prompt, Renderer())
-    print("뭉치: 수고하셨습니다!")
+            first_images, pending_images = pending_images, []
+            await stream_turn(client, stamp_prompt(prompt, clock), Renderer(), images=first_images)
+            if conversation_key and store is not None:
+                follow_up = await confirm_in_terminal(store, conversation_key, create=create)
+                if follow_up is CHAT_EXIT:
+                    break
+                queued = follow_up
+    print(f"{PERSONA_LABELS[persona]}: 수고하셨습니다!")
     return 0
 
 
 class KoreanHelpFormatter(argparse.RawDescriptionHelpFormatter):
     def add_usage(self, usage, actions, groups, prefix=None):  # type: ignore[override]
-        return super().add_usage(usage, actions, groups, prefix="사용법: ")
+        # argparse passes prefix="" when it builds a subcommand's prog; keep that.
+        return super().add_usage(usage, actions, groups, prefix="사용법: " if prefix is None else prefix)
 
 
 class KoreanArgumentParser(argparse.ArgumentParser):
@@ -216,51 +698,342 @@ class KoreanArgumentParser(argparse.ArgumentParser):
 def build_parser() -> argparse.ArgumentParser:
     parser = KoreanArgumentParser(
         prog="mungchi",
-        description="뭉치 비서실: 업뎃(공저자 업데이트)과 빠릿(일정)에게 일을 맡기는 연구 비서.",
+        description=(
+            "고뭉치 비서실: 업뎃(Dropbox 업데이트)과 '일정'(캘린더·날씨)에게 일을 맡기는 연구 비서.\n"
+            "Chat KHU 크레딧('토큰')과 오늘·내일 날씨는 고뭉치가 직접 확인합니다(get_credits, get_weather)."
+        ),
         epilog=(
             "예시:\n"
             "  python -m mungchi                       # 대화 모드\n"
-            "  python -m mungchi --brief               # 오늘 브리핑\n"
-            '  python -m mungchi "어제 공저자들이 뭐 고쳤어?"   # 질문 한 번'
+            "  python -m mungchi --brief               # 오늘 브리핑: [고뭉치] 인사·날씨·크레딧, [업뎃] Dropbox, [일정] 오늘 일정\n"
+            '  python -m mungchi "어제 Dropbox에서 뭐 바뀌었어?"   # 질문 한 번\n'
+            '  python -m mungchi "날씨랑 토큰 좀 알려줘"      # 고뭉치가 날씨와 Chat KHU 크레딧을 직접 확인\n'
+            "  python -m mungchi slack                 # Slack 봇 실행 (Socket Mode, BRIEF_TIME이 있으면 아침 브리핑도)\n"
+            "  python -m mungchi --brief --slack       # 오늘 브리핑을 지금 바로 Slack에 올리기 (아침 브리핑 시험용)\n"
+            '  python -m mungchi --agent update "누가 무슨 파일 고쳤어?"   # 업뎃에게 바로 묻기\n'
+            "  python -m mungchi --agent update --image poster.jpg   # 사진 속 일정을 캘린더에 (대화 모드, 첫 메시지에 사진)\n"
+            '  python -m mungchi --agent schedule --image a.png --image b.png "11월 것만"   # 질문 한 번: 미리보기만\n'
+            "  python -m mungchi --agent schedule      # '일정'과 바로 대화 (일정, 오늘·내일 날씨)\n"
+            '  python -m mungchi --agent schedule "내일 비 오면 일정 바꿔야 할까?"   # 날씨가 걸린 일정 질문\n'
+            "  python -m mungchi --list-models         # 쓸 수 있는 모델 ID 확인 (MUNGCHI_MODEL 고르기)\n"
+            "  python -m mungchi --credits             # Chat KHU 남은 크레딧과 이번 달 사용량 (LLM 호출 없음)\n"
+            "  python -m mungchi --weather             # 오늘 서울 날씨 한 줄 (Open-Meteo, LLM 호출 없음)\n"
+            "  python -m mungchi --calendar-setup      # Mac 캘린더 앱 연결 (처음 한 번, 터미널에서)\n"
+            "  python -m mungchi --calendars           # 캘린더 목록: 계정·종류·쓰기 가능·CALENDAR_EXCLUDE 여부·7일 일정 수\n"
+            "  python -m mungchi --dropbox-check --hours 72   # 업뎃이 Dropbox 변경을 못 찾을 때 원인 확인 (최근 72시간)\n"
+            "  python -m mungchi service install       # (macOS) Slack 봇을 백그라운드 서비스로 설치 (로그인하면 자동 시작)\n"
+            "  python -m mungchi service status        # (macOS) 서비스 상태(실행 중인 코드 버전 포함)와 최근 로그\n"
+            "\n"
+            "질문 자리에 slack 한 단어만 쓰면 질문이 아니라 Slack 봇 실행 명령으로 처리합니다.\n"
+            "Slack 봇은 고뭉치·업뎃·일정 가운데 토큰을 넣은 봇이 한 프로세스에서 함께 켜집니다.\n"
+            "Slack에서 '날씨', '토큰'(크레딧), '날씨랑 토큰 좀 알려줘'처럼 짧게 물으면 LLM 호출 없이 바로 답합니다.\n"
+            "Slack 설정(SLACK_BOT_TOKEN 등)은 README의 'Slack에서 부르기'를 보세요.\n"
+            "\n"
+            "마찬가지로 맨 앞에 service 한 단어를 쓰면 질문이 아니라 백그라운드 서비스 명령(macOS 전용)입니다:\n"
+            "  service install | uninstall | start | stop | restart | status | logs [-f] [-n N]\n"
+            "  service run은 서비스가 내부에서 쓰는 명령입니다(직접 실행하지 마세요).\n"
+            "  자세히: python -m mungchi service --help, README의 '백그라운드로 실행하기'"
         ),
         formatter_class=KoreanHelpFormatter,
         add_help=False,
     )
     args_group = parser.add_argument_group("인자")
-    args_group.add_argument("question", nargs="?", metavar="질문", help="뭉치에게 한 번만 물어볼 질문")
+    args_group.add_argument(
+        "question",
+        nargs="?",
+        metavar="질문",
+        help=(
+            "한 번만 물어볼 질문 (기본은 고뭉치에게). slack 이라고만 쓰면 Slack 봇을 실행하고, "
+            "맨 앞의 service 는 백그라운드 서비스 명령입니다"
+        ),
+    )
     opts = parser.add_argument_group("옵션")
-    opts.add_argument("--brief", action="store_true", help="오늘 브리핑을 한 번 받고 끝냅니다 (cron용)")
+    opts.add_argument(
+        "--brief",
+        action="store_true",
+        help=(
+            "오늘 브리핑을 한 번 받고 끝냅니다: 고뭉치(인사, 날씨, Chat KHU 크레딧), 업뎃(Dropbox 업데이트), "
+            "일정(오늘의 일정)이 차례로 자기 몫을 보고합니다"
+        ),
+    )
+    opts.add_argument(
+        "--slack",
+        action="store_true",
+        help=(
+            "--brief와 함께 쓰면 브리핑을 터미널 대신 Slack에 올립니다 "
+            "(SLACK_BRIEF_CHANNEL에 세 봇이 차례로, 비어 있으면 SLACK_ALLOWED_USER_IDS의 사람에게 봇마다 자기 DM으로)"
+        ),
+    )
+    opts.add_argument(
+        "--agent",
+        choices=list(DIRECT_PERSONAS),
+        metavar="{update,schedule}",
+        help="고뭉치 대신 업뎃(update) 또는 '일정'(schedule)과 바로 이야기합니다 (질문 한 번 또는 대화 모드)",
+    )
+    opts.add_argument(
+        "--image",
+        action="append",
+        metavar="사진",
+        help=(
+            "--agent와 함께: 사진(JPG·PNG·GIF·WebP·HEIC, 한 장 20MB까지) 속 일정을 읽어 캘린더 추가를 제안합니다. "
+            f"여러 장이면 --image를 되풀이합니다(최대 {image_prep.MAX_IMAGES}장). 질문과 함께 쓰면 미리보기만, "
+            "질문 없이 쓰면 대화 모드의 첫 메시지에 사진을 붙입니다"
+        ),
+    )
+    opts.add_argument(
+        "--list-models",
+        action="store_true",
+        help=(
+            "Claude API(또는 ANTHROPIC_BASE_URL의 게이트웨이)에서 쓸 수 있는 모델 ID를 보여 주고 끝냅니다 "
+            "(에이전트는 실행하지 않음)"
+        ),
+    )
+    opts.add_argument(
+        "--credits",
+        action="store_true",
+        help=(
+            "Chat KHU(Mindlogic 게이트웨이)의 남은 크레딧, 이번 달 사용량과 모델별 사용량을 보여 주고 끝냅니다 "
+            "(에이전트는 실행하지 않음, LLM 호출 없음)"
+        ),
+    )
+    opts.add_argument(
+        "--weather",
+        action="store_true",
+        help=(
+            "오늘 날씨(WEATHER_LABEL, 기본 서울)를 한 줄로 보여 주고 끝냅니다: 날씨, 최저·최고 기온, 강수확률, 미세먼지 "
+            "(Open-Meteo, 에이전트는 실행하지 않음, LLM 호출 없음)"
+        ),
+    )
+    opts.add_argument(
+        "--calendar-setup",
+        action="store_true",
+        help=(
+            "Mac 캘린더 앱 접근을 허용하고, 읽을 캘린더와 오늘·내일 일정, 메모로 일정을 추가할 캘린더를 확인합니다 "
+            "(macOS 터미널에서 한 번 실행, Claude API는 쓰지 않음)"
+        ),
+    )
+    opts.add_argument(
+        "--calendars",
+        action="store_true",
+        help=(
+            "Mac 캘린더 앱의 캘린더를 모두 보여 주고 끝냅니다: 계정, 종류, 일정을 넣을 수 있는지, CALENDAR_EXCLUDE로 "
+            "뺐는지, 앞으로 7일 일정 수 (읽기 전용, 권한을 묻지 않고 Claude API도 쓰지 않음)"
+        ),
+    )
+    opts.add_argument(
+        "--dropbox-check",
+        action="store_true",
+        help=(
+            "업뎃이 Dropbox 변경을 못 찾을 때 원인을 확인합니다: 폴더·계정, 기간 안에 바뀐 파일마다 "
+            "포함/제외 이유, 기간과 상관없이 최근에 바뀐 파일 (읽기 전용, Claude API는 쓰지 않고 "
+            "브리핑 기준 시각도 바꾸지 않음)"
+        ),
+    )
+    opts.add_argument(
+        "--hours",
+        type=int,
+        metavar="N",
+        help="--dropbox-check와 함께: 최근 N시간을 봅니다 (없으면 최근 24시간을 보고, 브리핑 기준 시각도 함께 보여 줌)",
+    )
     opts.add_argument("-h", "--help", action="help", help="이 도움말을 보여 주고 끝냅니다")
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    if args.brief and args.question:
-        parser.error("--brief와 질문은 함께 쓸 수 없습니다.")
+def drop_empty_claude_env(environ: MutableMapping[str, str] | None = None) -> None:
+    """Remove empty Claude settings such as ``ANTHROPIC_API_KEY=`` from the environment.
 
+    The bundled Claude Code CLI inherits this process's environment when the
+    SDK starts it, so this must run before any agent turn. With a gateway
+    (``ANTHROPIC_BASE_URL`` + ``ANTHROPIC_AUTH_TOKEN``) an empty-but-set
+    ``ANTHROPIC_API_KEY`` copied from .env.example could interfere with the
+    gateway's auth, and an empty ``ANTHROPIC_BASE_URL`` is not an address.
+    """
+    environ = os.environ if environ is None else environ
+    for name in config.CLAUDE_ENV_VARS:
+        if name in environ and not environ[name].strip():
+            del environ[name]
+
+
+def load_env() -> None:
+    """Load ``.env`` (searched from the working directory upwards), then drop empty Claude settings.
+
+    Runs before any SDK subprocess starts (CLI turns, Slack bots, --brief --slack,
+    the background service): an empty ANTHROPIC_API_KEY= line must not get in
+    the way of gateway auth.
+    """
     from dotenv import find_dotenv, load_dotenv
 
     load_dotenv(find_dotenv(usecwd=True))
-    # An empty ANTHROPIC_API_KEY= line copied from .env.example must not
-    # shadow a `claude` CLI login.
-    if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
-        os.environ.pop("ANTHROPIC_API_KEY", None)
-    options = build_options()
+    drop_empty_claude_env()
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == SERVICE_COMMAND:
+        # ``service <action> [...]`` has its own parser; like ``slack``, the bare
+        # word in the question position is a command, never a question.
+        from .service import service_main
+
+        return service_main(argv[1:])
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.question == SERVICE_COMMAND:
+        parser.error("service 명령은 맨 앞에 쓰고 다른 옵션과 함께 쓸 수 없습니다. 예: python -m mungchi service status")
+    if args.list_models and (args.question or args.brief or args.slack or args.agent):
+        parser.error("--list-models는 질문이나 다른 옵션(--brief, --slack, --agent, slack)과 함께 쓸 수 없습니다.")
+    if args.credits and (
+        args.question
+        or args.brief
+        or args.slack
+        or args.agent
+        or args.list_models
+        or args.calendar_setup
+        or args.dropbox_check
+    ):
+        parser.error(
+            "--credits는 질문이나 다른 옵션(--brief, --slack, --agent, --list-models, --calendar-setup, "
+            "--dropbox-check, slack)과 함께 쓸 수 없습니다."
+        )
+    if args.weather and (
+        args.question
+        or args.brief
+        or args.slack
+        or args.agent
+        or args.list_models
+        or args.credits
+        or args.calendar_setup
+        or args.dropbox_check
+    ):
+        parser.error(
+            "--weather는 질문이나 다른 옵션(--brief, --slack, --agent, --list-models, --credits, --calendar-setup, "
+            "--dropbox-check, slack)과 함께 쓸 수 없습니다."
+        )
+    if args.calendar_setup and (args.question or args.brief or args.slack or args.agent or args.list_models):
+        parser.error(
+            "--calendar-setup은 질문이나 다른 옵션(--brief, --slack, --agent, --list-models, slack)과 함께 쓸 수 없습니다."
+        )
+    if args.calendars and (
+        args.question
+        or args.brief
+        or args.slack
+        or args.agent
+        or args.list_models
+        or args.credits
+        or args.weather
+        or args.calendar_setup
+        or args.dropbox_check
+        or args.image
+    ):
+        parser.error(
+            "--calendars는 질문이나 다른 옵션(--brief, --slack, --agent, --image, --list-models, --credits, --weather, "
+            "--calendar-setup, --dropbox-check, slack)과 함께 쓸 수 없습니다."
+        )
+    if args.dropbox_check and (
+        args.question or args.brief or args.slack or args.agent or args.list_models or args.calendar_setup
+    ):
+        parser.error(
+            "--dropbox-check는 질문이나 다른 옵션(--brief, --slack, --agent, --list-models, --calendar-setup, slack)과 "
+            "함께 쓸 수 없습니다."
+        )
+    if args.image and (
+        args.brief
+        or args.slack
+        or args.list_models
+        or args.credits
+        or args.weather
+        or args.calendar_setup
+        or args.dropbox_check
+        or args.question == SLACK_COMMAND
+    ):
+        parser.error(
+            "--image는 --brief, --slack, --list-models, --credits, --weather, --calendar-setup, --dropbox-check, slack과 "
+            "함께 쓸 수 없습니다."
+        )
+    if args.image and not args.agent:
+        parser.error(
+            "--image는 --agent update 또는 --agent schedule과 함께 써야 합니다(사진 속 일정은 업뎃·일정이 읽습니다). "
+            "예: python -m mungchi --agent update --image poster.jpg"
+        )
+    if args.image and len(args.image) > image_prep.MAX_IMAGES:
+        parser.error(f"--image는 {image_prep.MAX_IMAGES}장까지만 쓸 수 있습니다(받은 사진 {len(args.image)}장).")
+    if args.hours is not None and not args.dropbox_check:
+        parser.error("--hours는 --dropbox-check와 함께 써야 합니다. 예: python -m mungchi --dropbox-check --hours 72")
+    if args.hours is not None and args.hours <= 0:
+        parser.error("--hours에는 1 이상의 정수(시간 수)를 적으세요. 예: --hours 72")
+    start_slack_bot = args.question == SLACK_COMMAND
+    if start_slack_bot and (args.brief or args.slack):
+        parser.error("slack 명령은 --brief, --slack과 함께 쓸 수 없습니다.")
+    if start_slack_bot and args.agent:
+        parser.error("slack 명령은 --agent와 함께 쓸 수 없습니다. 업뎃·일정 봇은 토큰을 넣으면 slack 명령 하나로 함께 켜집니다.")
+    if args.brief and args.question:
+        parser.error("--brief와 질문은 함께 쓸 수 없습니다.")
+    if args.slack and not args.brief:
+        parser.error("--slack은 --brief와 함께 써야 합니다.")
+    if args.brief and args.agent:
+        parser.error("--brief는 고뭉치 전용이라 --agent와 함께 쓸 수 없습니다.")
+    persona = args.agent or MUNGCHI
+    label = PERSONA_LABELS[persona]
+
+    load_env()
 
     try:
+        if args.list_models:
+            from .model_list import list_models
+
+            return list_models()
+        if args.credits:
+            from .credits import run_credits_cli
+
+            return run_credits_cli()
+        if args.weather:
+            from .weather import run_weather_cli
+
+            return run_weather_cli()
+        if args.calendar_setup:
+            from .calendar_setup import run_calendar_setup
+
+            return run_calendar_setup()
+        if args.calendars:
+            from .calendar_setup import run_calendar_list
+
+            return run_calendar_list()
+        if args.dropbox_check:
+            from .dropbox_check import run_dropbox_check
+
+            return run_dropbox_check(hours=args.hours)
+        if start_slack_bot:
+            from .slack_bot import run_bot_cli
+
+            return run_bot_cli()
+        if args.brief and args.slack:
+            from .slack_bot import post_briefing_cli
+
+            return post_briefing_cli()
         if args.brief:
-            today = korean_date(datetime.now(config.get_timezone()))
-            return asyncio.run(run_once(BRIEFING_PROMPT.format(today=today), options))
+            # The only briefing run in the terminal: 업뎃's report alone moves the Dropbox checkpoint.
+            # The same relay as --brief --slack and the morning briefing: [고뭉치], [업뎃], [일정].
+            from .briefing import run_brief_cli
+
+            return run_brief_cli()
+        images = None
+        if args.image:
+            try:
+                images = image_prep.load_image_files(args.image)
+            except image_prep.ImageError as exc:
+                print(f"[오류] {exc}", file=sys.stderr)
+                return 1
         if args.question:
-            return asyncio.run(run_once(args.question, options))
-        return asyncio.run(run_chat(options))
+            return asyncio.run(run_once(args.question, persona, images=images))
+        # The chat's own conversation key: a calendar proposal made in it is confirmed in it.
+        key = event_proposals.cli_conversation_key()
+        return asyncio.run(
+            run_chat(build_options(persona=persona, conversation_key=key), persona, conversation_key=key, images=images)
+        )
     except KeyboardInterrupt:
-        print("\n뭉치: 중단했습니다.", file=sys.stderr)
+        print(f"\n{label}: 중단했습니다.", file=sys.stderr)
         return 130
     except Exception as exc:  # noqa: BLE001 - show a clean Korean message, never a token
-        print(f"[오류] 뭉치를 실행하지 못했습니다: {scrub(f'{type(exc).__name__}: {exc}')}", file=sys.stderr)
+        print(f"[오류] {josa(label, '을', '를')} 실행하지 못했습니다: {scrub(f'{type(exc).__name__}: {exc}')}", file=sys.stderr)
         return 1
 
 

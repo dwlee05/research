@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mungchi"
 version = "0.1.0"
-description = "뭉치 비서실: 공저자 업데이트(업뎃)와 일정(빠릿)을 챙겨 주는 Claude Agent SDK 멀티 에이전트 비서"
+description = "고뭉치 비서실: Dropbox 업데이트(업뎃)와 캘린더 일정('일정')을 챙겨 주는 Claude Agent SDK 멀티 에이전트 비서"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -16,6 +16,15 @@ dependencies = [
     "recurring-ical-events>=3.0",
     "httpx>=0.27",
     "python-dotenv>=1.0",
+    "slack_bolt>=1.30",
+    "slack_sdk>=3.45",
+    "aiohttp>=3.9",
+    # Photos -> calendar: shrink images in memory before they go to the agent.
+    "Pillow>=10.0",
+    # HEIC/HEIF (iPhone photos). Imported only when present: without it HEIC gets a Korean note.
+    "pillow-heif>=0.16",
+    # Reads the macOS Calendar app (EventKit). Imported lazily, only on a Mac.
+    "pyobjc-framework-EventKit>=10.0; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]
