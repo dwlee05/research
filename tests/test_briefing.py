@@ -226,7 +226,7 @@ def test_a_valid_llm_greeting_is_used_and_stored_for_tomorrow():
     generate = FakeGreeting()
     greeting = asyncio.run(make_greeting(scheduled(8, 7), weather_text=WEATHER_LINE, store=store, generate=generate))
     assert (greeting.text, greeting.source) == (GREETING, "llm")
-    assert store.last_greeting() == ("2026-10-08", GREETING)
+    assert store.recent_greetings() == [("2026-10-08", GREETING)]
     [prompt] = generate.prompts
     # The time of day and the time come from code too, in this per-run prompt.
     assert prompt.startswith("아침 브리핑을 여는 인사를 1~2문장으로 써 줘.\n- 지금: 아침 브리핑 (07:00).")
@@ -236,7 +236,8 @@ def test_a_valid_llm_greeting_is_used_and_stored_for_tomorrow():
     assert "- 오늘은 평일이에요." in prompt
     assert "- 날씨 요약: 대체로 맑음 · 미세먼지 보통" in prompt
     assert not re.search(r"\d+°|\d+%", prompt)
-    assert "이전 인사" not in prompt  # nothing stored yet
+    assert "최근 인사" not in prompt  # nothing stored yet
+    assert prompt.endswith("- '똑똑'은 아주 가끔만 쓰는 말이라 굳이 쓰지 않아도 돼.")  # allowed, not encouraged
 
 
 def test_yesterdays_greeting_is_passed_and_todays_is_stored():
@@ -245,8 +246,11 @@ def test_yesterdays_greeting_is_passed_and_todays_is_stored():
     store.mark_greeting("2026-10-07", yesterday)
     generate = FakeGreeting()
     greeting = asyncio.run(make_greeting(scheduled(8, 7), store=store, generate=generate))
-    assert f'- 이전 인사: "{yesterday}" (이 인사와 다르게 시작하고, 같은 표현은 쓰지 마)' in generate.prompts[0]
-    assert greeting.source == "llm" and store.last_greeting() == ("2026-10-08", GREETING)
+    assert (
+        "- 최근 인사 1개(오래된 것부터). 이 인사들과 여는 말(첫 마디)이나 문장 구조가 겹치지 않게 써 줘:\n"
+        f'  1. "{yesterday}"'
+    ) in generate.prompts[0]
+    assert greeting.source == "llm" and store.recent_greetings() == [("2026-10-07", yesterday), ("2026-10-08", GREETING)]
 
 
 @pytest.mark.parametrize(
@@ -270,7 +274,7 @@ def test_an_invalid_or_failed_greeting_falls_back_to_a_template(reply):
     assert greeting.source == "template"
     assert greeting.text in [t.format(**briefing.date_fields(seoul(8, 7))) for t in phrases.GREETING_TEMPLATES["아침"]]
     assert "10월 8일" in greeting.text and valid_greeting(greeting.text, seoul(8, 7))
-    assert store.last_greeting() == ("2026-10-08", greeting.text)
+    assert store.recent_greetings() == [("2026-10-08", greeting.text)]
 
 
 def test_a_slow_greeting_times_out_into_a_template():
@@ -332,17 +336,18 @@ def test_a_morning_greeting_in_the_evening_falls_back_to_an_evening_template_and
     # The prompt asked for an evening greeting at 17:50; this morning's greeting was not replaced.
     [prompt] = generate.prompts
     assert prompt.startswith("저녁 브리핑을 여는 인사를 1~2문장으로 써 줘.\n- 지금: 저녁 브리핑 (17:50).")
+    assert f'  1. "{GREETING}"' in prompt  # a manual run reads the recent greetings too
     assert '"저녁 브리핑이에요~"' in prompt and "'아침'·'오후'·'밤' 같은 다른 때를 가리키는 말은 쓰지 마." in prompt
-    assert store.last_greeting() == ("2026-10-08", GREETING)
+    assert store.recent_greetings() == [("2026-10-08", GREETING)]
 
 
 def test_a_valid_evening_greeting_is_used_but_only_the_scheduled_run_stores_its_greeting():
     store = StateStore(config.get_state_path())
     evening = "오늘 하루도 수고 많으셨어요! 10월 8일(목) 저녁 브리핑이에요~"
     greeting = asyncio.run(make_greeting(manual(8, 17, 50), store=store, generate=FakeGreeting(evening)))
-    assert (greeting.text, greeting.source) == (evening, "llm") and store.last_greeting() is None
+    assert (greeting.text, greeting.source) == (evening, "llm") and store.recent_greetings() == []
     asyncio.run(make_greeting(scheduled(9, 7), store=store, generate=FakeGreeting("좋은 아침이에요! 10월 9일(금) 브리핑입니다")))
-    assert store.last_greeting() == ("2026-10-09", "좋은 아침이에요! 10월 9일(금) 브리핑입니다")
+    assert store.recent_greetings() == [("2026-10-09", "좋은 아침이에요! 10월 9일(금) 브리핑입니다")]
 
 
 @pytest.mark.parametrize("hour, period", [(7, "아침"), (14, "오후"), (18, "저녁"), (22, "밤"), (1, "밤")])
@@ -389,12 +394,106 @@ def test_greeting_templates_never_name_another_time_of_day():
         assert not re.search(r"\{(?:date|short|md|wd)\}\s*밤", template), template
 
 
-def test_the_fallback_avoids_yesterdays_template_and_is_seedable():
-    first = phrases.GREETING_TEMPLATES["아침"][0]
-    yesterday = ("2026-10-07", first.format(**briefing.date_fields(date(2026, 10, 7))))
-    picks = {fallback_greeting(seoul(8, 7), rng=random.Random(seed), previous=yesterday) for seed in range(50)}
-    assert first.format(**briefing.date_fields(seoul(8, 7))) not in picks and len(picks) >= 3
-    assert fallback_greeting(seoul(8, 7), rng=random.Random(4)) == fallback_greeting(seoul(8, 7), rng=random.Random(4))
+def test_the_fallback_avoids_yesterdays_opening_and_is_seedable():
+    now = seoul(8, 7)
+    pool = [t.format(**briefing.date_fields(now)) for t in phrases.GREETING_TEMPLATES["아침"]]
+    yesterday = phrases.GREETING_TEMPLATES["아침"][0].format(**briefing.date_fields(date(2026, 10, 7)))
+    picks = {fallback_greeting(now, rng=random.Random(seed), recent=[yesterday]) for seed in range(60)}
+    assert len(picks) >= 5 and picks <= set(pool)  # today's date, injected by code
+    assert briefing.greeting_opening(yesterday) not in {briefing.greeting_opening(pick) for pick in picks}
+    assert fallback_greeting(now, rng=random.Random(4)) == fallback_greeting(now, rng=random.Random(4))
+
+
+def test_greeting_openings_ignore_punctuation_dates_and_weekdays():
+    opening = briefing.greeting_opening
+    assert opening("똑똑! 🚪 2026년 10월 8일(목) 아침 브리핑입니다~") == opening("똑똑, 고뭉치예요!") == "똑똑"
+    assert opening("좋은 아침이에요! 10월 8일 목요일") == "좋은"
+    assert opening("10월 8일(목) 아침이에요") == opening("11월 30일(월) 저녁이에요")  # every date-first greeting alike
+    assert opening("목요일 아침이에요. 10월 8일") == opening("월요일 오후예요!")  # every weekday-first one too
+    assert opening("") == opening("🙂 !") == ""
+
+
+def test_the_fallback_picks_an_opening_none_of_the_recent_greetings_used():
+    now = seoul(8, 7)
+    templates = phrases.GREETING_TEMPLATES["아침"]
+    # A week of fallback greetings: the first seven morning templates, one a day.
+    recent = [t.format(**briefing.date_fields(date(2026, 10, day))) for day, t in zip(range(1, 8), templates)]
+    used = {briefing.greeting_opening(text) for text in recent}
+    picks = {fallback_greeting(now, rng=random.Random(seed), recent=recent) for seed in range(40)}
+    assert picks and all("10월 8일" in pick for pick in picks)
+    assert not {briefing.greeting_opening(pick) for pick in picks} & used
+
+
+def test_when_every_opening_was_used_the_one_used_longest_ago_wins(monkeypatch):
+    small = ("좋은 아침이에요! {short}", "안녕하세요! {short}", "바로 갈게요. {short}")
+    monkeypatch.setitem(phrases.GREETING_TEMPLATES, "아침", small)
+    recent = ["안녕하세요! 10월 5일(월)", "좋은 아침이에요! 10월 6일(화)", "바로 갈게요. 10월 7일(수)"]
+    picks = {fallback_greeting(seoul(8, 7), rng=random.Random(seed), recent=recent) for seed in range(20)}
+    assert picks == {"안녕하세요! 10월 8일(목)"}
+
+
+def test_the_fallback_never_knocks_when_a_recent_greeting_did():
+    now = seoul(8, 7)
+    recent = ["똑똑! 🚪 2026년 10월 2일(금) 아침 브리핑입니다~"]
+    for period in phrases.TIMES_OF_DAY:
+        picks = {fallback_greeting(now, period=period, rng=random.Random(seed), recent=recent) for seed in range(80)}
+        assert not any("똑똑" in pick for pick in picks), period
+    # Without a recent knock the one knock template can come up, but rarely.
+    picks = [fallback_greeting(now, rng=random.Random(seed)) for seed in range(400)]
+    assert 0 < sum("똑똑" in pick for pick in picks) < 100
+
+
+def test_greeting_pools_are_large_varied_and_rarely_knock():
+    now = seoul(8, 7)
+    for period in phrases.TIMES_OF_DAY:
+        pool = phrases.GREETING_TEMPLATES[period]
+        assert len(pool) >= 8, period
+        openings = {briefing.greeting_opening(t.format(**briefing.date_fields(now))) for t in pool}
+        assert len(openings) == len(pool), (period, openings)  # every template opens differently
+        assert sum("똑똑" in t for t in pool) <= 1, period
+        extras = phrases.WEEKEND_GREETING_TEMPLATES[period] + phrases.MONDAY_GREETING_TEMPLATES.get(period, ())
+        assert not any("똑똑" in t for t in extras), period
+    for persona, pool in phrases.PLACEHOLDER_POOLS.items():
+        assert sum("똑똑" in line for line in pool) <= 1, persona
+
+
+def test_knock_is_refused_while_a_recent_greeting_has_it():
+    store = StateStore(config.get_state_path())
+    store.mark_greeting("2026-10-03", "똑똑! 🚪 10월 3일(토) 아침 브리핑이에요~")
+    store.mark_greeting("2026-10-07", "좋은 아침이에요! 10월 7일 수요일 브리핑 시작할게요 🙂")
+    generate = FakeGreeting(GREETING)  # "똑똑!" again
+    greeting = asyncio.run(make_greeting(scheduled(8, 7), store=store, generate=generate))
+    assert greeting.source == "template" and "똑똑" not in greeting.text and "10월 8일" in greeting.text
+    [prompt] = generate.prompts
+    assert prompt.endswith("- 최근 인사에 '똑똑'이 이미 있으니 이번에는 '똑똑'을 쓰지 마.")
+    assert '  1. "똑똑! 🚪 10월 3일(토) 아침 브리핑이에요~"' in prompt and '  2. "좋은 아침이에요!' in prompt
+    assert valid_greeting(GREETING, seoul(8, 7)) and not valid_greeting(GREETING, seoul(8, 7), allow_knock=False)
+    assert not valid_greeting("똑 똑, 10월 8일(목) 아침이에요", seoul(8, 7), allow_knock=False)
+    # The scheduled run stored its greeting after the others.
+    assert store.recent_greetings()[-1] == ("2026-10-08", greeting.text)
+
+
+def test_knock_is_allowed_again_once_it_dropped_out_of_the_last_seven():
+    store = StateStore(config.get_state_path())
+    store.mark_greeting("2026-09-30", "똑똑! 🚪 9월 30일(수) 아침 브리핑이에요~")
+    for day in range(1, 8):
+        store.mark_greeting(f"2026-10-{day:02d}", f"좋은 아침이에요! 10월 {day}일 브리핑 시작할게요")
+    assert len(store.recent_greetings()) == 7 and not any("똑똑" in text for _day, text in store.recent_greetings())
+    generate = FakeGreeting(GREETING)
+    greeting = asyncio.run(make_greeting(scheduled(8, 7), store=store, generate=generate))
+    assert (greeting.text, greeting.source) == (GREETING, "llm")
+    [prompt] = generate.prompts
+    assert "- 최근 인사 7개(오래된 것부터)." in prompt and '  7. "좋은 아침이에요! 10월 7일 브리핑 시작할게요"' in prompt
+    assert "쓰지 마." not in prompt.splitlines()[-1] and "굳이 쓰지 않아도 돼" in prompt.splitlines()[-1]
+    assert store.recent_greetings()[-1] == ("2026-10-08", GREETING) and len(store.recent_greetings()) == 7
+
+
+def test_a_recent_greeting_is_never_used_again_word_for_word():
+    store = StateStore(config.get_state_path())
+    again = "좋은 아침이에요! 10월 8일 목요일 브리핑 시작할게요 🙂"
+    store.mark_greeting("2026-10-08", again)  # e.g. a catch-up of the same day
+    greeting = asyncio.run(make_greeting(manual(8, 9), store=store, generate=FakeGreeting(again)))
+    assert greeting.source == "template" and greeting.text != again and briefing.greeting_opening(greeting.text) != "좋은"
 
 
 def test_the_greeting_system_prompt_is_constant_and_in_mungchis_voice():
@@ -831,7 +930,7 @@ def test_brief_cli_at_1750_follows_the_evening_and_asks_for_tomorrow_too():
     assert "아침" not in mungchi
     assert 'date="2026-10-08", days=2' in run.call("schedule")["prompt"]
     assert run.call("update")["prompt"].startswith("저녁 브리핑에서")
-    assert store.last_greeting() is None  # --brief is a manual briefing
+    assert store.recent_greetings() == []  # --brief is a manual briefing
 
 
 @pytest.mark.parametrize("seed", range(8))

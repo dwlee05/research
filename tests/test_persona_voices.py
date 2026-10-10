@@ -48,7 +48,12 @@ def test_each_persona_prompt_has_its_voice_and_the_accuracy_rule():
             if other != persona:
                 assert VOICES[other] not in prompt, (persona, other)
     # Distinct voices, as the user asked.
-    assert "똑똑!" in VOICES["mungchi"] and "이모지는 한 메시지에 0~2개" in VOICES["mungchi"]
+    assert "이모지는 한 메시지에 0~2개" in VOICES["mungchi"]
+    # "똑똑" is one rare opener among many, not a signature habit (briefings and regular replies alike).
+    assert "'똑똑'은 여러 여는 말 가운데 하나일 뿐이라 아주 가끔(많아야 일주일에 한 번쯤)만 쓴다" in VOICES["mungchi"]
+    assert "브리핑이든 보통 답이든 같은 말로 연달아 시작하지 않는다" in VOICES["mungchi"]
+    assert "날씨나 요일 이야기, 계절감 있는 한마디, 가벼운 농담, 인사 없이 바로 본론" in VOICES["mungchi"]
+    assert "똑똑!" not in VOICES["mungchi"] and "좋아한다" not in VOICES["mungchi"]
     assert "'업뎃이', '일정이'" in VOICES["mungchi"]
     assert "업뎃 보고드립니다!" in VOICES["update"] and "📂 하나" in VOICES["update"]
     assert "오늘은 여유로운 편이에요 😊" in VOICES["schedule"] and "0~1개" in VOICES["schedule"]

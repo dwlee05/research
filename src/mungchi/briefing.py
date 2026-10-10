@@ -5,7 +5,7 @@ morning briefing of the running Slack bots (``BRIEF_TIME``) and a short
 briefing request to 고뭉치 in Slack ("오늘 건너뛴 브리핑 좀 해봐", or a bare
 ``@고뭉치``) all run the same relay (``start_relay``), in this order:
 
-    고뭉치   똑똑! 🚪 2026년 10월 8일(목) 아침 브리핑입니다~      ← one small LLM call (template if it fails)
+    고뭉치   좋은 아침이에요! 10월 8일 목요일 브리핑 시작할게요   ← one small LLM call (template if it fails)
              🌤️ 서울 날씨: 대체로 맑음 · ...                     ← code (Open-Meteo), no LLM; BRIEF_WEATHER=off drops it
              💳 Chat KHU 크레딧: ...                              ← code, no LLM
              @업뎃 @일정 아침 보고 부탁해요!                       ← hand-off, picked by code
@@ -27,14 +27,18 @@ and credits only ever appear in 고뭉치's part.
 * **Greeting**: one tool-less turn with a tiny constant system prompt
   (``GREETING_SYSTEM_PROMPT``). Its user prompt holds the time of day and
   the current time, today's date, a weekday/weekend note, the weather in
-  words (numbers removed) and the last greeting, which the model is told
-  not to repeat. The answer is checked (``valid_greeting``: today's
-  month/day present, no other date, year or weekday, no other numbers, no
-  word of another time of day, short); a failure, a timeout (30 s) or an
-  invalid answer falls back to a template for that time of day
-  (``phrases.GREETING_TEMPLATES``). Only the scheduled briefing stores the
-  greeting it used (``last_greeting``), so the next morning's is compared
-  with this morning's; every run is told not to repeat the stored one.
+  words (numbers removed) and the recent greetings (the last seven
+  scheduled ones), whose openings and structure the model is told not to
+  repeat. "똑똑" is rare: when one of the recent greetings has it, the
+  prompt says not to use it and the check rejects it. The answer is
+  checked (``valid_greeting``: today's month/day present, no other date,
+  year or weekday, no other numbers, no word of another time of day,
+  short, no "똑똑" when it is not allowed, not a recent greeting again); a
+  failure, a timeout (30 s) or an invalid answer falls back to a template
+  for that time of day (``phrases.GREETING_TEMPLATES``) whose opening
+  differs from the recent ones (``fallback_greeting``). Only the scheduled
+  briefing stores the greeting it used (``recent_greetings``); every run
+  reads the list.
 * **업뎃**: ``briefing=True``, so its Dropbox tool looks at the time since the
   last briefing and moves that checkpoint. **일정**: today only, or today's
   rest and tomorrow for a manual briefing from 17:00 to midnight.
@@ -263,9 +267,18 @@ GREETING_SYSTEM_PROMPT = (
     "- 날씨는 주어진 요약에 맞을 때만 가볍게 한마디 해도 된다. 요약에 없는 날씨는 말하지 않는다.\n"
     "- 일정, 파일, 크레딧 이야기는 하지 않고, 아무도 멘션하지 않는다.\n"
     "- 절기, 공휴일, 기념일 같은 달력 이야기는 하지 않는다.\n"
-    "- 이전 인사가 주어지면 그것과 다른 말로 시작하고 같은 표현을 되풀이하지 않는다.\n"
+    "- 최근 인사들이 주어지면 그 인사들과 여는 말(첫 마디)도, 문장 구조도 겹치지 않게 쓰고 같은 표현을 되풀이하지 않는다.\n"
+    "- '똑똑'은 아주 가끔만 쓴다. 사용자 메시지에서 '똑똑'을 쓰지 말라고 하면 쓰지 않는다.\n"
     f"- {ACCURACY_RULE}\n"
 )
+
+# The knock 고뭉치 may open with now and then: only when none of the recent greetings (the last seven) has it.
+KNOCK = "똑똑"
+
+
+def uses_knock(text: str) -> bool:
+    """True when ``text`` says "똑똑" (spaces ignored: "똑 똑" too)."""
+    return KNOCK in "".join((text or "").split())
 
 
 def weather_words(line: str) -> str:
@@ -295,10 +308,11 @@ def other_time_words(text: str, period: str) -> list[str]:
 
 
 def greeting_prompt(
-    now: datetime, *, period: str | None = None, weather_text: str = "", previous: str | None = None
+    now: datetime, *, period: str | None = None, weather_text: str = "", recent: Sequence[str] = ()
 ) -> str:
     """The greeting's user prompt: the time of day and the time, today's date (from code), a weekday note,
-    the weather in words, the last greeting. ``period`` defaults to the clock's time of day."""
+    the weather in words, the recent greetings (oldest first) and whether "똑똑" may be used.
+    ``period`` defaults to the clock's time of day."""
     period = period or time_of_day(now)
     fields = date_fields(now)
     if now.weekday() >= 5:
@@ -320,8 +334,14 @@ def greeting_prompt(
         f"- {day_note}",
         f"- 날씨 요약: {weather_words(weather_text) or '없음'}",
     ]
-    if previous:
-        lines.append(f'- 이전 인사: "{previous}" (이 인사와 다르게 시작하고, 같은 표현은 쓰지 마)')
+    recent = [text for text in recent if text and text.strip()]
+    if recent:
+        lines.append(f"- 최근 인사 {len(recent)}개(오래된 것부터). 이 인사들과 여는 말(첫 마디)이나 문장 구조가 겹치지 않게 써 줘:")
+        lines += [f'  {number}. "{text}"' for number, text in enumerate(recent, 1)]
+    if any(uses_knock(text) for text in recent):
+        lines.append(f"- 최근 인사에 '{KNOCK}'이 이미 있으니 이번에는 '{KNOCK}'을 쓰지 마.")
+    else:
+        lines.append(f"- '{KNOCK}'은 아주 가끔만 쓰는 말이라 굳이 쓰지 않아도 돼.")
     return "\n".join(lines)
 
 
@@ -338,16 +358,18 @@ def clean_greeting(text: str | None) -> str:
     return "\n".join(line.strip(_QUOTES).strip() for line in lines if line.strip())
 
 
-def valid_greeting(text: str, now: datetime, period: str | None = None) -> bool:
+def valid_greeting(text: str, now: datetime, period: str | None = None, *, allow_knock: bool = True) -> bool:
     """True when ``text`` is a short greeting with today's date and nothing that could be wrong.
 
     Today's month and day must appear ("10월 8일", or "10/8"); any other date,
     year or weekday, any other number, a word of another time of day than
     ``period`` (default: the clock's; e.g. "좋은 아침" in the evening), Slack
     markup or mention, more than two lines or more than ``MAX_GREETING_CHARS``
-    characters makes it invalid.
+    characters makes it invalid, and so does "똑똑" unless ``allow_knock``.
     """
     if not text or len(text) > MAX_GREETING_CHARS or text.count("\n") > 1:
+        return False
+    if not allow_knock and uses_knock(text):
         return False
     if any(char in text for char in "<>@*#`|[]_"):
         return False
@@ -378,27 +400,49 @@ def greeting_templates(now: date | datetime, period: str = MORNING) -> list[str]
     return pool
 
 
+def greeting_opening(text: str) -> str:
+    """A greeting's opening: its first word without punctuation or emoji, digits as 0, a weekday as "0요일".
+
+    "똑똑! 🚪 ..." -> "똑똑", "좋은 아침이에요!" -> "좋은", "10월 8일(목) ..." -> "00월",
+    "목요일 아침이에요" -> "0요일" (every greeting that starts with the date, or
+    with the weekday, has the same opening).
+    """
+    for word in unicodedata.normalize("NFC", text or "").split():
+        letters = "".join(char for char in word if unicodedata.category(char)[0] in "LN")
+        if letters:
+            return re.sub(r"^[월화수목금토일]요일", "0요일", re.sub(r"\d", "0", letters))
+    return ""
+
+
 def fallback_greeting(
     now: datetime,
     *,
     period: str | None = None,
     rng: random.Random | None = None,
-    previous: tuple[str, str] | None = None,
+    recent: Sequence[str] = (),
 ) -> str:
-    """A template greeting for ``now`` and ``period`` (default: the clock's), the date filled in by code;
-    not the template used last time when possible."""
-    pool = greeting_templates(now, period or time_of_day(now))
-    avoid = None
-    if previous is not None:
-        try:
-            last_day = date.fromisoformat(previous[0])
-        except ValueError:
-            last_day = None
-        if last_day is not None:
-            last_fields = date_fields(last_day)
-            used = (t for p in TIMES_OF_DAY for t in greeting_templates(last_day, p))
-            avoid = next((t for t in used if t.format(**last_fields) == previous[1]), None)
-    return phrases.pick(pool, rng, avoid=avoid).format(**date_fields(now))
+    """A template greeting for ``now`` and ``period`` (default: the clock's), the date filled in by code.
+
+    ``recent``: the recent greetings (oldest first). No "똑똑" template when
+    one of them has it; then a template whose opening none of them used (or,
+    when every opening was used, the one used longest ago), never a recent
+    greeting again when there is another one. ``rng`` makes it repeatable.
+    """
+    fields = date_fields(now)
+    pool = [template.format(**fields) for template in greeting_templates(now, period or time_of_day(now))]
+    recent = [text for text in recent if text]
+    if any(uses_knock(text) for text in recent):
+        pool = [text for text in pool if not uses_knock(text)] or pool
+    pool = [text for text in pool if text not in recent] or pool
+    openings = [greeting_opening(text) for text in recent]
+
+    def last_used(text: str) -> int:
+        """Where the text's opening was last used in ``recent`` (-1: not at all)."""
+        opening = greeting_opening(text)
+        return max((index for index, used in enumerate(openings) if used == opening), default=-1)
+
+    oldest = min(last_used(text) for text in pool)
+    return (rng or random).choice([text for text in pool if last_used(text) == oldest])
 
 
 async def llm_greeting(prompt: str, env: Mapping[str, str] | None = None) -> str:
@@ -431,31 +475,33 @@ async def make_greeting(
 ) -> Greeting:
     """고뭉치's greeting for ``when``: the model's when it is valid and new, else a template. Never raises.
 
-    The time of day and the time go into the prompt with the last greeting
-    (state file), which every run is told not to repeat. Only the scheduled
-    briefing stores the one it used (for tomorrow morning's): a manual
-    evening briefing never replaces this morning's greeting.
+    The time of day and the time go into the prompt with the recent
+    greetings (state file, the last seven), whose openings every run is
+    told not to repeat; "똑똑" is refused while one of them has it. Only the
+    scheduled briefing stores the one it used: a manual evening briefing
+    never adds to the list.
     """
     now, period = when.now, when.period
     store = store or StateStore(config.get_state_path(env))
     try:
-        previous = store.last_greeting()
+        recent = [text for _day, text in store.recent_greetings()]
     except OSError:
-        previous = None
-    prompt = greeting_prompt(now, period=period, weather_text=weather_text, previous=previous[1] if previous else None)
+        recent = []
+    allow_knock = not any(uses_knock(text) for text in recent)
+    prompt = greeting_prompt(now, period=period, weather_text=weather_text, recent=recent)
     greeting: Greeting | None = None
     try:
         call = generate(prompt) if generate is not None else generate_greeting(prompt, env)
         text = clean_greeting(await asyncio.wait_for(call, timeout))
-        if valid_greeting(text, now, period) and (previous is None or text != previous[1]):
+        if valid_greeting(text, now, period, allow_knock=allow_knock) and text not in recent:
             greeting = Greeting(text, "llm")
         else:
-            log.info("%s 인사가 형식에 맞지 않아(날짜·시간대 확인 등) 준비된 인사를 씁니다.", period)
+            log.info("%s 인사가 형식에 맞지 않아(날짜·시간대·'똑똑'·최근 인사 확인 등) 준비된 인사를 씁니다.", period)
     except Exception as exc:  # noqa: BLE001 - a template greeting is always fine
         reason = crash_kind(exc) if isinstance(exc, asyncio.TimeoutError) else safe_error(exc)
         log.warning("%s 인사를 만들지 못해 준비된 인사를 씁니다: %s", period, reason)
     if greeting is None:
-        greeting = Greeting(fallback_greeting(now, period=period, rng=rng, previous=previous), "template")
+        greeting = Greeting(fallback_greeting(now, period=period, rng=rng, recent=recent), "template")
     if when.scheduled:
         try:
             store.mark_greeting(now.date().isoformat(), greeting.text)

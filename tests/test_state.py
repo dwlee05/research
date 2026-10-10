@@ -230,15 +230,45 @@ def test_slack_threads_file_sits_next_to_state_file(tmp_path):
     assert config.get_slack_threads_path({}).name == ".mungchi_slack_threads.json"
 
 
-def test_last_greeting_round_trip_keeps_other_keys_and_ignores_junk(tmp_path):
+def test_recent_greetings_keep_the_last_seven_and_the_other_keys(tmp_path):
     store = StateStore(tmp_path / "state.json")
-    assert store.last_greeting() is None
+    assert store.recent_greetings() == []
     store.mark_brief_date("2026-10-07")
-    store.mark_greeting("2026-10-08", "똑똑! 🚪 2026년 10월 8일(목) 아침 브리핑입니다~")
-    assert store.last_greeting() == ("2026-10-08", "똑똑! 🚪 2026년 10월 8일(목) 아침 브리핑입니다~")
+    store.mark_greeting("2026-10-01", "  좋은 아침이에요! 10월 1일(목)  ")
+    assert store.recent_greetings() == [("2026-10-01", "좋은 아침이에요! 10월 1일(목)")]
+    for day in range(2, 10):
+        store.mark_greeting(f"2026-10-{day:02d}", f"인사 {day}")
+    # Capped at seven, oldest first: 10/01 and 10/02 dropped out.
+    assert store.recent_greetings() == [(f"2026-10-{day:02d}", f"인사 {day}") for day in range(3, 10)]
     assert store.last_brief_date() == "2026-10-07"
+    data = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert len(data["recent_greetings"]) == 7 and data["recent_greetings"][-1] == {"date": "2026-10-09", "text": "인사 9"}
+    assert "last_greeting" not in data
+
+
+def test_recent_greetings_ignore_junk(tmp_path):
+    store = StateStore(tmp_path / "state.json")
+    for junk in ([{"date": "어제", "text": "안녕"}, {"date": "2026-10-08", "text": "  "}, "인사", None, 3], "인사", None, {"a": 1}):
+        (tmp_path / "state.json").write_text(json.dumps({"recent_greetings": junk}, ensure_ascii=False), encoding="utf-8")
+        assert store.recent_greetings() == []
+    good = [{"date": "2026-10-08", "text": "좋은 아침이에요!"}, {"date": "어제", "text": "안녕"}]
+    (tmp_path / "state.json").write_text(json.dumps({"recent_greetings": good}, ensure_ascii=False), encoding="utf-8")
+    assert store.recent_greetings() == [("2026-10-08", "좋은 아침이에요!")]
+
+
+def test_a_legacy_last_greeting_is_migrated_into_the_list(tmp_path):
+    path = tmp_path / "state.json"
+    legacy = "똑똑! 🚪 2026년 10월 7일(수) 아침 브리핑입니다~"
+    path.write_text(
+        json.dumps({"last_greeting": {"date": "2026-10-07", "text": legacy}, "last_brief_date": "2026-10-07"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    store = StateStore(path)
+    assert store.recent_greetings() == [("2026-10-07", legacy)]  # read as a list of one
+    store.mark_greeting("2026-10-08", "좋은 아침이에요! 10월 8일 목요일 브리핑 시작할게요")
+    assert store.recent_greetings() == [("2026-10-07", legacy), ("2026-10-08", "좋은 아침이에요! 10월 8일 목요일 브리핑 시작할게요")]
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert "last_greeting" not in data and data["last_brief_date"] == "2026-10-07"  # moved, nothing else touched
     for junk in ({"date": "어제", "text": "안녕"}, {"date": "2026-10-08", "text": "  "}, "인사", None):
-        data = store.load()
-        data["last_greeting"] = junk
-        (tmp_path / "state.json").write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-        assert store.last_greeting() is None
+        path.write_text(json.dumps({"last_greeting": junk}, ensure_ascii=False), encoding="utf-8")
+        assert store.recent_greetings() == []

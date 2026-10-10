@@ -30,6 +30,10 @@ _PENDING_KEY = "pending_events"
 # passed to the CLI as ``--resume``.
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# 고뭉치's morning-briefing greetings kept so the next ones differ (about a week).
+MAX_RECENT_GREETINGS = 7
+# Before the list there was one greeting under this key; it is read as one of the list and dropped on the next write.
+_LEGACY_GREETING_KEY = "last_greeting"
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
@@ -49,6 +53,27 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _greeting_entry(record: Any) -> tuple[str, str] | None:
+    """``(date, text)`` of a stored greeting, or None for anything malformed."""
+    if not isinstance(record, dict):
+        return None
+    day, text = record.get("date"), record.get("text")
+    if not (isinstance(day, str) and _DATE_RE.match(day) and isinstance(text, str) and text.strip()):
+        return None
+    return day, text.strip()
+
+
+def _recent_greetings(data: dict[str, Any]) -> list[tuple[str, str]]:
+    """The stored greetings oldest first, at most ``MAX_RECENT_GREETINGS``; a legacy ``last_greeting`` is one of them."""
+    raw = data.get("recent_greetings")
+    greetings = [entry for entry in map(_greeting_entry, raw if isinstance(raw, list) else []) if entry]
+    legacy = _greeting_entry(data.get(_LEGACY_GREETING_KEY))
+    if legacy is not None and legacy not in greetings:
+        greetings.append(legacy)
+    greetings.sort(key=lambda item: item[0])  # by date; same-day ones keep their order
+    return greetings[-MAX_RECENT_GREETINGS:]
 
 
 def ensure_aware(dt: datetime) -> datetime:
@@ -71,7 +96,7 @@ class StateStore:
     ``{"last_checked": {"<source>": "<iso8601>"},
     "credit_alert": {"renewal_date": "<renewal_date>", "alerted_at": "<iso8601>"},
     "last_brief_date": "<YYYY-MM-DD>",
-    "last_greeting": {"date": "<YYYY-MM-DD>", "text": "<고뭉치's morning greeting>"},
+    "recent_greetings": [{"date": "<YYYY-MM-DD>", "text": "<고뭉치's morning greeting>"}, ...] (last 7, oldest first),
     "running_version": "<abc1234>", "running_since": "<iso8601>",
     "pending_events": {"<conversation key>": {..., "created_at": "<iso8601>", "expires_at": "<iso8601>"}}}``.
     Every write keeps the other keys as they are.
@@ -114,21 +139,24 @@ class StateStore:
             data["last_brief_date"] = day
             _write_json(self.path, data)
 
-    def last_greeting(self) -> tuple[str, str] | None:
-        """``(local date, text)`` of the last morning-briefing greeting 고뭉치 used, if any."""
-        record = self.load().get("last_greeting")
-        if not isinstance(record, dict):
-            return None
-        day, text = record.get("date"), record.get("text")
-        if not (isinstance(day, str) and _DATE_RE.match(day) and isinstance(text, str) and text.strip()):
-            return None
-        return day, text.strip()
+    def recent_greetings(self) -> list[tuple[str, str]]:
+        """``[(local date, text), ...]`` of the last ``MAX_RECENT_GREETINGS`` morning-briefing greetings, oldest first.
+
+        A file from before the list (one ``last_greeting``) reads as a list of that one greeting.
+        """
+        return _recent_greetings(self.load())
 
     def mark_greeting(self, day: str, text: str) -> None:
-        """Remember today's greeting, so tomorrow's is told not to repeat it."""
+        """Add today's greeting to the recent ones (the oldest drops out after seven), so the next ones differ.
+
+        A legacy ``last_greeting`` is moved into the list and its key removed.
+        """
         with _LOCK:
             data = self.load()
-            data["last_greeting"] = {"date": day, "text": text}
+            greetings = _recent_greetings(data) + [(day, text.strip())]
+            greetings.sort(key=lambda item: item[0])  # by date; same-day ones keep their order
+            data["recent_greetings"] = [{"date": d, "text": t} for d, t in greetings[-MAX_RECENT_GREETINGS:]]
+            data.pop(_LEGACY_GREETING_KEY, None)
             _write_json(self.path, data)
 
     def running(self) -> tuple[str, datetime | None] | None:

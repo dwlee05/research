@@ -196,7 +196,7 @@ def test_channel_relay_posts_in_order_each_bot_its_own_part(tmp_path):
     assert {c["persona"] for c in run.calls} == {"update", "schedule"}  # no 고뭉치 agent run at all
     # A manual briefing (the default) never stores its greeting: only the scheduled one does.
     # last_brief_date is never written by the relay.
-    assert options["store"].last_greeting() is None
+    assert options["store"].recent_greetings() == []
     assert options["store"].last_brief_date() is None
 
 
@@ -241,16 +241,28 @@ def test_the_greeting_falls_back_to_a_template_with_the_right_date(tmp_path):
     greeting = texts(log, "mungchi")[0].split("\n\n")[0]
     assert greeting in [t.format(**briefing.date_fields(at(8, 7))) for t in phrases.GREETING_TEMPLATES["아침"]]
     assert "10월 8일" in greeting and "10월 9일" not in greeting
-    assert options["store"].last_greeting() == ("2026-10-08", greeting)
+    assert options["store"].recent_greetings() == [("2026-10-08", greeting)]
 
 
 def test_yesterdays_greeting_reaches_the_greeting_prompt(tmp_path):
     store = StateStore(tmp_path / "state.json")
-    store.mark_greeting("2026-10-07", "똑똑! 🚪 2026년 10월 7일(수) 아침 브리핑입니다~")
+    store.mark_greeting("2026-10-07", "좋은 아침이에요! 2026년 10월 7일(수) 아침 브리핑입니다~")
     greeting = FakeGreeting()
     relay(make_bots([]), CHANNEL, tmp_path=tmp_path, greeting=greeting, store=store, scheduled=True)
-    assert '이전 인사: "똑똑! 🚪 2026년 10월 7일(수) 아침 브리핑입니다~"' in greeting.prompts[0]
-    assert store.last_greeting() == ("2026-10-08", GREETING)
+    assert '  1. "좋은 아침이에요! 2026년 10월 7일(수) 아침 브리핑입니다~"' in greeting.prompts[0]
+    assert store.recent_greetings()[-1] == ("2026-10-08", GREETING)
+
+
+def test_a_knock_yesterday_means_no_knock_today(tmp_path):
+    store = StateStore(tmp_path / "state.json")
+    store.mark_greeting("2026-10-07", "똑똑! 🚪 2026년 10월 7일(수) 아침 브리핑입니다~")
+    greeting = FakeGreeting()  # "똑똑!" again: refused
+    log: list[dict] = []
+    relay(make_bots(log), CHANNEL, tmp_path=tmp_path, greeting=greeting, store=store, scheduled=True)
+    assert "이번에는 '똑똑'을 쓰지 마" in greeting.prompts[0]
+    posted = texts(log, "mungchi")[0].split("\n\n")[0]
+    assert "똑똑" not in posted and "10월 8일" in posted
+    assert store.recent_greetings() == [("2026-10-07", "똑똑! 🚪 2026년 10월 7일(수) 아침 브리핑입니다~"), ("2026-10-08", posted)]
 
 
 def test_without_user_ids_the_hand_off_names_the_bots(tmp_path):
@@ -540,7 +552,7 @@ def test_the_default_relay_on_request_is_post_briefing(tmp_path, monkeypatch):
     assert [p["bot"] for p in log] == ["mungchi", "update", "schedule"]
     assert "💳 *Chat KHU 크레딧*: 확인 안 함 (Chat KHU 게이트웨이를 쓰지 않아요)" in log[0]["text"]  # offline here
     # A briefing on request is manual: it never stores its greeting nor touches last_brief_date.
-    assert StateStore(config.get_state_path()).last_greeting() is None
+    assert StateStore(config.get_state_path()).recent_greetings() == []
     assert StateStore(config.get_state_path()).last_brief_date() is None
 
 
@@ -582,8 +594,8 @@ def test_a_request_at_1750_is_an_evening_briefing_with_tomorrows_schedule(tmp_pa
     assert 'date="2026-10-08", days=2' in schedule and "*10/08 (목)*, *10/09 (금)*" in schedule
     assert {c["extra_system_prompt"] for c in run.calls} == {SLACK_FORMAT_PROMPT}  # the same system side as in the morning
     assert log[2]["text"] == EVENING_SCHEDULE_REPORT
-    # This morning's greeting is still the one tomorrow morning's is compared with.
-    assert store.last_greeting() == ("2026-10-08", GREETING)
+    # This morning's greeting is still the only one stored (a manual briefing never adds to the list).
+    assert store.recent_greetings() == [("2026-10-08", GREETING)]
 
 
 def test_a_dm_request_at_1750_says_the_others_report_without_morning_words(tmp_path):
@@ -670,7 +682,7 @@ def test_the_0700_tick_runs_the_relay_once_and_records_the_date_before_posting(t
     assert sorted(recorded_at_run) == [("2026-10-08", "schedule"), ("2026-10-08", "update")]  # written before the runs
     assert [p["bot"] for p in log] == ["mungchi", "update", "schedule"]
     # The scheduled briefing is the one that stores its greeting (for tomorrow morning's).
-    assert store.last_greeting() == ("2026-10-08", GREETING)
+    assert store.recent_greetings() == [("2026-10-08", GREETING)]
     # Later ticks the same day do nothing, in this process and after a restart (fresh state).
     for moment in (at(8, 7, 0), at(8, 7, 30), at(8, 11, 59)):
         clock.now = moment
@@ -739,7 +751,7 @@ def test_a_scheduled_catch_up_at_1130_is_still_the_morning_briefing(tmp_path):
     for persona in ("update", "schedule"):
         assert run.call(persona)["prompt"].startswith("아침 브리핑에서 네가 맡은 부분을 보고할 차례야(지금 11:30).")
     assert 'date="2026-10-08", days=1' in run.call("schedule")["prompt"]
-    assert store.last_greeting() == ("2026-10-08", GREETING)
+    assert store.recent_greetings() == [("2026-10-08", GREETING)]
 
 
 def test_a_scheduled_briefing_in_the_evening_hours_would_still_be_the_morning_one(tmp_path):
