@@ -14,6 +14,13 @@ from Open-Meteo (free, no key):
 
     🌤️ 서울 날씨: 대체로 맑음 · 최저 12° / 최고 23° · 강수확률 10% · 미세먼지 보통
 
+An evening or night briefing asked for by hand also shows tomorrow
+(``fetch_report(tomorrow=...)``, ``tomorrow_line``): the forecast's second
+day and tomorrow's fine dust, graded the same way from the daily mean of
+the hourly air-quality forecast:
+
+    🌧️ 내일(10/11 토): 비 · 최저 14° / 최고 20° · 강수확률 70% · 미세먼지 보통
+
 Nothing here raises into a caller: a failed forecast becomes the short note
 ``🌤️ 서울 날씨: 가져오지 못했어요``.
 """
@@ -26,6 +33,7 @@ import re
 import sys
 import unicodedata
 from dataclasses import dataclass
+from datetime import date
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Mapping, TextIO
 
@@ -34,6 +42,7 @@ import httpx
 from . import config
 from .model_list import SSL_HINT
 from .quick_info import query_text
+from .slack_format import WEEKDAYS_KO
 from .tools.common import safe_error, scrub
 
 log = logging.getLogger("mungchi.weather")
@@ -43,6 +52,8 @@ FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 AIR_QUALITY_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
 # From this chance of rain (%) on, the line ends with an umbrella reminder.
 UMBRELLA_PERCENT = 60.0
+# Tomorrow's fine dust is the daily mean of the hourly forecast: only with at least this many hours of a value.
+MIN_DUST_HOURS = 12
 
 DEFAULT_EMOJI = "🌤️"
 FAILED_NOTE = "가져오지 못했어요"
@@ -179,9 +190,11 @@ class WeatherReport:
 
     label: str = config.DEFAULT_WEATHER_LABEL
     forecast: Forecast | None = None
-    # Only when asked for (``fetch_report(days=2)``, the get_weather tool); the line never uses it.
+    # Only when asked for (``fetch_report(days=2)``: the get_weather tool; ``tomorrow=``: the evening briefing).
     tomorrow: Forecast | None = None
     air: AirQuality | None = None
+    # Tomorrow's fine dust (daily mean of the hourly forecast), only with ``fetch_report(tomorrow=...)``.
+    tomorrow_air: AirQuality | None = None
     error: str | None = None
     air_error: str | None = None
     # The forecast request's exception text (scrubbed), for the CLI's error line only.
@@ -255,6 +268,47 @@ def parse_air_quality(payload: Any) -> AirQuality:
     return AirQuality(pm10=pm10, pm2_5=pm2_5)
 
 
+def forecast_day_index(payload: Any, day: date) -> int | None:
+    """Where ``day`` is in the forecast's daily arrays: its place in ``daily.time``, or 1 (tomorrow) without dates.
+
+    None when the response lists dates but not ``day`` (e.g. the request
+    crossed midnight): then the caller has no forecast for that day.
+    """
+    times = _mapping(_mapping(payload).get("daily")).get("time")
+    if not isinstance(times, list):
+        return 1
+    wanted = day.isoformat()
+    return next((index for index, value in enumerate(times) if value == wanted), None)
+
+
+def parse_air_quality_day(payload: Any, day: date) -> AirQuality:
+    """``day``'s fine dust from the hourly air-quality forecast: the mean PM10 / PM2.5 of its hours.
+
+    Hours without a value (or a negative one) are skipped; a pollutant with
+    fewer than ``MIN_DUST_HOURS`` hours of values is None.
+    """
+    hourly = _mapping(_mapping(payload).get("hourly"))
+    times = hourly.get("time")
+    if not isinstance(times, list):
+        return AirQuality()
+    prefix = day.isoformat() + "T"
+
+    def mean(name: str) -> float | None:
+        values = hourly.get(name)
+        if not isinstance(values, list):
+            return None
+        picked = [
+            number
+            for stamp, raw in zip(times, values)
+            if isinstance(stamp, str) and stamp.startswith(prefix)
+            for number in [_number(raw)]
+            if number is not None and number >= 0
+        ]
+        return sum(picked) / len(picked) if len(picked) >= MIN_DUST_HOURS else None
+
+    return AirQuality(pm10=mean("pm10"), pm2_5=mean("pm2_5"))
+
+
 # ---------------------------------------------------------------- formatting (pure)
 
 
@@ -309,17 +363,8 @@ def failed_line(label: str = config.DEFAULT_WEATHER_LABEL, *, slack: bool = Fals
     return f"{DEFAULT_EMOJI} {_name(label, slack)}: {FAILED_NOTE}"
 
 
-def format_line(
-    label: str, forecast: Forecast | None, air: AirQuality | None = None, *, slack: bool = False
-) -> str:
-    """One Korean line; parts without data are left out.
-
-    ``🌤️ 서울 날씨: 대체로 맑음 · 최저 12° / 최고 23° · 강수확률 10% · 미세먼지 보통``, with
-    `` · ☔ 우산 챙기세요`` at the end from a 60% chance of rain. The current
-    temperature is shown only when today's lowest and highest are missing.
-    """
-    if forecast is None or forecast.empty:
-        return failed_line(label, slack=slack)
+def _forecast_parts(forecast: Forecast, air: AirQuality | None) -> tuple[str, list[str]]:
+    """``(emoji, parts)`` of a day's line: the weather, the temperatures, the chance of rain, the fine dust."""
     parts: list[str] = []
     if forecast.code is not None:
         description, emoji = describe_code(forecast.code)
@@ -340,9 +385,43 @@ def format_line(
     dust = dust_grade(air)
     if dust:
         parts.append(f"미세먼지 {dust}")
+    return emoji, parts
+
+
+def format_line(
+    label: str, forecast: Forecast | None, air: AirQuality | None = None, *, slack: bool = False
+) -> str:
+    """One Korean line; parts without data are left out.
+
+    ``🌤️ 서울 날씨: 대체로 맑음 · 최저 12° / 최고 23° · 강수확률 10% · 미세먼지 보통``, with
+    `` · ☔ 우산 챙기세요`` at the end from a 60% chance of rain. The current
+    temperature is shown only when today's lowest and highest are missing.
+    """
+    if forecast is None or forecast.empty:
+        return failed_line(label, slack=slack)
+    emoji, parts = _forecast_parts(forecast, air)
     if forecast.rain_chance is not None and forecast.rain_chance >= UMBRELLA_PERCENT:
         parts.append(UMBRELLA_NOTE)
     return f"{emoji} {_name(label, slack)}: " + " · ".join(parts)
+
+
+def tomorrow_label(day: date) -> str:
+    """``내일(10/11 토)``."""
+    return f"내일({day:%m/%d} {WEEKDAYS_KO[day.weekday()]})"
+
+
+def tomorrow_line(day: date, forecast: Forecast | None, air: AirQuality | None = None, *, slack: bool = False) -> str:
+    """Tomorrow's line under today's in an evening briefing, or "" without a forecast (no failure note).
+
+    ``🌧️ 내일(10/11 토): 비 · 최저 14° / 최고 20° · 강수확률 70% · 미세먼지 보통`` (the
+    label bold in Slack): the parts of today's line, the emoji from the
+    weather code, no umbrella reminder. ``day`` is tomorrow's date, from the caller's clock.
+    """
+    if forecast is None or forecast.empty:
+        return ""
+    emoji, parts = _forecast_parts(forecast, air)
+    label = tomorrow_label(day)
+    return f"{emoji} {f'*{label}*' if slack else label}: " + " · ".join(parts)
 
 
 def report_line(report: WeatherReport, *, slack: bool = False) -> str:
@@ -376,13 +455,18 @@ def forecast_params(cfg: config.WeatherConfig, days: int = 1) -> dict[str, str]:
     }
 
 
-def air_quality_params(cfg: config.WeatherConfig) -> dict[str, str]:
-    return {
+def air_quality_params(cfg: config.WeatherConfig, *, hourly: bool = False) -> dict[str, str]:
+    """The current PM10 / PM2.5; with ``hourly`` also the hourly forecast for today and tomorrow."""
+    params = {
         "latitude": f"{cfg.latitude:.4f}",
         "longitude": f"{cfg.longitude:.4f}",
         "current": "pm10,pm2_5",
         "timezone": cfg.timezone_name,
     }
+    if hourly:
+        params["hourly"] = "pm10,pm2_5"
+        params["forecast_days"] = "2"
+    return params
 
 
 def _reason(response: httpx.Response) -> str:
@@ -420,15 +504,21 @@ def fetch_report(
     transport: httpx.BaseTransport | None = None,
     timeout: float = TIMEOUT_SECONDS,
     days: int = 1,
+    tomorrow: date | None = None,
 ) -> WeatherReport:
     """Fetch today's forecast (with ``days=2`` tomorrow's too), then the fine dust. Never raises.
 
+    ``tomorrow``: tomorrow's local date (the caller's clock), for the evening
+    briefing's second line: tomorrow's forecast is the daily entry with that
+    date (none when the response lists other dates), and tomorrow's fine dust
+    (``tomorrow_air``) the daily mean of the hourly air-quality forecast.
     A failed forecast leaves ``forecast`` None with ``error`` set (the air
     quality is then not asked for); a failed air-quality request only sets
-    ``air_error``. A missing tomorrow only leaves ``tomorrow`` None.
+    ``air_error``. A missing tomorrow only leaves ``tomorrow`` (and
+    ``tomorrow_air``) None.
     """
     cfg = cfg or config.load_weather_config(env)
-    days = 2 if days >= 2 else 1
+    days = 2 if days >= 2 or tomorrow is not None else 1
     report = WeatherReport(label=cfg.label)
     try:
         with httpx.Client(transport=transport, timeout=timeout) as client:
@@ -443,19 +533,25 @@ def fetch_report(
                 return report
             report.forecast = forecast
             if days == 2:
-                tomorrow = parse_forecast(payload, day=1)
-                report.tomorrow = None if tomorrow.empty else tomorrow
+                index = 1 if tomorrow is None else forecast_day_index(payload, tomorrow)
+                # Day 0 is today with the current weather mixed in: never taken for tomorrow.
+                later = parse_forecast(payload, day=index) if index is not None and index >= 1 else Forecast()
+                report.tomorrow = None if later.empty else later
             try:
-                air = parse_air_quality(_get_json(client, AIR_QUALITY_URL, air_quality_params(cfg)))
+                air_payload = _get_json(client, AIR_QUALITY_URL, air_quality_params(cfg, hourly=tomorrow is not None))
             except _FetchError as exc:
                 report.air_error = exc.short
             except Exception as exc:  # noqa: BLE001 - the dust part is optional
                 report.air_error = type(exc).__name__
             else:
+                air = parse_air_quality(air_payload)
                 if air.empty:
                     report.air_error = "응답에 미세먼지 값이 없음"
                 else:
                     report.air = air
+                if tomorrow is not None and report.tomorrow is not None:
+                    later_air = parse_air_quality_day(air_payload, tomorrow)
+                    report.tomorrow_air = None if later_air.empty else later_air
     except Exception as exc:  # noqa: BLE001 - a short Korean reason, never a traceback
         if report.forecast is None:
             report.error = report.error or f"응답을 읽지 못함: {type(exc).__name__}"

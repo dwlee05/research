@@ -666,6 +666,102 @@ def test_the_briefing_line_still_uses_today_only():
     assert report.tomorrow is None
 
 
+# ---------------------------------------------------------------- tomorrow's line (evening briefing)
+
+
+def hourly_air(today=(40.0, 20.0), tomorrow=(50.0, 20.0), hours=24, day="2026-10-09"):
+    """Air quality with ``current`` and 48 hourly values: today's 24, then ``hours`` of tomorrow's (``None`` for the rest)."""
+    times = [f"2026-10-08T{h:02d}:00" for h in range(24)] + [f"{day}T{h:02d}:00" for h in range(24)]
+    pm10 = [today[0]] * 24 + [tomorrow[0] if h < hours else None for h in range(24)]
+    pm25 = [today[1]] * 24 + [tomorrow[1] if h < hours else None for h in range(24)]
+    return {**AIR_JSON, "hourly": {"time": times, "pm10": pm10, "pm2_5": pm25}}
+
+
+def test_fetch_with_tomorrow_asks_for_two_days_and_tomorrows_hourly_dust():
+    from datetime import date
+
+    transport, requests = routes(forecast=httpx.Response(200, json=FORECAST_2D), air=httpx.Response(200, json=hourly_air()))
+    report = fetch_report(env={}, transport=transport, tomorrow=date(2026, 10, 9))
+    forecast, air = requests
+    assert forecast.url.params["forecast_days"] == "2"
+    assert dict(air.url.params) == {
+        "latitude": "37.5665",
+        "longitude": "126.9780",
+        "current": "pm10,pm2_5",
+        "timezone": "Asia/Seoul",
+        "hourly": "pm10,pm2_5",
+        "forecast_days": "2",
+    }
+    # Today's line is exactly what it was; tomorrow comes from the second day and its hours.
+    assert report_line(report) == LINE
+    assert report.tomorrow == Forecast(code=63, low=13.2, high=17.4, rain_chance=80)
+    assert report.tomorrow_air == AirQuality(pm10=50.0, pm2_5=20.0) and dust_grade(report.tomorrow_air) == "보통"
+    assert weather.tomorrow_line(date(2026, 10, 9), report.tomorrow, report.tomorrow_air) == (
+        "🌧️ 내일(10/09 금): 비 · 최저 13° / 최고 17° · 강수확률 80% · 미세먼지 보통"
+    )
+
+
+def test_tomorrows_dust_is_the_daily_mean_graded_like_today():
+    from datetime import date
+
+    day = date(2026, 10, 9)
+    # PM2.5 averages 40 over the day (bad), PM10 stays fine: the worse of the two, as for today.
+    payload = hourly_air()
+    payload["hourly"]["pm2_5"][24:] = [20.0] * 12 + [60.0] * 12
+    air = weather.parse_air_quality_day(payload, day)
+    assert air == AirQuality(pm10=50.0, pm2_5=40.0) and dust_grade(air) == "나쁨"
+    # Too few hours of values: no grade for that pollutant (the line then leaves the dust out).
+    assert weather.parse_air_quality_day(hourly_air(hours=11), day).empty
+    assert weather.parse_air_quality_day(hourly_air(hours=12), day) == AirQuality(pm10=50.0, pm2_5=20.0)
+    # Another date's hours never count; odd payloads never crash.
+    assert weather.parse_air_quality_day(hourly_air(), date(2026, 10, 10)).empty
+    for odd in ({}, None, {"hourly": {"time": "x"}}, {"hourly": {"time": ["2026-10-09T00:00"], "pm10": "x"}}):
+        assert weather.parse_air_quality_day(odd, day).empty
+
+
+def test_tomorrow_must_be_the_forecasts_date_for_tomorrow():
+    from datetime import date
+
+    # The response's days are 10/09 and 10/10 (e.g. the request crossed midnight): no line for "tomorrow" 10/09.
+    shifted = {**FORECAST_2D, "daily": {**FORECAST_2D["daily"], "time": ["2026-10-09", "2026-10-10"]}}
+    transport, _ = routes(forecast=httpx.Response(200, json=shifted), air=httpx.Response(200, json=hourly_air()))
+    report = fetch_report(env={}, transport=transport, tomorrow=date(2026, 10, 9))
+    assert report.ok and report.tomorrow is None and report.tomorrow_air is None
+    assert weather.forecast_day_index(FORECAST_2D, date(2026, 10, 9)) == 1
+    assert weather.forecast_day_index(shifted, date(2026, 10, 11)) is None
+    assert weather.forecast_day_index({"daily": {"weather_code": [1, 63]}}, date(2026, 10, 9)) == 1  # no dates: second day
+
+
+def test_a_missing_tomorrow_or_its_dust_only_leaves_those_out():
+    from datetime import date
+
+    day = date(2026, 10, 9)
+    # One day only: no tomorrow at all.
+    transport, _ = routes(air=httpx.Response(200, json=hourly_air()))
+    report = fetch_report(env={}, transport=transport, tomorrow=day)
+    assert report_line(report) == LINE and report.tomorrow is None
+    assert weather.tomorrow_line(day, report.tomorrow, report.tomorrow_air) == ""
+    # A failed air-quality request: tomorrow's line without the dust, today's without it too.
+    transport, _ = routes(forecast=httpx.Response(200, json=FORECAST_2D), air=httpx.Response(503, text="busy"))
+    report = fetch_report(env={}, transport=transport, tomorrow=day)
+    assert report.tomorrow_air is None and report.air_error == "HTTP 503"
+    assert weather.tomorrow_line(day, report.tomorrow, report.tomorrow_air) == "🌧️ 내일(10/09 금): 비 · 최저 13° / 최고 17° · 강수확률 80%"
+
+
+@pytest.mark.parametrize(
+    "code, emoji",
+    [(0, "☀️"), (3, "☁️"), (63, "🌧️"), (73, "🌨️"), (95, "⛈️"), (None, "🌤️")],
+)
+def test_tomorrows_emoji_follows_the_weather_code_and_slack_bolds_the_label(code, emoji):
+    from datetime import date
+
+    forecast = Forecast(code=code, low=14.2, high=19.6, rain_chance=70)
+    text = weather.tomorrow_line(date(2026, 10, 10), forecast, AirQuality(pm10=40.0, pm2_5=20.0))
+    assert text.startswith(f"{emoji} 내일(10/10 토): ")
+    assert text.endswith("최저 14° / 최고 20° · 강수확률 70% · 미세먼지 보통") and "우산" not in text
+    assert weather.tomorrow_line(date(2026, 10, 10), forecast, slack=True).startswith(f"{emoji} *내일(10/10 토)*: ")
+
+
 # ---------------------------------------------------------------- --weather
 
 

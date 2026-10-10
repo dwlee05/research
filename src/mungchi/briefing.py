@@ -22,8 +22,11 @@ and credits only ever appear in 고뭉치's part.
   hand (Slack, ``--brief``, ``--brief --slack``) follows the local clock:
   아침 05:00–10:59, 오후 11:00–16:59, 저녁 17:00–20:59, 밤 21:00–04:59.
   The greeting, the hand-off and 업뎃's / 일정's framing all use it, and
-  from 17:00 to midnight a manual briefing's 일정 also covers tomorrow
-  (``days=2``, both dates from code).
+  from 17:00 to midnight a manual briefing also covers tomorrow
+  (``BriefTime.covers_tomorrow``): 일정 looks at tomorrow too (``days=2``,
+  both dates from code) and 고뭉치's part adds tomorrow's weather line
+  under today's (``🌧️ 내일(10/11 토): 비 · ...``, left out when the
+  forecast has no tomorrow).
 * **Greeting**: one tool-less turn with a tiny constant system prompt
   (``GREETING_SYSTEM_PROMPT``). Its user prompt holds the time of day and
   the current time, today's date, a weekday/weekend note, the weather in
@@ -177,9 +180,19 @@ class BriefTime:
         return f"{self.now:%H:%M}"
 
     @property
+    def covers_tomorrow(self) -> bool:
+        """A manual briefing from 17:00 to 23:59: 일정 adds tomorrow's schedule, 고뭉치 tomorrow's weather."""
+        return not self.scheduled and self.now.hour >= TOMORROW_FROM_HOUR
+
+    @property
     def schedule_days(self) -> int:
         """일정's ``days``: 2 (today and tomorrow) for a manual briefing from 17:00 to 23:59, else 1 (today)."""
-        return 2 if not self.scheduled and self.now.hour >= TOMORROW_FROM_HOUR else 1
+        return 2 if self.covers_tomorrow else 1
+
+    @property
+    def tomorrow(self) -> date:
+        """The local date after ``now``'s."""
+        return self.now.date() + timedelta(days=1)
 
 
 # ---------------------------------------------------------------- weather and credits (code, no LLM)
@@ -222,10 +235,15 @@ def weather_section(
     *,
     fetch: WeatherFetch | None = None,
     slack: bool = False,
-) -> str:
-    """Today's weather line (``weather.report_line``), or the short failure note. Never raises.
+    tomorrow: date | None = None,
+) -> tuple[str, str]:
+    """``(today's line, tomorrow's line)``. Never raises.
 
-    Only Open-Meteo is called, never a model. Blocking: run it in a worker
+    Today's is ``weather.report_line`` or the short failure note. Tomorrow's
+    (``weather.tomorrow_line``, labelled with ``tomorrow``) only when
+    ``tomorrow`` is given (a manual briefing from 17:00 to 23:59) and the
+    forecast has that day; else "" (no note). Only Open-Meteo is called,
+    never a model, in one fetch for both. Blocking: run it in a worker
     thread from async code.
     """
     label = config.DEFAULT_WEATHER_LABEL
@@ -233,16 +251,25 @@ def weather_section(
         if fetch is None:
             cfg = weather.load_config(env)  # logs a warning for unusable coordinates
             label = cfg.label
-            report = weather.fetch_report(cfg)
+            report = weather.fetch_report(cfg, tomorrow=tomorrow)
         else:
             report = fetch()
             label = report.label
         if not report.ok:
             weather.log.warning("브리핑의 날씨를 가져오지 못했습니다: %s", scrub(report.error or "응답 없음"))
-        return weather.report_line(report, slack=slack)
+        today = weather.report_line(report, slack=slack)
     except Exception as exc:  # noqa: BLE001 - the briefing goes out anyway
         weather.log.warning("브리핑의 날씨를 가져오지 못했습니다: %s", type(exc).__name__)
-        return weather.failed_line(label, slack=slack)
+        return weather.failed_line(label, slack=slack), ""
+    later = ""
+    if tomorrow is not None and report.ok:
+        try:
+            later = weather.tomorrow_line(tomorrow, report.tomorrow, report.tomorrow_air, slack=slack)
+        except Exception as exc:  # noqa: BLE001 - today's line goes out anyway
+            weather.log.warning("브리핑의 내일 날씨를 만들지 못했습니다: %s", type(exc).__name__)
+        if not later:
+            weather.log.info("내일 날씨가 응답에 없어 브리핑에서 내일 날씨 줄을 뺍니다.")
+    return today, later
 
 
 # ---------------------------------------------------------------- 고뭉치's greeting
@@ -676,19 +703,25 @@ async def run_report(
 
 @dataclass
 class Head:
-    """고뭉치's part before its closing lines: the greeting, the weather line ("" when off) and the credits."""
+    """고뭉치's part before its closing lines: the greeting, the weather line ("" when off), the credits,
+    and tomorrow's weather line (a manual briefing from 17:00 to 23:59 only, else "")."""
 
     greeting: Greeting
     weather: str
     credits: str
+    weather_tomorrow: str = ""
 
     def text(self, closing: Sequence[str] = ()) -> str:
-        return compose_head(self.greeting.text, self.weather, self.credits, closing)
+        return compose_head(self.greeting.text, self.weather, self.credits, closing, weather_tomorrow=self.weather_tomorrow)
 
 
-def compose_head(greeting: str, weather_text: str, credit_text: str, closing: Sequence[str] = ()) -> str:
-    """Greeting, then the weather and credit lines together, then the closing lines (notes, hand-off)."""
-    data = "\n".join(part.strip() for part in (weather_text, credit_text) if part and part.strip())
+def compose_head(
+    greeting: str, weather_text: str, credit_text: str, closing: Sequence[str] = (), *, weather_tomorrow: str = ""
+) -> str:
+    """Greeting, then the weather lines (today, tomorrow) and the credits together, then the closing lines (notes, hand-off)."""
+    data = "\n".join(
+        part.strip() for part in (weather_text, weather_tomorrow, credit_text) if part and part.strip()
+    )
     tail = "\n".join(line.strip() for line in closing if line and line.strip())
     return "\n\n".join(part for part in (greeting.strip(), data, tail) if part)
 
@@ -709,10 +742,16 @@ async def _build_head(
         asyncio.to_thread(credit_section, env, fetch=credit_fetch, now=when.now, slack=slack)
     )
     try:
-        weather_text = (
-            await asyncio.to_thread(weather_section, env, fetch=weather_fetch, slack=slack)
+        weather_text, weather_tomorrow = (
+            await asyncio.to_thread(
+                weather_section,
+                env,
+                fetch=weather_fetch,
+                slack=slack,
+                tomorrow=when.tomorrow if when.covers_tomorrow else None,
+            )
             if config.get_brief_weather(env)
-            else ""
+            else ("", "")
         )
         greeting = await make_greeting(
             when,
@@ -726,7 +765,7 @@ async def _build_head(
         credit_text = await credit_task
     finally:
         credit_task.cancel()  # a no-op once done
-    return Head(greeting, weather_text, credit_text)
+    return Head(greeting, weather_text, credit_text, weather_tomorrow)
 
 
 class Relay:

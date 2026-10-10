@@ -791,6 +791,127 @@ def test_mungchis_part_is_greeting_then_weather_and_credits_then_closing_lines()
     assert closing == "업뎃이, 일정이 아침 보고 부탁해요!"
 
 
+# Today sunny, tomorrow rainy (the evening briefing's second line).
+SUNNY_THEN_RAIN = weather.WeatherReport(
+    label="서울",
+    forecast=weather.Forecast(code=1, low=11.5, high=22.6, rain_chance=10),
+    tomorrow=weather.Forecast(code=63, low=14.2, high=19.6, rain_chance=70),
+    air=weather.AirQuality(pm10=42.3, pm2_5=12.0),
+    tomorrow_air=weather.AirQuality(pm10=40.0, pm2_5=20.0),
+)
+TOMORROW_TAIL = "비 · 최저 14° / 최고 20° · 강수확률 70% · 미세먼지 보통"
+
+
+def _head_at(now, *, scheduled=False, slack=False, fetch=lambda: SUNNY_THEN_RAIN, env=WEATHER_ON):
+    async def go():
+        async with start_relay(
+            personas=(), now=now, scheduled=scheduled, env=env, slack=slack, credit_fetch=report, weather_fetch=fetch, greeting_generate=FakeGreeting()
+        ) as relay:
+            return await relay.head()
+
+    return asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    "now, label",
+    [
+        (seoul(8, 17, 50), "내일(10/09 금)"),
+        (seoul(8, 17, 0), "내일(10/09 금)"),
+        (seoul(8, 21, 30), "내일(10/09 금)"),
+        (seoul(8, 23, 59), "내일(10/09 금)"),
+        (seoul(10, 18, 0), "내일(10/11 일)"),
+        (datetime(2026, 10, 31, 22, 0, tzinfo=SEOUL), "내일(11/01 일)"),  # month end
+        (datetime(2026, 12, 31, 23, 59, tzinfo=SEOUL), "내일(01/01 금)"),  # year end
+        (datetime(2028, 2, 28, 20, 0, tzinfo=SEOUL), "내일(02/29 화)"),  # leap day
+    ],
+)
+def test_an_evening_or_night_manual_briefing_adds_tomorrows_weather_under_todays(now, label):
+    head = _head_at(now)
+    assert head.weather == WEATHER_LINE
+    assert head.weather_tomorrow == f"🌧️ {label}: {TOMORROW_TAIL}"
+    _greeting, data = head.text().split("\n\n")
+    assert data.splitlines()[:3] == [WEATHER_LINE, f"🌧️ {label}: {TOMORROW_TAIL}", CREDIT_LINE]
+    # In Slack the label is bold, like today's.
+    assert _head_at(now, slack=True).weather_tomorrow == f"🌧️ *{label}*: {TOMORROW_TAIL}"
+
+
+@pytest.mark.parametrize(
+    "now, scheduled",
+    [
+        (seoul(8, 16, 59), False),  # afternoon
+        (seoul(9, 0, 0), False),  # after midnight: the new day only
+        (seoul(9, 1, 30), False),
+        (seoul(8, 7, 0), False),  # a manual morning briefing
+        (seoul(8, 7, 0), True),  # the scheduled 07:00 briefing
+        (seoul(8, 18, 0), True),  # a scheduled one is the morning briefing whatever the hour
+    ],
+)
+def test_other_briefings_have_no_tomorrow_line(now, scheduled):
+    head = _head_at(now, scheduled=scheduled)
+    assert head.weather == WEATHER_LINE and head.weather_tomorrow == ""
+    assert "내일(" not in head.text() and "🌧️" not in head.text()
+
+
+def test_a_missing_tomorrow_leaves_its_line_out_and_today_unchanged():
+    without = weather.WeatherReport(label="서울", forecast=SUNNY.forecast, air=SUNNY.air)  # no tomorrow in the answer
+    head = _head_at(seoul(8, 17, 50), fetch=lambda: without)
+    assert head.weather == WEATHER_LINE and head.weather_tomorrow == ""
+    assert head.text().split("\n\n")[1].splitlines()[:2] == [WEATHER_LINE, CREDIT_LINE]
+    # Today's forecast failed: the short note for today, nothing for tomorrow.
+    failed = weather.WeatherReport(label="서울", error="연결 실패", tomorrow=SUNNY_THEN_RAIN.tomorrow)
+    head = _head_at(seoul(8, 17, 50), fetch=lambda: failed)
+    assert head.weather == "🌤️ 서울 날씨: 가져오지 못했어요" and head.weather_tomorrow == ""
+    # BRIEF_WEATHER=off: neither line.
+    head = _head_at(seoul(8, 17, 50), env={"BRIEF_WEATHER": "off"})
+    assert head.weather == head.weather_tomorrow == "" and "날씨" not in head.text() and "내일(" not in head.text()
+
+
+def test_the_greeting_only_hears_about_todays_weather():
+    generate = FakeGreeting()
+
+    async def go():
+        async with start_relay(
+            personas=(), now=seoul(8, 17, 50), env=WEATHER_ON, credit_fetch=report, weather_fetch=lambda: SUNNY_THEN_RAIN, greeting_generate=generate
+        ) as relay:
+            return await relay.head()
+
+    asyncio.run(go())
+    assert "- 날씨 요약: 대체로 맑음 · 미세먼지 보통" in generate.prompts[0] and "비" not in generate.prompts[0].split("날씨 요약:")[1].splitlines()[0]
+
+
+def test_the_evening_briefing_fetches_tomorrow_from_open_meteo_in_the_same_requests(monkeypatch, capsys):
+    import httpx
+
+    seen = []
+
+    def handle(request):
+        seen.append(request)
+        if request.url.host == "api.open-meteo.com":
+            return httpx.Response(200, json={"daily": {
+                "time": ["2026-10-08", "2026-10-09"],
+                "weather_code": [1, 63],
+                "temperature_2m_min": [11.5, 14.2],
+                "temperature_2m_max": [22.6, 19.6],
+                "precipitation_probability_max": [10, 70],
+            }})
+        hours = [f"2026-10-08T{h:02d}:00" for h in range(24)] + [f"2026-10-09T{h:02d}:00" for h in range(24)]
+        return httpx.Response(200, json={"current": {"pm10": 42.3, "pm2_5": 12.0}, "hourly": {"time": hours, "pm10": [40.0] * 48, "pm2_5": [20.0] * 48}})
+
+    real_client = httpx.Client
+    monkeypatch.setattr(weather.httpx, "Client", lambda **kw: real_client(transport=httpx.MockTransport(handle), timeout=kw.get("timeout")))
+    out = io.StringIO()
+    code = run_brief_cli(env=WEATHER_ON, run=PersonaRun(), now=seoul(8, 17, 50), credit_fetch=report, greeting_generate=FakeGreeting(), rng=random.Random(0), out=out, err=io.StringIO())
+    assert code == 0
+    mungchi = out.getvalue().split("[업뎃]\n")[0]
+    assert f"\n{WEATHER_LINE}\n🌧️ 내일(10/09 금): {TOMORROW_TAIL}\n{CREDIT_LINE}" in mungchi
+    assert [r.url.host for r in seen] == ["api.open-meteo.com", "air-quality-api.open-meteo.com"]  # still two requests
+    assert seen[0].url.params["forecast_days"] == "2" and seen[1].url.params["hourly"] == "pm10,pm2_5"
+    # At 16:59 the same CLI asks for today only, exactly as before.
+    seen.clear()
+    run_brief_cli(env=WEATHER_ON, run=PersonaRun(), now=seoul(8, 16, 59), credit_fetch=report, greeting_generate=FakeGreeting(), out=io.StringIO(), err=io.StringIO())
+    assert seen[0].url.params["forecast_days"] == "1" and "hourly" not in seen[1].url.params
+
+
 @pytest.mark.parametrize("value", ["off", "0", "false", "OFF"])
 def test_brief_weather_off_leaves_the_line_out_and_fetches_nothing(value):
     fetched = []

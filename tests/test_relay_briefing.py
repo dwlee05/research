@@ -598,6 +598,38 @@ def test_a_request_at_1750_is_an_evening_briefing_with_tomorrows_schedule(tmp_pa
     assert store.recent_greetings() == [("2026-10-08", GREETING)]
 
 
+def sunny_then_rain():
+    return weather.WeatherReport(
+        label="서울",
+        forecast=weather.Forecast(code=1, low=11.5, high=22.6, rain_chance=10),
+        tomorrow=weather.Forecast(code=63, low=14.2, high=19.6, rain_chance=70),
+        air=weather.AirQuality(pm10=42.3, pm2_5=12.0),
+        tomorrow_air=weather.AirQuality(pm10=40.0, pm2_5=20.0),
+    )
+
+
+TOMORROW_LINE = "🌧️ *내일(10/09 금)*: 비 · 최저 14° / 최고 20° · 강수확률 70% · 미세먼지 보통"
+
+
+def test_an_evening_request_in_slack_adds_tomorrows_weather_line(tmp_path):
+    log: list[dict] = []
+    code, _ = relay(make_bots(log), CHANNEL, tmp_path=tmp_path, now=at(8, 17, 50), weather_fetch=sunny_then_rain)
+    assert code == 0
+    data = texts(log, "mungchi")[0].split("\n\n")[1]
+    assert data.splitlines()[:3] == [WEATHER_LINE, TOMORROW_LINE, CREDIT_LINE]
+    # 업뎃 and 일정 never get the weather.
+    assert "내일(" not in texts(log, "update")[0] and "🌧️" not in texts(log, "schedule")[0]
+
+
+def test_the_scheduled_briefing_never_has_tomorrows_weather_line(tmp_path):
+    store = StateStore(tmp_path / "state.json")
+    log: list[dict] = []
+    status = tick(make_bots(log), store, FakeClock(at(8, 7, 0)), PersonaRun(), state=slack_bot.BriefLoopState(), weather_fetch=sunny_then_rain)
+    assert status == "sent"
+    data = texts(log, "mungchi")[0].split("\n\n")[1]
+    assert data.splitlines()[:2] == [WEATHER_LINE, CREDIT_LINE] and "내일(" not in texts(log, "mungchi")[0]
+
+
 def test_a_dm_request_at_1750_says_the_others_report_without_morning_words(tmp_path):
     log: list[dict] = []
     handler, _store = _request_handler(tmp_path, log, PersonaRun(), now=at(8, 17, 50))
@@ -640,7 +672,7 @@ class FakeClock:
         return self.now
 
 
-def tick(bots, store, clock, run, *, state, destinations=(CHANNEL,), sessions=None, schedule=MORNING, greeting=None, **kwargs):
+def tick(bots, store, clock, run, *, state, destinations=(CHANNEL,), sessions=None, schedule=MORNING, greeting=None, weather_fetch=sunny, **kwargs):
     return asyncio.run(
         slack_bot.morning_brief_tick(
             bots,
@@ -653,7 +685,7 @@ def tick(bots, store, clock, run, *, state, destinations=(CHANNEL,), sessions=No
             run=run,
             sessions=sessions,
             credit_fetch=low_report,
-            weather_fetch=sunny,
+            weather_fetch=weather_fetch,
             greeting_generate=greeting or FakeGreeting(),
             **kwargs,
         )
