@@ -126,6 +126,67 @@ def test_mungchi_passes_on_the_short_credits_unless_details_are_asked_for():
     assert first.encode("utf-8") == again.encode("utf-8")
 
 
+# ---------------------------------------------------------------- 박사님
+
+
+def test_every_persona_calls_the_user_baksanim_in_its_prompts():
+    from mungchi.briefing import GREETING_SYSTEM_PROMPT
+
+    rule = agents.HONORIFIC_RULE
+    assert "'박사님'이라고 부르고" in rule and "높임말" in rule and "문장마다 붙이지 않고" in rule
+    assert "'사용자', '사용자님', '당신'이라고 부르지 않고" in rule
+    prompts = {
+        "mungchi": build_options(env={}).system_prompt,
+        "update": build_options(env={}, persona="update").system_prompt,
+        "schedule": build_options(env={}, persona="schedule").system_prompt,
+        **{f"{name} (subagent)": agent.prompt for name, agent in build_options(env={}).agents.items()},
+    }
+    for name, prompt in prompts.items():
+        assert prompt.count(rule) == 1, name  # in the shared voice rules (direct) or the subagent voice
+    assert "박사님께 팀원 이야기를 할 때는" in VOICES["mungchi"] and "가끔은 '박사님,' 하고 부르며 시작하기" in VOICES["mungchi"]
+    assert "인사를 받는 분은 '박사님'이다. 가끔 '박사님,' 하고 부르며 시작해도 되지만 날마다 부르지는 않고" in GREETING_SYSTEM_PROMPT
+    # Still constant, byte for byte.
+    for persona in PERSONAS:
+        first = build_options(env={}, persona=persona).system_prompt
+        assert first.encode("utf-8") == build_options(env={}, persona=persona).system_prompt.encode("utf-8")
+
+
+def test_the_all_mine_no_changes_line_says_baksanim_modified_them():
+    for prompt in (agents.build_update_prompt(), agents.build_update_prompt(direct=True)):
+        assert "기간 안에 바뀐 파일 5개는 모두 박사님이 수정하신 거예요" in prompt
+        assert "5개는 박사님이 수정하셨고, 3개는 수정한 사람을 알 수 없어 뺐어요" in prompt
+
+
+def test_no_user_facing_text_speaks_of_the_users_work_in_the_first_person():
+    from pathlib import Path
+
+    from mungchi import dropbox_check, service
+    from mungchi.tools import dropbox_tool
+
+    src = Path(agents.__file__).parent
+    for path in sorted(src.rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        for phrase in ("내가 수정", "제가 수정", "사용자님", "내가 고친"):
+            # Only the rule that forbids it may name it.
+            allowed = agents.HONORIFIC_RULE.count(phrase) if path.name == "agents.py" and path.parent == src else 0
+            assert text.count(phrase) == allowed, (path.name, phrase)
+    assert dropbox_check.DECISION_LABELS["excluded_mine"] == "제외: 박사님이 수정하신 파일"
+    assert "다른 분(박사님 본인 제외)" in dropbox_tool.TOOL_DESCRIPTION and "나 제외" not in dropbox_tool.TOOL_DESCRIPTION
+    assert "박사님이 '네'라고 확인하신 것만" in service.CALENDAR_USAGE_TEXT and "사용자가" not in service.CALENDAR_USAGE_TEXT
+
+
+def test_some_but_not_all_templates_and_placeholders_say_baksanim():
+    pools = [*phrases.GREETING_TEMPLATES.values(), *phrases.PLACEHOLDER_POOLS.values()]
+    for pool in pools:
+        assert sum("박사님" in line for line in pool) <= 1, pool  # never overused
+        assert any("박사님" not in line for line in pool)
+    assert all(any("박사님" in line for line in pool) for pool in phrases.GREETING_TEMPLATES.values())
+    assert all(any("박사님" in line for line in pool) for pool in phrases.PLACEHOLDER_POOLS.values())
+    assert "박사님, 좋은 저녁이에요! {short} 브리핑 전할게요 🙂" in phrases.GREETING_TEMPLATES["저녁"]
+    for extra in (phrases.WEEKEND_GREETING_TEMPLATES, phrases.MONDAY_GREETING_TEMPLATES, phrases.HANDOFF_TEMPLATES, phrases.APOLOGY_TEMPLATES):
+        assert not any("박사님" in line for pool in extra.values() for line in pool)
+
+
 def test_call_names_take_i_after_a_final_consonant():
     assert [call_name(p) for p in PERSONAS] == ["고뭉치", "업뎃이", "일정이"]
 

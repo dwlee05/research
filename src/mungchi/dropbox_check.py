@@ -41,7 +41,7 @@ NO_INFO = "(정보 없음)"
 DECISION_LABELS = {
     INCLUDED: "포함",
     EXCLUDED_TEMP: "제외: 임시 파일",
-    EXCLUDED_MINE: "제외: 내가 수정",
+    EXCLUDED_MINE: "제외: 박사님이 수정하신 파일",
     EXCLUDED_UNKNOWN_MODIFIER: "제외: 수정자 정보 없음(공유 폴더 아님)",
     EXCLUDED_BEFORE_WINDOW: "제외: 기간 이전 (기준 시각 이전)",
 }

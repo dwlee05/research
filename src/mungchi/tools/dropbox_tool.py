@@ -388,14 +388,14 @@ def run_check(
 
 
 TOOL_DESCRIPTION = (
-    "DROPBOX_ROOT_FOLDER(기본 /20_연구-진행)와 그 하위 폴더 전체에서 다른 분(나 제외)이 수정한 파일 목록만 확인한다. "
+    "DROPBOX_ROOT_FOLDER(기본 /20_연구-진행)와 그 하위 폴더 전체에서 다른 분(박사님 본인 제외)이 수정한 파일 목록만 확인한다. "
     "하위 폴더 → 사람별로 파일 경로와 수정 시각, 하위 폴더 링크를 짧은 JSON으로 돌려준다. "
     f"파일 내용·diff는 읽지 않는다. 최근 {MAX_LISTED_FILES}개를 넘는 파일은 개수(omitted)만 준다. "
     "임시·잠금 파일(~$…, .~lock.…, .DS_Store, *.tmp, *.swp 등)은 처음부터 뺀다. "
     "since_basis는 기간의 기준이다: default_24h(기간 없이 물어 최근 24시간), since_hours(지정한 시간), "
     "briefing_checkpoint(브리핑 실행: 지난 브리핑 이후), lookback_default(브리핑 실행인데 기록이 없어 "
     "LOOKBACK_DAYS일). 어느 기준인지는 실행 방식이 정하고, since_hours를 주면 그것이 우선한다. "
-    "stats는 훑어본 파일 수(scanned), 기간 안에 바뀐 파일 수(changed_in_window, 임시 파일 제외), 그중 내가 수정해서 "
+    "stats는 훑어본 파일 수(scanned), 기간 안에 바뀐 파일 수(changed_in_window, 임시 파일 제외), 그중 박사님(사용자 본인)이 수정해서 "
     "뺀 수(excluded_mine), 수정자 정보가 없어서(공유 폴더가 아닌 곳) 뺀 수(excluded_unknown_modifier), 기간과 "
     "상관없이 임시·잠금 파일이라 뺀 수(excluded_temp)다. 브리핑 실행만 브리핑 기준 시각을 지금으로 바꾸고, "
     "그 밖의 확인은 아무것도 바꾸지 않는다. 이동·이름 바꾸기·삭제는 감지하지 않는다. "

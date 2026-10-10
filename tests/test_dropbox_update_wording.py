@@ -176,7 +176,9 @@ def test_the_no_changes_lines_say_dropbox_update_and_keep_the_window():
         assert '"Dropbox 업데이트 없음: 지난 브리핑(10/06 07:50) 이후 바뀐 파일이 없어요"' in section
         assert '"Dropbox 업데이트 없음: 지난 브리핑 기록이 없어 최근 24시간 기준으로 봤는데, 바뀐 파일이 없어요"' in section
         assert '"Dropbox 업데이트 없음: 10/03 14:20 이후 바뀐 파일이 없어요"' in section
-        assert '"Dropbox 업데이트 없음 (최근 24시간 기준): 기간 안에 바뀐 파일 5개는 모두 내가 수정했어요"' in section
+        assert '"Dropbox 업데이트 없음 (최근 24시간 기준): 기간 안에 바뀐 파일 5개는 모두 박사님이 수정하신 거예요"' in section
+        assert '8개 가운데 5개는 박사님이 수정하셨고, 3개는 수정한 사람을 알 수 없어 뺐어요' in section
+        assert "내가 수정" not in prompt
         assert 'stats가 없으면 "Dropbox 업데이트 없음"만 쓴다.' in section
         assert "변경 없음 (Dropbox" not in prompt
     # 고뭉치 passes that line on as it is.

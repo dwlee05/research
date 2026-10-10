@@ -34,13 +34,13 @@ PLACEHOLDER_POOLS: dict[str, tuple[str, ...]] = {
     MUNGCHI: (
         "잠시만요, 금방 확인해 볼게요 🗂️",
         "네, 바로 알아볼게요!",
-        "알겠어요, 하나씩 챙겨 볼게요 🙂",
+        "알겠어요, 박사님. 하나씩 챙겨 볼게요 🙂",
         "잠깐만요, 고뭉치가 살펴보는 중이에요...",
         "좋아요, 금방 다녀올게요!",
     ),
     UPDATE: (
         "네, 바로 확인해 보겠습니다.",
-        "확인 들어갑니다! 금방 보고드릴게요.",
+        "박사님, 확인 들어갑니다! 금방 보고드릴게요.",
         "잠시만요, 꼼꼼히 살펴보고 말씀드릴게요 📂",
         "업뎃이 확인 중입니다...",
     ),
@@ -48,7 +48,7 @@ PLACEHOLDER_POOLS: dict[str, tuple[str, ...]] = {
         "잠깐만요, 금방 확인해 드릴게요! ⏰",
         "네! 바로 살펴볼게요 😊",
         "일정이 확인 중이에요~ 조금만 기다려 주세요",
-        "좋아요, 금방 알려드릴게요!",
+        "좋아요, 박사님! 금방 알려드릴게요.",
     ),
 }
 
@@ -94,7 +94,8 @@ TIMES_OF_DAY: tuple[str, ...] = (MORNING, AFTERNOON, EVENING, NIGHT)
 # Each pool opens in many different ways (``briefing.greeting_opening``: the
 # first word), so the fallback can pick one that differs from the recent
 # greetings. "똑똑" is one rare opener among many: one template per time of
-# day at most, and none in the weekend and Monday extras.
+# day at most, and none in the weekend and Monday extras. The user is
+# 박사님: one template per time of day calls them so, not more.
 
 GREETING_TEMPLATES: dict[str, tuple[str, ...]] = {
     MORNING: (
@@ -107,6 +108,7 @@ GREETING_TEMPLATES: dict[str, tuple[str, ...]] = {
         "커피 한 잔 하셨어요? {short} 아침 브리핑 시작할게요 ☕",
         "오늘 하루도 잘 부탁드려요! {date} 아침 브리핑입니다~",
         "바로 본론부터 갈게요. {short} 아침 브리핑이에요.",
+        "박사님, 좋은 아침이에요! {short} 브리핑 시작할게요 🙂",
     ),
     AFTERNOON: (
         "안녕하세요, 고뭉치예요. {md} {wd} 오후 브리핑 시작할게요 🙂",
@@ -118,6 +120,7 @@ GREETING_TEMPLATES: dict[str, tuple[str, ...]] = {
         "{wd} 오후예요! {md} 브리핑 바로 시작할게요.",
         "바로 본론부터 갈게요. {short} 오후 브리핑입니다.",
         "남은 하루도 차근차근 가 봐요. {date} 오후 브리핑이에요 ✨",
+        "박사님, 오후 브리핑이에요. {md} {wd} 소식 챙겨 왔어요!",
     ),
     EVENING: (
         "오늘 하루도 수고 많으셨어요! {md} {wd} 저녁 브리핑 시작할게요 🙂",
@@ -129,6 +132,7 @@ GREETING_TEMPLATES: dict[str, tuple[str, ...]] = {
         "저녁은 챙겨 드셨어요? {short} 저녁 브리핑 시작할게요 🍚",
         "바로 본론부터 갈게요. {date} 저녁 브리핑입니다.",
         "고생 많으셨어요. {short} 브리핑으로 내일 준비도 함께 챙겨 볼게요 ✨",
+        "박사님, 좋은 저녁이에요! {short} 브리핑 전할게요 🙂",
     ),
     NIGHT: (
         "늦게까지 수고 많으세요. {md} {wd} 브리핑 짧게 전할게요 🙂",
@@ -140,6 +144,7 @@ GREETING_TEMPLATES: dict[str, tuple[str, ...]] = {
         "무리하지 마시고요, {md} {wd} 브리핑 간단히 전할게요 🙂",
         "바로 본론부터 갈게요. {date} 브리핑입니다.",
         "{short} 브리핑, 짧게 전하고 물러갈게요 🌙",
+        "박사님, 늦게까지 고생 많으세요. {short} 브리핑 짧게 전할게요 🌙",
     ),
 }
 WEEKEND_GREETING_TEMPLATES: dict[str, tuple[str, ...]] = {

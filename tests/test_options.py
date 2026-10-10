@@ -400,7 +400,7 @@ def test_update_prompts_turn_periods_into_since_hours_and_explain_empty_results(
         assert "last_check" not in prompt and "마지막 확인" not in prompt
         assert "Dropbox 업데이트 없음: 최근 24시간 동안 바뀐 파일이 없어요" in prompt
         assert "지난 브리핑(10/06 07:50) 이후 바뀐 파일이 없어요" in prompt
-        assert "기간 안에 바뀐 파일 5개는 모두 내가 수정했어요" in prompt
+        assert "기간 안에 바뀐 파일 5개는 모두 박사님이 수정하신 거예요" in prompt
         assert "수정한 사람을 알 수 없어 뺐어요 (공유 폴더가 아닌 곳에 있을 수 있어요)" in prompt
 
     # 고뭉치 converts periods for 업뎃 from the per-turn time line, and passes
@@ -435,7 +435,7 @@ def test_the_dropbox_window_is_explained_from_since_basis_only():
         assert "Dropbox <folder> (<기간>, 파일 total_files개)" in prompt and "(since 이후," not in prompt
         # Every no-result line names its window the same way.
         assert "지난 브리핑 기록이 없어 최근 24시간 기준으로 봤는데, 바뀐 파일이 없어요" in prompt
-        assert "Dropbox 업데이트 없음 (최근 24시간 기준): 기간 안에 바뀐 파일 5개는 모두 내가 수정했어요" in prompt
+        assert "Dropbox 업데이트 없음 (최근 24시간 기준): 기간 안에 바뀐 파일 5개는 모두 박사님이 수정하신 거예요" in prompt
         assert "since_basis가 default_24h, briefing_checkpoint, lookback_default이면 같은 줄 끝에" in prompt
         assert "since_basis가 since_hours나 lookback_default" not in prompt
     # 고뭉치 relays 업뎃's wording and never guesses why the window is what it is.

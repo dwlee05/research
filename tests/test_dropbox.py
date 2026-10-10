@@ -601,7 +601,7 @@ def test_dropbox_check_explains_every_file_without_moving_the_checkpoint(tmp_pat
         "  - 제외: 임시 파일: 2개 (~$·.~lock.로 시작하는 파일, .DS_Store, *.tmp 등. 기간과 상관없이 먼저 뺌)",
         "기간 안에 바뀐 파일: 4개",
         "  - 포함: 2개 (업뎃이 알려 주는 파일)",
-        "  - 제외: 내가 수정: 1개",
+        "  - 제외: 박사님이 수정하신 파일: 1개",
         "  - 제외: 수정자 정보 없음(공유 폴더 아님): 1개",
     ):
         assert line + "\n" in out
@@ -609,7 +609,7 @@ def test_dropbox_check_explains_every_file_without_moving_the_checkpoint(tmp_pat
 
     changed = [
         ("개인/notes.txt", "10-04 12:00", "(정보 없음)", "아니오", "제외: 수정자 정보 없음(공유 폴더 아님)"),
-        ("논문A/mine.tex", "10-04 11:00", "나연구", "예", "제외: 내가 수정"),
+        ("논문A/mine.tex", "10-04 11:00", "나연구", "예", "제외: 박사님이 수정하신 파일"),
         ("논문A/intro.tex", "10-04 10:00", "김공저", "예", "포함"),
         ("Paper-B/refs.bib", "10-03 14:00", "(정보 없음)", "예", "포함"),
     ]
@@ -686,7 +686,7 @@ def test_dropbox_check_matches_what_the_tool_reports(tmp_path):
     stats = payload["stats"]
     assert f"훑어본 파일: {stats['scanned']}개" in out
     assert f"기간 안에 바뀐 파일: {stats['changed_in_window']}개" in out
-    assert f"제외: 내가 수정: {stats['excluded_mine']}개" in out
+    assert f"제외: 박사님이 수정하신 파일: {stats['excluded_mine']}개" in out
     assert f"제외: 임시 파일: {stats['excluded_temp']}개" in out
 
 
