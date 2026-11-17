@@ -1320,7 +1320,9 @@ def test_help_texts_list_the_service_commands(capsys):
         main(["service", "logs", "--help"])
     out = capsys.readouterr().out
     assert out.startswith("사용법: mungchi service logs") and "사용법: 사용법" not in out
-    assert "-f, --follow" in out and "-n N, --lines N" in out
+    assert "-f, --follow" in out
+    # Python 3.13+ argparse prints the metavar once ("-n, --lines N"); 3.12 and older repeat it ("-n N, --lines N").
+    assert re.search(r"-n( N)?, --lines N", out)
 
 
 @pytest.mark.parametrize("action", ["install", "uninstall", "start", "stop", "restart", "status", "logs"])
