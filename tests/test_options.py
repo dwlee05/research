@@ -1671,3 +1671,97 @@ def test_cli_image_chat_mode_sends_the_photos_with_the_first_message_only(image_
     assert without_now_line(first["message"]["content"][-1]["text"]) == "이 이미지에 있는 일정을 캘린더에 등록해줘"
     assert isinstance(second, str) and without_now_line(second) == "고마워"
     assert "사진 1장을 첫 메시지와 함께 보냅니다" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------- terminal chat: events with a similar one, one by one
+
+SIMILAR_EVENTS = [
+    {"title": "잡세미나 - 이승헌", "date": "2099-11-18", "start_time": "15:00", "end_time": "16:00"},
+    {"title": "잡세미나 - 한요셉", "date": "2099-11-19", "start_time": "10:00", "end_time": "11:00"},
+    {"title": "잡세미나 - 김하늘", "date": "2099-11-19", "start_time": "13:00", "end_time": "14:00"},
+]
+ALREADY_THERE = {
+    0: "2099/11/18(수) 15:00–16:00 잡세미나(응용경제 공채) - 이승헌 (Event-KHU)",
+    2: "2099/11/19(목) 13:00–14:00 잡세미나 - 김하늘 (Event-KHU)",
+}
+
+
+class SimilarProposingSDKClient(ProposingSDKClient):
+    async def query(self, prompt, session_id="default"):
+        await FakeSDKClient.query(self, prompt, session_id)
+        if without_now_line(prompt) in self.propose_on:
+            items, _ = event_proposals.normalize_events(SIMILAR_EVENTS, tz=ZoneInfo("Asia/Seoul"), now=NOW)
+            for index, text in ALREADY_THERE.items():
+                items[index].similar = [text]
+            proposal = {"id": "p", "calendar": None, "categories": CATEGORY_ROWS, "suggested_category": "Event-KHU",
+                        "events": [e.to_state() for e in items]}
+            self.store.save_pending_proposal(self.key, proposal, utcnow())
+
+
+def similar_chat(monkeypatch, tmp_path, lines, refuse=()):
+    store, key = StateStore(tmp_path / "state.json"), "cli:test"
+    SimilarProposingSDKClient.store, SimilarProposingSDKClient.key, SimilarProposingSDKClient.propose_on = store, key, {"메모"}
+    FakeSDKClient.instances = []
+    monkeypatch.setattr(main_module, "ClaudeSDKClient", SimilarProposingSDKClient)
+    feed, asked, created, refused = iter(lines), [], [], set(refuse)
+
+    def fake_input(prompt=""):
+        asked.append(prompt)
+        try:
+            return next(feed)
+        except StopIteration:
+            raise EOFError from None
+
+    def create(proposal):  # one result per event, in order; titles in ``refused`` are refused once
+        results = []
+        for event in proposal["events"]:
+            if event["title"] in refused:
+                refused.discard(event["title"])
+                results.append(CreationResult(summary=event["title"], error="읽기 전용 캘린더예요", retry_event=event))
+            else:
+                created.append((event["title"], proposal.get("chosen_category")))
+                results.append(CreationResult(summary=event["title"], ok=True, category=proposal.get("chosen_category") or ""))
+        return CreationOutcome(results=results)
+
+    monkeypatch.setattr("builtins.input", fake_input)
+    options = build_options(persona="schedule", conversation_key=key)
+    assert asyncio.run(run_chat(options, "schedule", conversation_key=key, store=store, create=create)) == 0
+    [client] = FakeSDKClient.instances[-1:]
+    return asked, created, store, [without_now_line(p) for p in client.prompts]
+
+
+ITEM_PROMPT = "넣을까요? [넣기/건너뛰기] "
+
+
+def test_chat_asks_about_each_similar_event_after_the_category(monkeypatch, tmp_path, capsys):
+    asked, created, store, prompts = similar_chat(monkeypatch, tmp_path, ["메모", "5", "1", "넣기", "건너뛰기", "종료"])
+    assert asked == ["\n나> ", CATEGORY_QUESTION, ITEM_PROMPT, ITEM_PROMPT, ITEM_PROMPT, "\n나> "]
+    assert created == [("잡세미나 - 한요셉", "Event-KHU"), ("잡세미나 - 이승헌", "Event-KHU")]  # the 3rd was skipped
+    out = capsys.readouterr().out
+    assert (
+        "✅ Event-KHU 캘린더에 추가했어요\n• 잡세미나 - 한요셉\n"
+        "비슷한 일정이 이미 있는 2건은 하나씩 골라 주세요, 박사님.\n"
+        "1) 2099/11/18(수) 15:00–16:00 잡세미나 - 이승헌\n"
+        f"   ↔ 이미 있음: {ALREADY_THERE[0]}\n"
+    ) in out
+    assert "비슷한 일정은 번호와 함께 답해 주세요, 박사님 (1~2번)" in out  # "1" alone
+    assert "1) 2099/11/18(수) 15:00–16:00 잡세미나 - 이승헌: ✅ 넣었어요\n2) 2099/11/19(목) 13:00–14:00 잡세미나 - 김하늘" in out
+    assert "2) 2099/11/19(목) 13:00–14:00 잡세미나 - 김하늘: ⏭️ 건너뛰었어요" in out
+    assert prompts == ["메모"]  # never the agent
+    assert store.pending_proposal("cli:test#similar", utcnow()) is None
+
+
+def test_chat_retries_a_refused_similar_event_and_takes_all_at_once(monkeypatch, tmp_path, capsys):
+    asked, created, store, prompts = similar_chat(monkeypatch, tmp_path, ["메모", "5", "넣기", "다시", "모두 넣기", "종료"], refuse={"잡세미나 - 이승헌"})
+    assert asked == ["\n나> ", CATEGORY_QUESTION, ITEM_PROMPT, "다시 시도할까요? [다시/건너뛰기] ", ITEM_PROMPT, "\n나> "]
+    assert [title for title, _ in created] == ["잡세미나 - 한요셉", "잡세미나 - 이승헌", "잡세미나 - 김하늘"]
+    assert "1) 2099/11/18(수) 15:00–16:00 잡세미나 - 이승헌: ❌ 추가하지 못했어요: 읽기 전용 캘린더예요" in capsys.readouterr().out
+
+
+def test_chat_sends_anything_else_to_the_agent_and_drops_the_similar_events(monkeypatch, tmp_path):
+    asked, created, store, prompts = similar_chat(monkeypatch, tmp_path, ["메모", "5", "이 날 다른 일정 있어?", "종료"])
+    assert prompts == ["메모", "이 날 다른 일정 있어?"] and created == [("잡세미나 - 한요셉", "Event-KHU")]
+    assert store.pending_proposal("cli:test#similar", utcnow()) is None
+    # End of input at the question drops it too.
+    asked, created, store, prompts = similar_chat(monkeypatch, tmp_path, ["메모", "5"])
+    assert asked[-1] == ITEM_PROMPT and store.pending_proposal("cli:test#similar", utcnow()) is None

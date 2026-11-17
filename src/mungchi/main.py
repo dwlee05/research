@@ -602,9 +602,13 @@ async def confirm_in_terminal(
     agent as the next message (e.g. "시간은 1시로 바꿔줘"). Events the
     Calendar app did not add are asked about right away
     (``추가하지 못한 5건을 다시 시도할까요? [다시/아니요]``): "다시" tries only those.
-    Returns None when nothing more is to be sent, ``CHAT_EXIT`` on end of input.
+    Then each event with a similar one already in the calendar, one by one
+    (``confirm_items_in_terminal``). Returns None when nothing more is to be
+    sent, ``CHAT_EXIT`` on end of input.
     """
-    pending = store.pending_proposal(conversation_key, (now or utcnow)())
+    clock = now or utcnow
+    item_key = event_proposals.item_question_key(conversation_key)
+    pending = store.pending_proposal(conversation_key, clock())
     while pending is not None:
         while True:
             try:
@@ -612,6 +616,7 @@ async def confirm_in_terminal(
             except EOFError:
                 print()
                 store.clear_pending_proposal(conversation_key)
+                store.clear_pending_proposal(item_key)
                 return CHAT_EXIT
             if not reply:
                 continue
@@ -620,22 +625,86 @@ async def confirm_in_terminal(
                 break
             print(answer.message)
         if answer.kind is None:
-            store.clear_pending_proposal(conversation_key)  # replaced by whatever the agent does next
+            # Replaced by whatever the agent does next.
+            store.clear_pending_proposal(conversation_key)
+            store.clear_pending_proposal(item_key)
             return reply
         result = await asyncio.to_thread(
             event_proposals.confirm_proposal,
             store,
             conversation_key,
             answer.kind,
-            now=(now or utcnow)(),
+            now=clock(),
             create=create,
             category=answer.category,
             proposal_id=pending.get("id"),
         )
-        print(result or event_proposals.CANCELLED_TEXT)
-        pending = store.pending_proposal(conversation_key, (now or utcnow)())
+        if result is None:
+            print(event_proposals.CANCELLED_TEXT)
+        elif result:
+            print(result)
+        pending = store.pending_proposal(conversation_key, clock())
         if not event_proposals.is_retry(pending):
+            break
+    return await confirm_items_in_terminal(store, conversation_key, create=create, now=clock)
+
+
+async def confirm_items_in_terminal(
+    store: StateStore,
+    conversation_key: str,
+    *,
+    create: Creator | None = None,
+    now: Clock | None = None,
+) -> Any:
+    """Ask about each event with a similar one already in the calendar: ``넣을까요? [넣기/건너뛰기]``.
+
+    One item at a time (its line and ``↔ 이미 있음: …`` first): 넣기 / 네 adds
+    it (code, never the agent), 건너뛰기 / 아니요 skips it, "모두 넣기" /
+    "모두 건너뛰기" answers the rest. One the Calendar app did not add is
+    asked again (``[다시/건너뛰기]``). A short unclear answer gets a hint;
+    anything else drops the question and is returned for the agent. Returns
+    None when nothing more is to be sent, ``CHAT_EXIT`` on end of input.
+    """
+    clock = now or utcnow
+    item_key = event_proposals.item_question_key(conversation_key)
+    question = store.pending_proposal(item_key, clock())
+    if question is None or not event_proposals.open_items(question):
+        return None
+    print(event_proposals.item_question_intro(question))
+    while question is not None:
+        still_open = event_proposals.open_items(question)
+        if not still_open:
             return None
+        index = still_open[0]
+        print(event_proposals.item_text(question, index))
+        try:
+            reply = (await asyncio.to_thread(input, event_proposals.cli_item_prompt(question, index))).strip()
+        except EOFError:
+            print()
+            store.clear_pending_proposal(item_key)
+            return CHAT_EXIT
+        if not reply:
+            continue
+        answer = event_proposals.parse_item_answer(reply, question, current=index)
+        if answer is None:
+            store.clear_pending_proposal(item_key)  # replaced by whatever the agent does next
+            return reply
+        if answer.hint:
+            print(answer.hint)
+            continue
+        decision = await asyncio.to_thread(
+            event_proposals.decide_items,
+            store,
+            conversation_key,
+            str(question.get("id") or ""),
+            answer.choices,
+            create=create,
+            now=clock(),
+        )
+        if decision is None:
+            return None
+        print("\n".join(decision.lines))
+        question = None if decision.done else store.pending_proposal(item_key, clock())
     return None
 
 

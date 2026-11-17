@@ -3365,3 +3365,318 @@ def test_a_briefing_asked_at_the_top_level_of_the_brief_channel_stays_there(tmp_
     asyncio.run(handler.handle_event(room_mention(f"<@{BOT}> 브리핑", ts="1700000000.000300"), event_id="Ev2", source="mention"))
     assert [p["text"] for p in client.posts] == ["⚠️ 오늘 브리핑을 만들지 못했어요 (OSError). 실행 로그를 확인해 주세요."]
     assert top_level(client.posts) and run.calls == []
+
+
+# ---------------------------------------------------------------- events with a similar one: [넣기] [건너뛰기] per item
+
+from datetime import date  # noqa: E402
+
+from mungchi.tools.event_proposals import ProposedEvent, item_question_key  # noqa: E402
+
+SEOUL = ZoneInfo("Asia/Seoul")
+# SEMINARS[:4]: the Calendar app already has the 1st (이승헌) and the 3rd (김하늘).
+ALREADY = {
+    0: "2099/11/18(수) 15:00–16:00 잡세미나(응용경제 공채) - 이승헌 (Event-KHU)",
+    2: "2099/11/19(목) 13:00–14:00 잡세미나 - 김하늘 (Event-KHU)",
+}
+MIXED_REPORT = (
+    "✅ 2건 모두 Event-KHU 캘린더에 추가했어요\n"
+    "• 2099/11/19(목) 10:00–11:00 잡세미나 - 한요셉\n"
+    "• 2099/11/20(금) 10:00–11:00 잡세미나 - 박바다"
+)
+ITEM_1 = "1) 2099/11/18(수) 15:00–16:00 잡세미나 - 이승헌\n   ↔ 이미 있음: " + ALREADY[0]
+ITEM_2 = "2) 2099/11/19(목) 13:00–14:00 잡세미나 - 김하늘\n   ↔ 이미 있음: " + ALREADY[2]
+
+
+def store_similar_proposal(store, persona, channel, thread_ts, *, similar=ALREADY, events=SEMINARS[:4], pid="pid-s", now=None):
+    """A category proposal whose events at the keys of ``similar`` had that similar event when proposed."""
+    items, problems = normalize_events(events, tz=SEOUL, now=datetime(2099, 1, 1, tzinfo=timezone.utc))
+    assert problems == []
+    for index, text in similar.items():
+        items[index].similar = [text]
+    key = slack_conversation_key(persona, channel, thread_ts)
+    proposal = {
+        "id": pid, "calendar": None, "calendar_label": "", "categories": CATEGORY_ROWS, "suggested_category": "Event-KHU",
+        "events": [e.to_state() for e in items],
+    }
+    store.save_pending_proposal(key, proposal, now or utcnow())
+    return key
+
+
+def item_click(question_id, index, action, *, message_ts, user=OWNER, channel=DM, thread_ts=ROOT):
+    kind = {"add": "item_add", "skip": "item_skip", "retry": "item_retry"}[action]
+    value = {"proposal_id": question_id, "item": index, "skip" if action == "skip" else "add": True}
+    return click(value, user=user, channel=channel, message_ts=message_ts, thread_ts=thread_ts, action_id=f"mungchi_cal_{kind}_{index + 1}")
+
+
+def sections(blocks):
+    return [b["text"]["text"] for b in blocks if b["type"] == "section"]
+
+
+def buttons_of(blocks):
+    return [[(e["action_id"], e["text"]["text"]) for e in b["elements"]] for b in blocks if b["type"] == "actions"]
+
+
+def similar_handler(tmp_path, app=None, **kwargs):
+    handler, client, run, app, store = proposal_handler(tmp_path, app=app, **kwargs)
+    key = store_similar_proposal(store, "schedule", DM, ROOT)
+    return handler, client, run, app, store, key
+
+
+def test_without_similar_events_the_category_answer_is_as_before(tmp_path):
+    handler, client, run, app, store = proposal_handler(tmp_path)
+    key = store_similar_proposal(store, "schedule", DM, ROOT, similar={})
+    asyncio.run(handler.handle_event(dm("5", ts="1700000000.000300", thread_ts=ROOT), event_id="Ev1", source="dm"))
+    assert len(app.created) == 4 and [p["text"].splitlines()[0] for p in client.posts] == ["✅ 4건 모두 Event-KHU 캘린더에 추가했어요"]
+    assert all("blocks" not in p for p in client.posts) and handler._item_messages == {}
+    assert store.pending_proposal(item_question_key(key), utcnow()) is None
+
+
+def test_the_others_go_in_at_once_and_each_similar_one_gets_its_own_buttons(tmp_path):
+    handler, client, run, app, store, key = similar_handler(tmp_path)
+    asyncio.run(handler.handle_event(dm("5", ts="1700000000.000300", thread_ts=ROOT), event_id="Ev1", source="dm"))
+    assert app.created == ["잡세미나 - 한요셉", "잡세미나 - 박바다"] and app.calendars == ["Event-KHU", "Event-KHU"]
+    report, asking = client.posts
+    assert report["text"] == MIXED_REPORT and "blocks" not in report
+    question = store.pending_proposal(item_question_key(key), utcnow())
+    qid = question["id"]
+    assert asking["thread_ts"] == ROOT and handler._item_messages[key] == (DM, asking["_ts"], qid)
+    assert sections(asking["blocks"]) == ["비슷한 일정이 이미 있는 2건은 하나씩 골라 주세요, 박사님.", ITEM_1, ITEM_2]
+    assert buttons_of(asking["blocks"]) == [
+        [("mungchi_cal_item_add_1", "넣기"), ("mungchi_cal_item_skip_1", "건너뛰기")],
+        [("mungchi_cal_item_add_2", "넣기"), ("mungchi_cal_item_skip_2", "건너뛰기")],
+    ]
+    assert asking["blocks"][-1] == {"type": "context", "elements": [{"type": "mrkdwn", "text": event_proposals.ITEM_TYPED_HINT}]}
+    assert asking["text"].startswith("비슷한 일정이 이미 있는 2건은 하나씩 골라 주세요, 박사님.\n1) 2099/11/18(수)")
+    # [넣기] on the 1st: only that one goes in; its buttons give way to the result, the 2nd keeps its own.
+    asyncio.run(handler.handle_action(item_click(qid, 0, "add", message_ts=asking["_ts"])))
+    assert app.created[2:] == ["잡세미나 - 이승헌"] and app.calendars[2:] == ["Event-KHU"]
+    update = client.updates[-1]
+    assert update["ts"] == asking["_ts"] and update["channel"] == DM
+    assert sections(update["blocks"])[1:] == [f"{ITEM_1}\n   ✅ 넣었어요", ITEM_2]
+    assert buttons_of(update["blocks"]) == [[("mungchi_cal_item_add_2", "넣기"), ("mungchi_cal_item_skip_2", "건너뛰기")]]
+    # [건너뛰기] on the 2nd: nothing is created; everything is decided, so the question is gone.
+    asyncio.run(handler.handle_action(item_click(qid, 1, "skip", message_ts=asking["_ts"])))
+    assert len(app.created) == 3 and client.ephemerals == [] and run.calls == []
+    done = client.updates[-1]
+    assert sections(done["blocks"]) == ["비슷한 일정이 이미 있던 2건은 이렇게 처리했어요.", f"{ITEM_1}\n   ✅ 넣었어요", f"{ITEM_2}\n   ⏭️ 건너뛰었어요"]
+    assert buttons_of(done["blocks"]) == [] and all(b["type"] != "context" for b in done["blocks"])
+    assert store.pending_proposal(item_question_key(key), utcnow()) is None and handler._item_messages == {}
+    assert len(client.posts) == 2  # clicks only update the message
+
+
+def test_when_every_event_has_a_similar_one_the_category_message_becomes_the_question(tmp_path):
+    handler, client, run, app, store = proposal_handler(tmp_path)
+    key = store_similar_proposal(store, "schedule", DM, ROOT, events=[SEMINARS[0], SEMINARS[2]], similar={0: ALREADY[0], 1: ALREADY[2]})
+    asyncio.run(handler.handle_action(click({"proposal_id": "pid-s", "category": "Event-KHU"}, message_ts="1700000100.000009")))
+    assert app.created == [] and client.posts == [] and client.ephemerals == []
+    [update] = client.updates
+    assert update["ts"] == "1700000100.000009" and sections(update["blocks"])[0] == "비슷한 일정이 이미 있는 2건은 하나씩 골라 주세요, 박사님."
+    question = store.pending_proposal(item_question_key(key), utcnow())
+    assert handler._item_messages[key] == (DM, "1700000100.000009", question["id"]) and question["chosen_category"] == "Event-KHU"
+    assert store.pending_proposal(key, utcnow()) is None
+
+
+def test_a_double_click_or_a_late_click_never_adds_an_item_twice(tmp_path):
+    handler, client, run, app, store, key = similar_handler(tmp_path, app=CalendarWrites(delay=0.05))
+    asyncio.run(handler.handle_event(dm("5", ts="1700000000.000300", thread_ts=ROOT), event_id="Ev1", source="dm"))
+    asking = client.posts[-1]
+    qid = store.pending_proposal(item_question_key(key), utcnow())["id"]
+
+    async def scenario():
+        await asyncio.gather(
+            handler.handle_action(item_click(qid, 0, "add", message_ts=asking["_ts"])),
+            handler.handle_action(item_click(qid, 0, "add", message_ts=asking["_ts"])),
+            handler.handle_action(item_click(qid, 0, "skip", message_ts=asking["_ts"])),
+        )
+
+    asyncio.run(scenario())
+    assert app.created.count("잡세미나 - 이승헌") == 1
+    assert [e["text"] for e in client.ephemerals] == [slack_bot.STALE_ACTION_TEXT] * 2
+    assert client.ephemerals[0] == {"channel": DM, "user": OWNER, "thread_ts": ROOT, "text": slack_bot.STALE_ACTION_TEXT}
+    asyncio.run(handler.handle_action(item_click(qid, 1, "skip", message_ts=asking["_ts"])))
+    # Late: everything was decided and the question is gone.
+    asyncio.run(handler.handle_action(item_click(qid, 1, "add", message_ts=asking["_ts"])))
+    assert app.created.count("잡세미나 - 김하늘") == 0 and len(client.ephemerals) == 3
+    # Malformed or someone else's: nothing happens.
+    asyncio.run(handler.handle_action(click({"proposal_id": qid, "item": "1", "add": True}, action_id="mungchi_cal_item_add_1")))
+    asyncio.run(handler.handle_action(item_click(qid, 0, "add", message_ts=asking["_ts"], user=STRANGER)))
+    assert client.ephemerals[-1]["text"] == REFUSAL_TEXT and client.ephemerals[-2]["text"] == slack_bot.STALE_ACTION_TEXT
+    assert app.created.count("잡세미나 - 이승헌") == 1 and run.calls == []
+
+
+def test_an_expired_item_question_gets_the_stale_note(tmp_path):
+    handler, client, run, app, store, key = similar_handler(tmp_path)
+    asyncio.run(handler.handle_event(dm("5", ts="1700000000.000300", thread_ts=ROOT), event_id="Ev1", source="dm"))
+    asking = client.posts[-1]
+    qid = store.pending_proposal(item_question_key(key), utcnow())["id"]
+    data = json.loads(store.path.read_text(encoding="utf-8"))
+    data["pending_events"][item_question_key(key)]["expires_at"] = (utcnow() - timedelta(minutes=1)).isoformat()
+    store.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    asyncio.run(handler.handle_action(item_click(qid, 0, "add", message_ts=asking["_ts"])))
+    assert client.ephemerals[-1]["text"] == slack_bot.STALE_ACTION_TEXT and len(app.created) == 2
+    # A typed answer after expiry is an ordinary message for the agent.
+    asyncio.run(handler.handle_event(dm("1 넣기", ts="1700000000.000400", thread_ts=ROOT), event_id="Ev2", source="dm"))
+    assert [c["prompt"] for c in run.calls] == ["1 넣기"] and len(app.created) == 2
+
+
+@pytest.mark.parametrize("how", ["button", "typed"])
+def test_a_failed_item_shows_why_and_its_retry_adds_it_exactly_once(tmp_path, how):
+    handler, client, run, app, store, key = similar_handler(tmp_path, app=CalendarWrites(fail_titles={"잡세미나 - 이승헌"}))
+    asyncio.run(handler.handle_event(dm("5", ts="1700000000.000300", thread_ts=ROOT), event_id="Ev1", source="dm"))
+    asking = client.posts[-1]
+    qid = store.pending_proposal(item_question_key(key), utcnow())["id"]
+    asyncio.run(handler.handle_action(item_click(qid, 0, "add", message_ts=asking["_ts"])))
+    failed = client.updates[-1]
+    assert sections(failed["blocks"])[1] == f"{ITEM_1}\n   ❌ 추가하지 못했어요: 읽기 전용 캘린더예요"
+    assert buttons_of(failed["blocks"])[0] == [("mungchi_cal_item_retry_1", "다시 시도"), ("mungchi_cal_item_skip_1", "건너뛰기")]
+    assert store.pending_proposal(key, utcnow()) is None  # no proposal-wide retry: the item keeps its own
+    app.fail_titles.clear()
+    if how == "button":
+        asyncio.run(handler.handle_action(item_click(qid, 0, "retry", message_ts=asking["_ts"])))
+    else:
+        asyncio.run(handler.handle_event(dm("다시", ts="1700000000.000400", thread_ts=ROOT), event_id="Ev2", source="dm"))
+        assert client.posts[-1]["text"] == "1) 2099/11/18(수) 15:00–16:00 잡세미나 - 이승헌: ✅ 넣었어요"
+    assert sections(client.updates[-1]["blocks"])[1] == f"{ITEM_1}\n   ✅ 넣었어요"
+    assert app.created.count("잡세미나 - 이승헌") == 2 and app.calendars[-1] == "Event-KHU"  # refused once, added once
+    asyncio.run(handler.handle_action(item_click(qid, 0, "retry", message_ts=asking["_ts"])))
+    assert app.created.count("잡세미나 - 이승헌") == 2 and client.ephemerals[-1]["text"] == slack_bot.STALE_ACTION_TEXT
+    assert run.calls == []
+
+
+def test_typed_item_answers_decide_one_item_and_update_the_message(tmp_path):
+    handler, client, run, app, store, key = similar_handler(tmp_path)
+    say = lambda text, n: asyncio.run(handler.handle_event(dm(text, ts=f"1700000000.0004{n:02d}", thread_ts=ROOT), event_id=f"Ev{n}", source="dm"))  # noqa: E731
+    say("5", 0)
+    asking = client.posts[-1]
+    for n, text in enumerate(("1", "넣기", "네", "3 넣기"), start=1):  # unclear: a hint, nothing changes
+        say(text, n)
+        assert client.posts[-1]["text"] == "비슷한 일정은 번호와 함께 답해 주세요, 박사님 (1~2번): '1 넣기', '1 건너뛰기', '모두 넣기', '모두 건너뛰기'"
+    assert len(app.created) == 2 and client.updates == []
+    say("1 넣기", 10)
+    assert client.posts[-1]["text"] == "1) 2099/11/18(수) 15:00–16:00 잡세미나 - 이승헌: ✅ 넣었어요"
+    assert client.updates[-1]["ts"] == asking["_ts"] and sections(client.updates[-1]["blocks"])[1].endswith("✅ 넣었어요")
+    say("1 넣어", 11)  # again: nothing more
+    assert client.posts[-1]["text"] == "1) 2099/11/18(수) 15:00–16:00 잡세미나 - 이승헌: 이미 처리했어요(✅ 넣었어요)"
+    say("2 빼", 12)
+    assert client.posts[-1]["text"] == "2) 2099/11/19(목) 13:00–14:00 잡세미나 - 김하늘: ⏭️ 건너뛰었어요"
+    assert sections(client.updates[-1]["blocks"])[0] == "비슷한 일정이 이미 있던 2건은 이렇게 처리했어요."
+    assert app.created == ["잡세미나 - 한요셉", "잡세미나 - 박바다", "잡세미나 - 이승헌"] and run.calls == []
+    assert store.pending_proposal(item_question_key(key), utcnow()) is None and handler._item_messages == {}
+
+
+@pytest.mark.parametrize("text,added", [("모두 넣기", ["잡세미나 - 이승헌", "잡세미나 - 김하늘"]), ("모두 건너뛰기", []), ("다 빼", [])])
+def test_all_at_once_by_typing(tmp_path, text, added):
+    handler, client, run, app, store, key = similar_handler(tmp_path)
+    asyncio.run(handler.handle_event(dm("5", ts="1700000000.000300", thread_ts=ROOT), event_id="Ev1", source="dm"))
+    asyncio.run(handler.handle_event(dm(text, ts="1700000000.000400", thread_ts=ROOT), event_id="Ev2", source="dm"))
+    assert app.created[2:] == added and run.calls == []
+    status = "✅ 넣었어요" if added else "⏭️ 건너뛰었어요"
+    assert client.posts[-1]["text"].splitlines() == [
+        f"1) 2099/11/18(수) 15:00–16:00 잡세미나 - 이승헌: {status}", f"2) 2099/11/19(목) 13:00–14:00 잡세미나 - 김하늘: {status}",
+    ]
+    assert store.pending_proposal(item_question_key(key), utcnow()) is None
+
+
+def test_item_answers_never_collide_with_dasi_or_the_agent(tmp_path):
+    # 한요셉 (not similar) is refused the first time: a proposal-wide retry waits next to the item question.
+    handler, client, run, app, store, key = similar_handler(tmp_path, app=FlakyWrites(fail_once={"잡세미나 - 한요셉"}))
+    asyncio.run(handler.handle_event(dm("5", ts="1700000000.000300", thread_ts=ROOT), event_id="Ev1", source="dm"))
+    report, retry, asking = client.posts
+    assert report["text"].startswith("⚠️ 2건 중 1건 추가, 1건은 추가하지 못했어요") and retry["text"] == "추가하지 못한 1건을 다시 시도할까요?"
+    assert sections(asking["blocks"])[0] == "비슷한 일정이 이미 있는 2건은 하나씩 골라 주세요, 박사님."
+    asyncio.run(handler.handle_event(dm("1 넣어", ts="1700000000.000400", thread_ts=ROOT), event_id="Ev2", source="dm"))
+    assert app.created[-1] == "잡세미나 - 이승헌" and event_proposals.is_retry(store.pending_proposal(key, utcnow()))
+    asyncio.run(handler.handle_event(dm("다시", ts="1700000000.000500", thread_ts=ROOT), event_id="Ev3", source="dm"))
+    assert app.created[-1] == "잡세미나 - 한요셉" and app.created.count("잡세미나 - 한요셉") == 2  # the retry, once
+    assert client.posts[-1]["text"].startswith("✅ Event-KHU 캘린더에 추가했어요")
+    assert len([p for p in client.posts if "blocks" in p and p["blocks"][0]["text"]["text"].startswith("비슷한")]) == 1  # not asked twice
+    assert store.pending_proposal(item_question_key(key), utcnow()) is not None
+    # Anything else goes to the agent and closes the question; its buttons give way to a note.
+    asyncio.run(handler.handle_event(dm("이 날 다른 일정 있어?", ts="1700000000.000600", thread_ts=ROOT), event_id="Ev4", source="dm"))
+    assert [c["prompt"] for c in run.calls] == ["이 날 다른 일정 있어?"]
+    assert store.pending_proposal(item_question_key(key), utcnow()) is None and handler._item_messages == {}
+    closed = [u for u in client.updates if u["ts"] == asking["_ts"]][-1]
+    assert buttons_of(closed["blocks"]) == [] and closed["blocks"][-1]["elements"][0]["text"] == slack_bot.BUTTONS_REPLACED_TEXT
+    assert sections(closed["blocks"])[1].endswith("✅ 넣었어요")
+    assert app.created.count("잡세미나 - 김하늘") == 0
+
+
+@pytest.mark.parametrize("where", ["dm", "channel_thread", "top_level"])
+def test_item_questions_work_in_threads_at_the_top_level_and_in_dms(tmp_path, where):
+    if where == "top_level":
+        handler, client, run, app, store = proposal_handler(tmp_path, brief_room=ROOM, clock=Clock())
+        channel, thread = ROOM, slack_bot.TOP_LEVEL
+        say = lambda text, ts: room_mention(f"<@UBOT> {text}", ts=ts)  # noqa: E731
+        press = lambda qid, i, action, ts: top_click({"proposal_id": qid, "item": i, action: True}, message_ts=ts)  # noqa: E731
+        source = "mention"
+    else:
+        handler, client, run, app, store = proposal_handler(tmp_path)
+        channel, thread = (DM, ROOT) if where == "dm" else (CHANNEL, ROOT)
+        if where == "dm":
+            say = lambda text, ts: dm(text, ts=ts, thread_ts=ROOT)  # noqa: E731
+            source = "dm"
+        else:
+            say = lambda text, ts: mention(f"<@UBOT> {text}", ts=ts, thread_ts=ROOT)  # noqa: E731
+            source = "mention"
+        press = lambda qid, i, action, ts: item_click(qid, i, "add" if action == "add" else "skip", message_ts=ts, channel=channel)  # noqa: E731
+    key = store_similar_proposal(store, "schedule", channel, thread)
+    asyncio.run(handler.handle_event(say("Event-KHU", "1700000000.000300"), event_id="Ev1", source=source))
+    report, asking = client.posts
+    assert report["text"] == MIXED_REPORT and asking["blocks"]
+    if where == "top_level":
+        assert top_level(client.posts)
+    else:
+        assert all(p["thread_ts"] == ROOT and p["channel"] == channel for p in client.posts)
+    qid = store.pending_proposal(item_question_key(key), utcnow())["id"]
+    asyncio.run(handler.handle_action(press(qid, 0, "add", asking["_ts"])))
+    asyncio.run(handler.handle_event(say("2 건너뛰기", "1700000000.000400"), event_id="Ev2", source=source))
+    assert app.created == ["잡세미나 - 한요셉", "잡세미나 - 박바다", "잡세미나 - 이승헌"] and run.calls == []
+    assert client.posts[-1]["text"] == "2) 2099/11/19(목) 13:00–14:00 잡세미나 - 김하늘: ⏭️ 건너뛰었어요"
+    assert {u["ts"] for u in client.updates} == {asking["_ts"]} and client.ephemerals == []
+    assert store.pending_proposal(item_question_key(key), utcnow()) is None
+
+
+def test_more_than_twenty_similar_events_are_asked_about_by_typing(tmp_path):
+    handler, client, run, app, store = proposal_handler(tmp_path)
+    many = [
+        ProposedEvent(title=f"세미나 {i}", day=date(2099, 11, 2), start=datetime(2099, 11, 2, 9, tzinfo=SEOUL) + timedelta(minutes=10 * i),
+                      end=datetime(2099, 11, 2, 9, 30, tzinfo=SEOUL) + timedelta(minutes=10 * i), similar=[f"2099/11/02(월) 세미나 {i} (Research)"])
+        for i in range(21)
+    ]
+    key = slack_conversation_key("schedule", DM, ROOT)
+    store.save_pending_proposal(key, {"id": "many", "calendar": None, "categories": CATEGORY_ROWS, "events": [e.to_state() for e in many]}, utcnow())
+    asyncio.run(handler.handle_event(dm("3", ts="1700000000.000300", thread_ts=ROOT), event_id="Ev1", source="dm"))
+    assert app.created == [] and all("blocks" not in p for p in client.posts) and handler._item_messages == {}
+    text = "\n".join(p["text"] for p in client.posts)
+    assert text.startswith("비슷한 일정이 이미 있는 21건은 하나씩 골라 주세요, 박사님.\n1) 2099/11/02(월) 09:00–09:30 세미나 0")
+    assert text.endswith(event_proposals.ITEMS_TYPED_ONLY_NOTE) and "21) 2099/11/02(월) 12:20–12:50 세미나 20" in text
+    assert slack_bot.item_blocks(store.pending_proposal(item_question_key(key), utcnow())) is None
+    asyncio.run(handler.handle_event(dm("21 넣기", ts="1700000000.000400", thread_ts=ROOT), event_id="Ev2", source="dm"))
+    assert app.created == ["세미나 20"] and app.calendars == ["Research"]
+    assert client.posts[-1]["text"] == "21) 2099/11/02(월) 12:20–12:50 세미나 20: ✅ 넣었어요" and client.updates == []
+
+
+def test_the_item_question_payload():
+    events = [{"title": f"t{i}", "summary": f"11/1{i}(수) t{i}", "similar": [f"s{i}"], "decision": "pending"} for i in range(20)]
+    events[1].update(decision="failed", error="거부됨", retry=True)
+    events[2].update(decision="added")
+    question = {"id": "q1", "events": events}
+    text, blocks = slack_bot.item_blocks(question)
+    assert len(blocks) <= 50 and len(blocks) == 1 + 20 + 19 + 1
+    actions = [b for b in blocks if b["type"] == "actions"]
+    assert len({b["block_id"] for b in blocks if "block_id" in b}) == len(actions)  # unique within the message
+    ids = [e["action_id"] for b in actions for e in b["elements"]]
+    assert len(set(ids)) == len(ids) and all(slack_bot.CATEGORY_ACTION_RE.match(i) for i in ids)
+    assert actions[0]["block_id"] == "mungchi_cal_item_q1_1"
+    assert [json.loads(e["value"]) for e in actions[1]["elements"]] == [
+        {"proposal_id": "q1", "item": 1, "add": True}, {"proposal_id": "q1", "item": 1, "skip": True},
+    ]
+    assert [e["text"]["text"] for e in actions[1]["elements"]] == ["다시 시도", "건너뛰기"]
+    assert sections(blocks)[2] == "2) 11/11(수) t1\n   ↔ 이미 있음: s1\n   ❌ 추가하지 못했어요: 거부됨"
+    assert all(b["text"]["type"] == "plain_text" for b in blocks[1:] if b["type"] == "section")
+    assert text.startswith("비슷한 일정이 이미 있는 20건은 하나씩 골라 주세요, 박사님.")
+    _, closed = slack_bot.item_blocks(question, closed=True)
+    assert buttons_of(closed) == [] and closed[-1]["elements"][0]["text"] == slack_bot.BUTTONS_REPLACED_TEXT
+    assert slack_bot.item_blocks({**question, "events": events + [dict(events[0])]}) is None  # 21: typed answers
+    assert slack_bot.item_blocks({**question, "id": ""}) is None and slack_bot.item_blocks(None) is None

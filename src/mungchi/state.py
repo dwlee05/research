@@ -5,13 +5,14 @@ briefing channel (``.mungchi_slack_threads.json``)."""
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .personas import MUNGCHI, PERSONAS
 
@@ -243,6 +244,34 @@ class StateStore:
             data[_PENDING_KEY] = {k: v for k, v in self._live_proposals(data, now).items() if k != key}
             _write_json(self.path, data)
         return proposal
+
+    def update_pending_proposal(
+        self,
+        key: str,
+        now: datetime,
+        proposal_id: str,
+        change: Callable[[dict[str, Any]], tuple[dict[str, Any] | None, Any]],
+    ) -> tuple[bool, Any]:
+        """Change the proposal under ``key`` in one step, only if it is still that very one (``proposal_id``) and live.
+
+        ``change`` gets a copy and returns ``(the new proposal, or None to drop it, result)``.
+        Returns ``(True, result)``, or ``(False, None)`` when there is no such proposal (nothing is written).
+        The proposal keeps its ``created_at`` and ``expires_at``.
+        """
+        with _LOCK:
+            data = self.load()
+            live = self._live_proposals(data, now)
+            current = live.get(key)
+            if current is None or current.get("id") != proposal_id:
+                return False, None
+            updated, result = change(copy.deepcopy(current))
+            if updated is None:
+                del live[key]
+            else:
+                live[key] = {**updated, "created_at": current.get("created_at"), "expires_at": current.get("expires_at")}
+            data[_PENDING_KEY] = live
+            _write_json(self.path, data)
+        return True, result
 
     def clear_pending_proposal(self, key: str) -> bool:
         """Drop the proposal under ``key`` (expired or not). True if there was one."""

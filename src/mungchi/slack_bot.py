@@ -15,7 +15,10 @@ number or name ("2", "Research", "khu"), "네" (the suggested category),
 preview. The events are created, or the proposal dropped. The reply says how
 it went ("6건 중 1건 추가, 5건은 추가하지 못했어요"); events that were not
 added wait for "다시" (or the "실패한 N건 다시 시도" button), which tries only
-those again.
+those again. Events with a similar one already in the calendar are not
+created with the others: each is asked about on its own, with [넣기]
+[건너뛰기] buttons (or "1 넣기", "2 건너뛰기", "모두 넣기" typed), and its
+buttons give way to its result.
 
 A photo (poster, email screenshot, timetable) sent to 업뎃 or 일정 (a mention
 with an image, or a DM) is downloaded with the bot token, shrunk in memory
@@ -109,10 +112,15 @@ CONFIRM_ACTION = CATEGORY_ACTION_PREFIX + "confirm"
 CANCEL_ACTION = CATEGORY_ACTION_PREFIX + "cancel"
 # Under a report whose failed events wait for "다시".
 RETRY_ACTION = CATEGORY_ACTION_PREFIX + "retry"
+# Per item of the question about events with a similar one already in the calendar.
+ITEM_ADD_ACTION = CATEGORY_ACTION_PREFIX + "item_add_{number}"
+ITEM_SKIP_ACTION = CATEGORY_ACTION_PREFIX + "item_skip_{number}"
+ITEM_RETRY_ACTION = CATEGORY_ACTION_PREFIX + "item_retry_{number}"
 STALE_ACTION_TEXT = "이미 처리됐거나 만료된 요청이에요"
 BUTTONS_ANSWERED_TEXT = "버튼 대신 답장으로 처리했어요."
 BUTTONS_REPLACED_TEXT = "새 메시지가 와서 이 제안은 닫았어요."
 MAX_BUTTON_TEXT_CHARS = 75
+MAX_SECTION_CHARS = 3_000
 # Photos: 고뭉치 does not read them; 업뎃 and 일정 do.
 IMAGE_REDIRECT_TEXT = "사진 속 일정 등록은 @업뎃이나 @일정에게 보내주세요"
 FILE_SHARE_SUBTYPE = "file_share"
@@ -370,6 +378,50 @@ def button_answer(value: Mapping[str, Any], proposal: Mapping[str, Any]) -> even
     if isinstance(category, str) and category in event_proposals.category_labels(proposal):
         return event_proposals.Answer(event_proposals.YES, category)
     return None
+
+
+def item_blocks(question: Mapping[str, Any] | None, *, closed: bool = False) -> tuple[str, list[dict[str, Any]]] | None:
+    """``(fallback text, blocks)`` of an item question (events with a similar one already in the calendar).
+
+    The intro, then per item its text (``1) …``, ``↔ 이미 있음: …``, the
+    result once decided) and, while it is open, its own [넣기] [건너뛰기]
+    (``[다시 시도]`` after a failure), then how to answer by typing. Each
+    button's value carries the question id and the item, so a click only
+    ever answers that item of this very question. ``closed``: no buttons,
+    a note that a new message closed it. None (typed answers only) without
+    an id or with more than ``MAX_ITEM_BUTTONS`` items: a Slack message has
+    at most 50 blocks. Pure.
+    """
+    items = (question or {}).get("events")
+    question_id = str((question or {}).get("id") or "")
+    if not question_id or not isinstance(items, list) or not items or len(items) > event_proposals.MAX_ITEM_BUTTONS:
+        return None
+    blocks: list[dict[str, Any]] = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": event_proposals.item_question_intro(question)}}
+    ]
+    for index, item in enumerate(items):
+        text = scrub(event_proposals.item_text(question, index))
+        if len(text) > MAX_SECTION_CHARS:
+            text = text[: MAX_SECTION_CHARS - 1] + "…"
+        blocks.append({"type": "section", "text": {"type": "plain_text", "text": text, "emoji": True}})
+        if closed or not event_proposals.item_open(item):
+            continue
+        number = index + 1
+        failed = item.get("decision") == event_proposals.ITEM_FAILED
+        add = _button(
+            (ITEM_RETRY_ACTION if failed else ITEM_ADD_ACTION).format(number=number),
+            "다시 시도" if failed else "넣기",
+            {"proposal_id": question_id, "item": index, "add": True},
+        )
+        skip = _button(ITEM_SKIP_ACTION.format(number=number), "건너뛰기", {"proposal_id": question_id, "item": index, "skip": True})
+        blocks.append({"type": "actions", "block_id": f"{CATEGORY_ACTION_PREFIX}item_{question_id}_{number}", "elements": [add, skip]})
+    footer = BUTTONS_REPLACED_TEXT if closed else (event_proposals.ITEM_TYPED_HINT if event_proposals.open_items(question) else "")
+    if footer:
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": footer}]})
+    text = event_proposals.item_question_text(question)
+    if closed:
+        text = f"{text}\n{BUTTONS_REPLACED_TEXT}"
+    return to_mrkdwn(scrub(text)), blocks
 
 
 def quick_info_request(text: str, label: str | None = None) -> set[str]:
@@ -637,6 +689,9 @@ class SlackHandler:
         self._confirming: dict[str, Mapping[str, Any]] = {}
         # Category buttons still clickable, per thread: (channel, message ts, proposal id).
         self._button_messages: dict[str, tuple[str, str, str]] = {}
+        # The item question (events with a similar one already in the calendar) on show, per thread:
+        # (channel, message ts, question id).
+        self._item_messages: dict[str, tuple[str, str, str]] = {}
         self._semaphore = semaphore or asyncio.Semaphore(max(1, max_concurrent))
         self._locks: dict[str, list[Any]] = {}
         self._seen = RecentKeys()
@@ -723,8 +778,10 @@ class SlackHandler:
         if files and await self._answer_files(channel, thread_ts, request, files):
             return
         # The answer to a calendar proposal waiting in this thread (a category,
-        # "네", "아니요"): code only.
+        # "네", "아니요"), then to its events with a similar one ("1 넣기"): code only.
         if await self._answer_proposal(channel, thread_ts, request):
+            return
+        if await self._answer_items(channel, thread_ts, request):
             return
         wanted = quick_info_request(request, weather.configured_label())
         detailed = quick_info.CREDIT_DETAIL in wanted
@@ -767,17 +824,31 @@ class SlackHandler:
     def _conversation_key(self, channel: str, thread_ts: str) -> str:
         return event_proposals.slack_conversation_key(self.persona, channel, thread_ts)
 
-    def _drop_proposal(self, channel: str, thread_ts: str) -> None:
+    def _drop_proposal(self, channel: str, thread_ts: str) -> Mapping[str, Any] | None:
+        """Drop this thread's pending proposal and item question; the item question as it was (to close its message)."""
+        key = self._conversation_key(channel, thread_ts)
+        item_key = event_proposals.item_question_key(key)
+        question = None
         try:
-            if self.proposals.clear_pending_proposal(self._conversation_key(channel, thread_ts)):
+            question = self.proposals.pending_proposal(item_key, utcnow())
+            dropped = self.proposals.clear_pending_proposal(key)
+            if self.proposals.clear_pending_proposal(item_key) or dropped:
                 log.info("%s: 스레드 %s:%s 기다리던 캘린더 제안을 새 메시지로 대신합니다", self.texts.label, channel, thread_ts)
         except OSError as exc:
             log.warning("기다리던 캘린더 제안을 지우지 못했습니다: %s", safe_error(exc))
+        return question
 
     async def _replace_proposal(self, channel: str, thread_ts: str) -> None:
-        """Drop this thread's pending proposal (a new message replaces it) and close its buttons."""
-        self._drop_proposal(channel, thread_ts)
-        await self._retire_buttons(self._conversation_key(channel, thread_ts), BUTTONS_REPLACED_TEXT)
+        """Drop this thread's pending proposal and item question (a new message replaces them) and close their buttons."""
+        question = self._drop_proposal(channel, thread_ts)
+        key = self._conversation_key(channel, thread_ts)
+        await self._retire_buttons(key, BUTTONS_REPLACED_TEXT)
+        entry = self._item_messages.pop(key, None)
+        if entry is not None:
+            item_channel, ts, question_id = entry
+            offer = item_blocks(question, closed=True) if question is not None and question.get("id") == question_id else None
+            text, blocks = offer or (BUTTONS_REPLACED_TEXT, [])
+            await self._update(item_channel, ts, text, blocks=blocks)
 
     async def _retire_buttons(self, key: str, text: str) -> None:
         """Replace this thread's category buttons (if any are still up) with ``text``."""
@@ -836,9 +907,11 @@ class SlackHandler:
             await self._post_shortcut(channel, thread_ts, answer.message)
             return True
 
-        async def deliver(reply: str) -> None:
-            await self._post_shortcut(channel, thread_ts, reply)
+        async def deliver(reply: str) -> str | None:
+            if reply:
+                await self._post_shortcut(channel, thread_ts, reply)
             await self._retire_buttons(key, BUTTONS_ANSWERED_TEXT)
+            return None
 
         await self._apply_answer(channel, thread_ts, pending, answer, deliver)
         return True
@@ -849,7 +922,7 @@ class SlackHandler:
         thread_ts: str,
         pending: Mapping[str, Any],
         answer: event_proposals.Answer,
-        deliver: Callable[[str], Awaitable[None]],
+        deliver: Callable[[str], Awaitable[str | None]],
     ) -> bool:
         """Take ``pending`` out of the store and create its events (or cancel it), then ``deliver`` the reply.
 
@@ -857,8 +930,10 @@ class SlackHandler:
         the event loop, and only if it is still that very proposal (same id),
         so it is never created twice. Events the Calendar app did not add come
         back as a retry under the same key (``event_proposals.settle_answer``),
-        and its "다시 시도" button goes right under the reply. False: it was
-        already gone.
+        and its "다시 시도" button goes right under the reply. Events with a
+        similar one already in the calendar are not created: their item
+        question goes last (into the message ``deliver`` returns when there
+        was nothing else to report). False: it was already gone.
         """
         key = self._conversation_key(channel, thread_ts)
         if answer.kind == event_proposals.NO:
@@ -887,12 +962,131 @@ class SlackHandler:
                 except Exception as exc:  # noqa: BLE001 - reported in Slack without details
                     _log_exception("캘린더 제안을 처리하지 못했습니다.", exc)
                     reply = CALENDAR_CRASH_TEXT.format(kind=type(exc).__name__)
-            await deliver(reply)
+            free_ts = await deliver(reply)
         finally:
             self._confirming.pop(key, None)
         # The failed events kept for "다시": their button under the reply (nothing when all went in).
         await self._offer_category_buttons(channel, thread_ts)
+        # The events with a similar one: each with its own buttons, last.
+        await self._offer_item_question(channel, thread_ts, reuse_ts=free_ts)
         return True
+
+    # -- events with a similar one already in the calendar: 넣기 / 건너뛰기, one by one (no agent turn)
+
+    async def _offer_item_question(self, channel: str, thread_ts: str, *, reuse_ts: str | None = None) -> None:
+        """Show the item question waiting in this thread, unless it is already on show.
+
+        Into the message ``reuse_ts`` (a category message with nothing else to
+        say) or a new one. More than ``MAX_ITEM_BUTTONS`` items: the text only,
+        with a note to answer by typing.
+        """
+        key = self._conversation_key(channel, thread_ts)
+        try:
+            question = self.proposals.pending_proposal(event_proposals.item_question_key(key), utcnow())
+        except OSError as exc:
+            log.warning("비슷한 일정 질문을 읽지 못했습니다: %s", safe_error(exc))
+            question = None
+        if question is None:
+            if reuse_ts:
+                await self._update(channel, reuse_ts, STALE_ACTION_TEXT, blocks=[])
+            return
+        shown = self._item_messages.get(key)
+        if shown is not None and shown[2] == question.get("id"):
+            return
+        offer = item_blocks(question)
+        if offer is None:
+            chunks = to_slack_chunks(event_proposals.item_question_text(question, typed_only=True))
+            if reuse_ts and chunks and await self._update(channel, reuse_ts, chunks[0], blocks=[]):
+                chunks = chunks[1:]
+            for chunk in chunks:
+                await self._post(channel, thread_ts, chunk)
+            return
+        text, blocks = offer
+        ts = reuse_ts if reuse_ts and await self._update(channel, reuse_ts, text, blocks=blocks) else None
+        ts = ts or await self._post(channel, thread_ts, text, blocks=blocks)
+        if ts:
+            self._item_messages[key] = (channel, ts, str(question.get("id") or ""))
+
+    async def _answer_items(self, channel: str, thread_ts: str, request: str) -> bool:
+        """A typed answer to this thread's item question ("1 넣기", "2 빼", "모두 건너뛰기"). False: not such an answer.
+
+        A bare number, a bare 넣기 or "네" gets a short hint and changes nothing.
+        Like a proposal, nothing is answered while this thread's agent turn runs.
+        """
+        key = self._conversation_key(channel, thread_ts)
+        if self._turns.get(key):
+            return False
+        try:
+            question = self.proposals.pending_proposal(event_proposals.item_question_key(key), utcnow())
+        except OSError as exc:
+            log.warning("비슷한 일정 질문을 읽지 못했습니다: %s", safe_error(exc))
+            return False
+        if question is None:
+            return False
+        answer = event_proposals.parse_item_answer(request, question)
+        if answer is None:
+            return False
+        if answer.hint:
+            log.info("%s: 스레드 %s:%s 비슷한 일정 답을 다시 묻습니다 (에이전트 실행 없음)", self.texts.label, channel, thread_ts)
+            await self._post_shortcut(channel, thread_ts, answer.hint)
+            return True
+        await self._decide_items(channel, thread_ts, str(question.get("id") or ""), answer.choices)
+        return True
+
+    async def _decide_items(
+        self,
+        channel: str,
+        thread_ts: str,
+        question_id: str,
+        choices: Sequence[tuple[int, str]],
+        *,
+        clicked_by: str | None = None,
+        message_ts: str | None = None,
+    ) -> None:
+        """Apply 넣기 / 건너뛰기 to items (``event_proposals.decide_items``) and show the result.
+
+        Under the thread's lock, so clicks and replies for one thread go one at
+        a time; the store takes each item before it is created, so it is
+        created at most once. The item question's message shows each result in
+        place of the item's buttons. A typed answer also gets the result lines
+        as a reply; a click on an item already decided (or a question gone)
+        gets ``STALE_ACTION_TEXT`` only the clicker sees.
+        """
+        key = self._conversation_key(channel, thread_ts)
+        adds = sum(1 for _index, action in choices if action == event_proposals.ADD)
+        log.info(
+            "%s: 스레드 %s:%s 비슷한 일정 넣기 %d건, 건너뛰기 %d건 (에이전트 실행 없음)",
+            self.texts.label, channel, thread_ts, adds, len(choices) - adds,
+        )
+        crash: Exception | None = None
+        async with self._thread_lock(f"{self.persona}:{channel}:{thread_ts}"):
+            try:
+                decision = await asyncio.to_thread(
+                    event_proposals.decide_items, self.proposals, key, question_id, choices, create=self.create_events
+                )
+            except Exception as exc:  # noqa: BLE001 - reported in Slack without details
+                _log_exception("비슷한 일정을 처리하지 못했습니다.", exc)
+                decision, crash = None, exc
+        if crash is not None:
+            await self._post_shortcut(channel, thread_ts, CALENDAR_CRASH_TEXT.format(kind=type(crash).__name__))
+            return
+        if decision is None or (clicked_by is not None and not decision.changed):
+            log.info("%s: 스레드 %s:%s 이미 처리됐거나 만료된 비슷한 일정 답", self.texts.label, channel, thread_ts)
+            if clicked_by is not None:
+                await self._ephemeral(channel, clicked_by, thread_ts, STALE_ACTION_TEXT)
+            else:
+                await self._post_shortcut(channel, thread_ts, STALE_ACTION_TEXT)
+            return
+        shown = self._item_messages.get(key)
+        ts = message_ts or (shown[1] if shown is not None and shown[2] == question_id else None)
+        offer = item_blocks(decision.question)
+        if ts and offer is not None:
+            text, blocks = offer
+            await self._update(channel, ts, text, blocks=blocks)
+        if decision.done and shown is not None and shown[2] == question_id:
+            self._item_messages.pop(key, None)
+        if clicked_by is None:
+            await self._post_shortcut(channel, thread_ts, "\n".join(decision.lines))
 
     async def handle_action(self, body: Mapping[str, Any]) -> None:
         """A click on a category button (Bolt has already acked it).
@@ -902,7 +1096,8 @@ class SlackHandler:
         this thread for this bot (not expired, not answered yet); otherwise the
         clicker sees "이미 처리됐거나 만료된 요청이에요". Then the same code as a
         text answer creates the events, and the button message is replaced by
-        the result, so the buttons cannot be clicked twice.
+        the result, so the buttons cannot be clicked twice. A click on an
+        item's [넣기] / [건너뛰기] / [다시 시도] decides that item only (``_decide_items``).
         """
         user = str((body.get("user") or {}).get("id") or "")
         container = body.get("container") or {}
@@ -927,6 +1122,18 @@ class SlackHandler:
         except (ValueError, AttributeError):
             value = {}
         value = value if isinstance(value, dict) else {}
+        if "item" in value:
+            # 넣기 / 건너뛰기 / 다시 시도 of one event with a similar one already in the calendar.
+            index, add, skip = value.get("item"), value.get("add") is True, value.get("skip") is True
+            if isinstance(index, int) and not isinstance(index, bool) and add != skip:
+                action = event_proposals.ADD if add else event_proposals.SKIP
+                await self._decide_items(
+                    channel, thread_ts, str(value.get("proposal_id") or ""), [(index, action)],
+                    clicked_by=user, message_ts=message_ts,
+                )
+            else:
+                await self._ephemeral(channel, user, thread_ts, STALE_ACTION_TEXT)
+            return
         key = self._conversation_key(channel, thread_ts)
         if key in self._confirming:
             return  # a second click while the first is being applied: answered once is enough
@@ -942,13 +1149,16 @@ class SlackHandler:
             await self._ephemeral(channel, user, thread_ts, STALE_ACTION_TEXT)
             return
 
-        async def deliver(reply: str) -> None:
+        async def deliver(reply: str) -> str | None:
             self._button_messages.pop(key, None)  # this very message becomes the result
+            if not reply:
+                return message_ts  # every event has a similar one: their question takes this message's place
             chunks = to_slack_chunks(reply) or [CALENDAR_CRASH_TEXT.format(kind="빈 응답")]
             if not await self._update(channel, message_ts, chunks[0], blocks=[]):
                 await self._post(channel, thread_ts, chunks[0])
             for chunk in chunks[1:]:
                 await self._post(channel, thread_ts, chunk)
+            return None
 
         if not await self._apply_answer(channel, thread_ts, pending, answer, deliver):
             await self._ephemeral(channel, user, thread_ts, STALE_ACTION_TEXT)

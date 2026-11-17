@@ -1795,3 +1795,213 @@ def test_env_example_lists_the_default_categories():
     assert values["CALENDAR_CATEGORIES"] == config.DEFAULT_CALENDAR_CATEGORIES
     assert values["CALENDAR_CATEGORY_ALIASES"] == ""
     assert config.get_calendar_categories(values) == config.get_calendar_categories({})
+
+
+# ---------------------------------------------------------------- events with a similar one: asked about one by one
+
+from mungchi.tools.event_proposals import (  # noqa: E402
+    ADD,
+    SKIP,
+    ItemAnswer,
+    decide_items,
+    item_question_key,
+    parse_item_answer,
+)
+
+ITEM_KEY = item_question_key(KEY)
+# Like the poster: four seminars; the Calendar app already has the 1st and the 3rd.
+SEMINAR_NOTE = [
+    {"title": "잡세미나 - 이승헌", "date": "2026-11-18", "start_time": "15:00", "end_time": "16:00"},
+    {"title": "잡세미나 - 한요셉", "date": "2026-11-19", "start_time": "10:00", "end_time": "11:00"},
+    {"title": "잡세미나 - 김하늘", "date": "2026-11-20", "start_time": "15:00", "end_time": "16:00"},
+    {"title": "잡세미나 - 박바다", "date": "2026-11-21", "start_time": "11:00", "end_time": "12:00"},
+]
+ALREADY_THERE = [
+    record("잡세미나(응용경제 공채) - 이승헌", at(11, 18, 15), at(11, 18, 16), calendar="Event-KHU"),
+    record("잡세미나 - 김하늘", at(11, 20, 15), at(11, 20, 16), calendar="Event-KHU"),
+]
+SIMILAR_1 = "11/18(수) 15:00–16:00 잡세미나(응용경제 공채) - 이승헌 (Event-KHU)"
+SIMILAR_3 = "11/20(금) 15:00–16:00 잡세미나 - 김하늘 (Event-KHU)"
+
+
+def seminar_proposal(tmp_path, existing=ALREADY_THERE, events=SEMINAR_NOTE, **kwargs):
+    app = category_app(existing=existing, **kwargs)
+    payload, store = run_categories(app, events, store=StateStore(tmp_path / "s.json"), suggested_category="Event-KHU")
+    assert payload["ok"]
+    return app, store
+
+
+def test_similar_events_found_when_proposed_are_kept_with_the_proposal(tmp_path):
+    app, store = seminar_proposal(tmp_path)
+    events = store.pending_proposal(KEY, NOW)["events"]
+    assert [e.get("similar") for e in events] == [[SIMILAR_1], None, [SIMILAR_3], None]
+    rebuilt = ProposedEvent.from_state(events[0], SEOUL)
+    assert rebuilt.similar == [SIMILAR_1] and rebuilt.to_state() == events[0]
+    assert ProposedEvent.from_state({**events[0], "similar": "junk"}, SEOUL).similar == []
+
+
+def test_without_similar_events_everything_is_created_as_before(tmp_path):
+    app, store = seminar_proposal(tmp_path, existing=())
+    reply = confirm_proposal(store, KEY, YES, now=NOW, create=category_creator(app), category="Event-KHU")
+    assert reply.splitlines()[0] == "✅ 4건 모두 Event-KHU 캘린더에 추가했어요" and len(app.created) == 4
+    assert store.pending_proposal(ITEM_KEY, NOW) is None
+
+
+def test_the_others_are_created_now_and_the_similar_ones_wait_for_their_own_answer(tmp_path):
+    app, store = seminar_proposal(tmp_path)
+    first = store.pending_proposal(KEY, NOW)
+    reply = confirm_proposal(store, KEY, YES, now=NOW, create=category_creator(app), category="Event-KHU")
+    assert [c["title"] for c in app.created] == ["잡세미나 - 한요셉", "잡세미나 - 박바다"]
+    assert reply == (
+        "✅ 2건 모두 Event-KHU 캘린더에 추가했어요\n"
+        "• 11/19(목) 10:00–11:00 잡세미나 - 한요셉\n"
+        "• 11/21(토) 11:00–12:00 잡세미나 - 박바다"
+    )
+    assert store.pending_proposal(KEY, NOW) is None  # nothing failed: no retry
+    question = store.pending_proposal(ITEM_KEY, NOW)
+    assert question["similar_items"] is True and question["chosen_category"] == "Event-KHU"
+    assert question["expires_at"] == first["expires_at"] and question["id"] != first["id"]
+    assert [(e["title"], e["decision"]) for e in question["events"]] == [("잡세미나 - 이승헌", "pending"), ("잡세미나 - 김하늘", "pending")]
+    assert event_proposals.item_question_text(question) == (
+        "비슷한 일정이 이미 있는 2건은 하나씩 골라 주세요, 박사님.\n"
+        "1) 11/18(수) 15:00–16:00 잡세미나 - 이승헌\n"
+        f"   ↔ 이미 있음: {SIMILAR_1}\n"
+        "2) 11/20(금) 15:00–16:00 잡세미나 - 김하늘\n"
+        f"   ↔ 이미 있음: {SIMILAR_3}\n"
+        "답장으로도 고를 수 있어요: '1 넣기', '1 건너뛰기', '모두 넣기', '모두 건너뛰기'"
+    )
+
+
+def test_when_every_event_has_a_similar_one_nothing_is_created_at_once(tmp_path):
+    app, store = seminar_proposal(tmp_path, events=[SEMINAR_NOTE[0], SEMINAR_NOTE[2]])
+    assert confirm_proposal(store, KEY, YES, now=NOW, create=category_creator(app), category="Research") == ""
+    assert app.created == [] and store.pending_proposal(KEY, NOW) is None
+    question = store.pending_proposal(ITEM_KEY, NOW)
+    assert len(question["events"]) == 2 and question["chosen_category"] == "Research"
+    # A cancel never asks anything.
+    seminar_proposal(tmp_path, events=[SEMINAR_NOTE[0]])
+    assert confirm_proposal(store, KEY, NO, now=NOW, create=category_creator(app)) == "취소했어요"
+
+
+def test_an_event_without_a_time_is_never_asked_about(tmp_path):
+    no_time = {"title": "잡세미나 - 이승헌", "date": "2026-11-18", "start_time": None}
+    app, store = seminar_proposal(tmp_path, events=[no_time, SEMINAR_NOTE[1]])
+    assert store.pending_proposal(KEY, NOW)["events"][0]["similar"]  # the whole day was checked
+    reply = confirm_proposal(store, KEY, YES, now=NOW, create=category_creator(app), category="Event-KHU")
+    assert reply.splitlines()[:2] == [
+        "✅ Event-KHU 캘린더에 추가했어요",
+        "⏭️ 11/18(수) 시간 미정 잡세미나 - 이승헌: 시작 시각이 없어 추가하지 않았어요. 시각을 알려 주시면 다시 제안할게요.",
+    ]
+    assert store.pending_proposal(ITEM_KEY, NOW) is None
+
+
+def asked(tmp_path, **kwargs):
+    app, store = seminar_proposal(tmp_path, **kwargs)
+    confirm_proposal(store, KEY, YES, now=NOW, create=category_creator(app), category="Event-KHU")
+    app.created.clear()
+    return app, store, store.pending_proposal(ITEM_KEY, NOW)
+
+
+def test_each_item_is_decided_once_and_the_question_is_gone_when_all_are(tmp_path):
+    app, store, question = asked(tmp_path)
+    added = decide_items(store, KEY, question["id"], [(0, ADD)], create=category_creator(app), now=NOW)
+    assert [(c["title"], c["calendar_name"]) for c in app.created] == [("잡세미나 - 이승헌", "Event-KHU")]
+    assert added.lines == ["1) 11/18(수) 15:00–16:00 잡세미나 - 이승헌: ✅ 넣었어요"] and added.changed == 1 and not added.done
+    # Again (a double or a late click): nothing more is created.
+    again = decide_items(store, KEY, question["id"], [(0, ADD), (0, SKIP)], create=category_creator(app), now=NOW)
+    assert again.changed == 0 and again.lines == ["1) 11/18(수) 15:00–16:00 잡세미나 - 이승헌: 이미 처리했어요(✅ 넣었어요)"]
+    assert len(app.created) == 1
+    skipped = decide_items(store, KEY, question["id"], [(1, SKIP)], create=category_creator(app), now=NOW)
+    assert skipped.lines == ["2) 11/20(금) 15:00–16:00 잡세미나 - 김하늘: ⏭️ 건너뛰었어요"] and skipped.done
+    assert len(app.created) == 1 and store.pending_proposal(ITEM_KEY, NOW) is None
+    assert event_proposals.item_question_intro(skipped.question) == "비슷한 일정이 이미 있던 2건은 이렇게 처리했어요."
+    assert decide_items(store, KEY, question["id"], [(1, ADD)], create=category_creator(app), now=NOW) is None  # gone
+    assert len(app.created) == 1
+
+
+def test_a_failed_item_shows_why_stays_open_and_is_created_once_on_retry(tmp_path):
+    app, store, question = asked(tmp_path, fail_titles={"잡세미나 - 이승헌"})
+    failed = decide_items(store, KEY, question["id"], [(0, ADD)], create=category_creator(app), now=NOW)
+    assert failed.lines == ["1) 11/18(수) 15:00–16:00 잡세미나 - 이승헌: ❌ 추가하지 못했어요: 캘린더에 저장하지 못했어요 (읽기 전용 캘린더)"]
+    item = failed.question["events"][0]
+    assert item["decision"] == "failed" and item["retry"] is True and event_proposals.open_items(failed.question) == [0, 1]
+    assert event_proposals.cli_item_prompt(failed.question, 0) == "다시 시도할까요? [다시/건너뛰기] "
+    app.fail_titles.clear()
+    retried = decide_items(store, KEY, question["id"], [(0, ADD)], create=category_creator(app), now=NOW)
+    assert retried.lines[0].endswith(": ✅ 넣었어요")
+    assert [c["title"] for c in app.created] == ["잡세미나 - 이승헌", "잡세미나 - 이승헌"]  # refused once, then added once
+    decide_items(store, KEY, question["id"], [(0, ADD)], create=category_creator(app), now=NOW)
+    assert len(app.created) == 2
+
+
+def test_an_item_that_may_have_been_added_is_never_tried_again(tmp_path):
+    app, store, question = asked(tmp_path, raise_titles={"잡세미나 - 이승헌"})
+    crashed = decide_items(store, KEY, question["id"], [(0, ADD)], create=category_creator(app), now=NOW)
+    assert crashed.question["events"][0]["retry"] is False and event_proposals.open_items(crashed.question) == [1]
+    boom = decide_items(store, KEY, question["id"], [(1, ADD)], create=lambda p: (_ for _ in ()).throw(RuntimeError("down")), now=NOW)
+    assert boom.lines == ["2) 11/20(금) 15:00–16:00 잡세미나 - 김하늘: ❌ 추가하지 못했어요: 오류가 났어요 (RuntimeError: down)"]
+    assert boom.done and store.pending_proposal(ITEM_KEY, NOW) is None
+
+
+def test_nothing_tried_because_of_the_permission_may_be_tried_again(tmp_path):
+    app, store, question = asked(tmp_path)
+    app.status = DENIED
+    denied = decide_items(store, KEY, question["id"], [(0, ADD), (1, ADD)], create=category_creator(app), now=NOW)
+    assert app.created == [] and all(e["retry"] for e in denied.question["events"])
+    app.status = GRANTED
+    all_in = decide_items(store, KEY, question["id"], [(0, ADD), (1, ADD)], create=category_creator(app), now=NOW)
+    assert all_in.done and [c["title"] for c in app.created] == ["잡세미나 - 이승헌", "잡세미나 - 김하늘"]
+
+
+def test_the_item_question_expires_with_the_proposal(tmp_path):
+    app, store, question = asked(tmp_path)
+    later = NOW + timedelta(hours=25)
+    assert decide_items(store, KEY, question["id"], [(0, ADD)], create=category_creator(app), now=later) is None
+    assert app.created == [] and store.pending_proposal(ITEM_KEY, later) is None
+
+
+def _question(*decisions):
+    return {"id": "q", "events": [{"title": f"t{i}", "decision": d, "retry": d == "failed"} for i, d in enumerate(decisions)]}
+
+
+@pytest.mark.parametrize(
+    "text,choices",
+    [
+        ("1 넣기", ((0, ADD),)), ("1 넣어", ((0, ADD),)), ("1번 넣어줘", ((0, ADD),)), ("2 건너뛰기", ((1, SKIP),)),
+        ("2 빼", ((1, SKIP),)), ("2번 빼주세요!", ((1, SKIP),)), ("1) 넣기", ((0, ADD),)), ("2 다시", ((1, ADD),)),
+        ("모두 넣기", ((0, ADD), (1, ADD))), ("전부 넣어", ((0, ADD), (1, ADD))), ("모두 건너뛰기", ((0, SKIP), (1, SKIP))),
+        ("다 빼", ((0, SKIP), (1, SKIP))), (unicodedata.normalize("NFD", "1 넣기"), ((0, ADD),)),
+    ],
+)
+def test_typed_item_answers(text, choices):
+    assert parse_item_answer(text, _question("pending", "pending")) == ItemAnswer(choices)
+
+
+@pytest.mark.parametrize("text", ["1", "2번", "3 넣기", "0 빼", "넣기", "건너뛰기", "네", "아니요", "모두", "다시"])
+def test_unclear_item_answers_get_a_hint(text):
+    hint = parse_item_answer(text, _question("pending", "pending"))
+    assert hint == ItemAnswer(hint="비슷한 일정은 번호와 함께 답해 주세요, 박사님 (1~2번): '1 넣기', '1 건너뛰기', '모두 넣기', '모두 건너뛰기'")
+
+
+@pytest.mark.parametrize("text", ["", "시간은 1시로 바꿔줘", "12시", "2026", "이 날 다른 일정 있어?", "Research", "1번은 Research로 넣고 2번은 빼줘"])
+def test_anything_else_is_not_an_item_answer(text):
+    assert parse_item_answer(text, _question("pending", "pending")) is None
+
+
+def test_item_answers_only_count_for_open_items_and_never_collide_with_categories_or_dasi():
+    mixed = _question("added", "failed", "pending")
+    assert parse_item_answer("모두 넣기", mixed) == ItemAnswer(((1, ADD), (2, ADD)))  # the added one is not open
+    assert parse_item_answer("다시", mixed) == ItemAnswer(((1, ADD),))  # only the failed one
+    assert parse_item_answer("다시 해줘", mixed) == ItemAnswer(((1, ADD),))
+    assert parse_item_answer("모두 넣기", _question("added", "skipped")) == ItemAnswer(hint="비슷한 일정은 이미 모두 처리했어요.")
+    # The terminal asks about one item: there a bare answer is for that item.
+    assert parse_item_answer("넣기", mixed, current=2) == ItemAnswer(((2, ADD),))
+    assert parse_item_answer("네", mixed, current=2) == ItemAnswer(((2, ADD),))
+    assert parse_item_answer("아니요", mixed, current=1) == ItemAnswer(((1, SKIP),))
+    assert parse_item_answer("1 넣기", _question("pending")) == ItemAnswer(((0, ADD),))
+    assert parse_item_answer("1", _question("pending")).hint.startswith("비슷한 일정은 번호와 함께 답해 주세요, 박사님 (1번)")
+    # A category question and a retry read their own answers; the item forms are not among them.
+    for text in ("1 넣기", "2 건너뛰기", "모두 넣기", "모두 건너뛰기", "2 빼"):
+        assert parse_answer(text, _pending()).kind is None
+        assert parse_answer(text, {"retry": True, "events": [{}]}).kind is None
+    assert parse_answer("다시", {"retry": True, "events": [{}]}) == Answer(YES)

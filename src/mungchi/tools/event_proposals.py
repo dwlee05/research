@@ -27,6 +27,10 @@ The reply after creating says how it went (``creation_report``: all added,
 "6건 중 1건 추가, 5건은 추가하지 못했어요", or none). Events the Calendar app
 did not add wait under the same key as a retry (same category, same expiry):
 "다시" tries only those again, never the ones already added.
+
+Events with a similar event already in the calendar (found when proposed)
+are not created with the others: after the category is picked each waits
+for its own 넣기 / 건너뛰기 (``item_question_key``, ``decide_items``).
 """
 
 from __future__ import annotations
@@ -388,6 +392,9 @@ class ProposedEvent:
     warnings: list[str] = field(default_factory=list)
     # This event's own category (a label), only when the user named one for it.
     category: str | None = None
+    # The similar events already in the calendar when it was proposed (``_duplicate_text``):
+    # after the category is picked, it is asked about on its own (``settle_answer``).
+    similar: list[str] = field(default_factory=list)
 
     def to_state(self) -> dict[str, Any]:
         state = {
@@ -402,6 +409,8 @@ class ProposedEvent:
         }
         if self.category:
             state["category"] = self.category
+        if self.similar:
+            state["similar"] = list(self.similar)
         return state
 
     @classmethod
@@ -429,6 +438,7 @@ class ProposedEvent:
             notes=str(data.get("notes") or ""),
             needs_time=needs_time,
             category=str(data.get("category") or "") or None,
+            similar=[str(text) for text in similar if text] if isinstance(similar := data.get("similar"), list) else [],
         )
 
     def to_payload(self) -> dict[str, Any]:
@@ -715,6 +725,7 @@ def run_propose(
     store = store or StateStore(config.get_state_path(env))
     if conversation_key:
         store.clear_pending_proposal(conversation_key)
+        store.clear_pending_proposal(item_question_key(conversation_key))
 
     events, problems = normalize_events(
         args.get("events"), tz=tz, now=now, default_minutes=config.get_default_event_minutes(env)
@@ -795,7 +806,8 @@ def run_propose(
                 event.warnings.append(f"이미 있는 일정과 겹치는지 확인하지 못했어요 ({safe_error(exc)}).")
                 continue
             for record in similar[:MAX_DUPLICATES_SHOWN]:
-                event.warnings.append(f"비슷한 일정이 이미 있어요: {_duplicate_text(record, today)}")
+                event.similar.append(_duplicate_text(record, today))
+                event.warnings.append(f"비슷한 일정이 이미 있어요: {event.similar[-1]}")
     else:
         notes.append(WRITE_ONLY_NOTE)
 
@@ -1198,9 +1210,36 @@ def settle_answer(
     """Like ``answer_text``, and the events the Calendar app did not add wait under ``key`` for "다시".
 
     The reply ends with how to try them again only when they were kept.
-    Blocking: EventKit runs here. Never raises (a failure to keep them is logged).
+    Events with a similar one already in the calendar (found when proposed,
+    ``ProposedEvent.similar``) are not created here: they wait under
+    ``item_question_key(key)``, each for its own 넣기 / 건너뛰기
+    (``decide_items``), and only the others are created and reported. The
+    reply is "" when every event waits. Blocking: EventKit runs here. Never
+    raises (a failure to keep them is logged).
     """
     now = now or utcnow()
+    if kind == YES and not is_retry(proposal):
+        at_once, asked = split_similar(proposal)
+        if asked:
+            chosen = {**proposal, "chosen_category": category} if category else dict(proposal)
+            kept = keep_item_question(store, key, item_question(chosen, asked, now), now)
+            parts = [_settle(store, key, {**chosen, "events": at_once}, kind, create, None, now)] if at_once else []
+            if not kept:
+                parts.append(ITEMS_NOT_KEPT_TEXT.format(n=len(asked)))
+            return "\n".join(parts)
+    return _settle(store, key, proposal, kind, create, category, now)
+
+
+def _settle(
+    store: StateStore,
+    key: str,
+    proposal: Mapping[str, Any],
+    kind: str,
+    create: Callable[[Mapping[str, Any]], CreationOutcome] | None,
+    category: str | None,
+    now: datetime,
+) -> str:
+    """Create every event of ``proposal`` (or cancel it) and keep the failed ones for "다시"; the report."""
     outcome, retry = apply_answer(proposal, kind, create=create, category=category, now=now)
     if outcome is None:
         return CANCELLED_TEXT
@@ -1222,7 +1261,9 @@ def confirm_proposal(
 
     The proposal is taken out of the store first (so it is never created
     twice) and is gone afterwards whatever happens; only the events the
-    Calendar app did not add come back, as a retry for "다시". With
+    Calendar app did not add come back, as a retry for "다시", and the events
+    with a similar one already in the calendar as a question of their own
+    (``item_question_key``; "" when nothing else was tried). With
     ``proposal_id`` only that very proposal is taken. Blocking: EventKit runs here.
     """
     now = now or utcnow()
@@ -1230,3 +1271,371 @@ def confirm_proposal(
     if proposal is None:
         return None
     return settle_answer(store, key, proposal, kind, create=create, category=category, now=now)
+
+
+# ---------------------------------------------------------------- similar events: 넣기 / 건너뛰기, one by one
+#
+# After the category is picked, an event the duplicate check found a similar
+# one for (``ProposedEvent.similar``, captured when it was proposed) is not
+# created with the others: it waits in an item question under
+# ``item_question_key(key)``, with the proposal's category and expiry, until
+# the user answers it on its own (a Slack button, "1 넣기", "2 건너뛰기",
+# "모두 넣기", or the terminal's ``[넣기/건너뛰기]``). Each item is taken
+# ("working") in the store before it is created and can be decided once; one
+# that the Calendar app clearly did not add stays open for 다시 시도. The
+# question is gone once every item is decided.
+
+ITEM_KEY_SUFFIX = "#similar"
+# An item's ``decision``.
+ITEM_PENDING = "pending"
+ITEM_WORKING = "working"  # taken, being created right now
+ITEM_ADDED = "added"
+ITEM_SKIPPED = "skipped"
+ITEM_FAILED = "failed"  # with ``error``; ``retry``: clearly not added, may be tried again
+# What an answer does to an item.
+ADD = "add"
+SKIP = "skip"
+# At most this many items get buttons (two blocks each; a Slack message has at most 50).
+MAX_ITEM_BUTTONS = 20
+MAX_ITEM_REPLY_CHARS = 24
+
+ITEM_ADDED_TEXT = "✅ 넣었어요"
+ITEM_SKIPPED_TEXT = "⏭️ 건너뛰었어요"
+ITEM_WORKING_TEXT = "⏳ 넣는 중이에요"
+ITEM_FAILED_TEXT = "❌ 추가하지 못했어요: {reason}"
+ITEMS_INTRO = "비슷한 일정이 이미 있는 {n}건은 하나씩 골라 주세요, 박사님."
+ITEM_INTRO_ONE = "비슷한 일정이 이미 있는 1건은 넣을지 골라 주세요, 박사님."
+ITEMS_DONE_INTRO = "비슷한 일정이 이미 있던 {n}건은 이렇게 처리했어요."
+ITEM_SIMILAR_LINE = "   ↔ 이미 있음: {text}"
+ITEM_TYPED_HINT = "답장으로도 고를 수 있어요: '1 넣기', '1 건너뛰기', '모두 넣기', '모두 건너뛰기'"
+ITEMS_TYPED_ONLY_NOTE = (
+    "비슷한 일정이 많아 버튼 없이 여쭤요. '1 넣기', '2 건너뛰기'처럼 번호와 함께 답하시거나 '모두 넣기', '모두 건너뛰기'라고 답해 주세요."
+)
+ITEM_HINT = "비슷한 일정은 번호와 함께 답해 주세요, 박사님 ({numbers}): '1 넣기', '1 건너뛰기', '모두 넣기', '모두 건너뛰기'"
+ITEMS_ALL_DONE_TEXT = "비슷한 일정은 이미 모두 처리했어요."
+ITEM_ALREADY_TEXT = "이미 처리했어요({status})"
+ITEMS_NOT_KEPT_TEXT = "⚠️ 비슷한 일정이 이미 있는 {n}건은 넣지 않았어요. 넣으시려면 다시 부탁해 주세요, 박사님."
+CLI_ITEM_PROMPT = "넣을까요? [넣기/건너뛰기] "
+CLI_ITEM_RETRY_PROMPT = "다시 시도할까요? [다시/건너뛰기] "
+
+# Typed answers, after ``normalize_reply`` (no spaces): "1 넣기", "2번 빼", "모두 넣기".
+_ITEM_ADD_WORDS = frozenset(
+    {"넣기", "넣어", "넣어줘", "넣어주세요", "넣어요", "넣을게요", "추가", "추가해", "추가해줘", "추가해주세요", "다시", "다시시도", "재시도", "add"}
+)
+_ITEM_SKIP_WORDS = frozenset(
+    {
+        "건너뛰기", "건너뛰어", "건너뛰어줘", "건너뛰어주세요", "건너뛰어요", "빼", "빼기", "빼줘", "빼주세요", "빼요",
+        "안넣어", "넣지마", "넣지마세요", "스킵", "패스", "skip",
+    }
+)
+_ITEM_ALL_WORDS = ("모두", "전부", "다")
+_ITEM_NUMBERED_RE = re.compile(r"^(\d{1,2})(?:번|\)|\.|:)?(.+)$")
+_ITEM_NUMBER_RE = re.compile(r"^\d{1,2}번?$")
+
+
+def item_question_key(key: str) -> str:
+    """Where a conversation's item question waits (next to its proposal or retry, which keep ``key``)."""
+    return f"{key}{ITEM_KEY_SUFFIX}"
+
+
+def split_similar(proposal: Mapping[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """``(events to create now, events asked about one by one)``, each in proposal order.
+
+    Asked about: a similar event was found when it was proposed and it has a
+    start time (one without is never created, so it is reported as before).
+    """
+    at_once: list[dict[str, Any]] = []
+    asked: list[dict[str, Any]] = []
+    for event in proposal.get("events") or []:
+        similar = event.get("similar") if isinstance(event, Mapping) else None
+        if isinstance(similar, list) and similar and not event.get("needs_time"):
+            asked.append(dict(event))
+        else:
+            at_once.append(event)
+    return at_once, asked
+
+
+def _item_summary(event: Mapping[str, Any], now: datetime) -> str:
+    """``11/18(수) 15:00–16:00 잡세미나 - 이승헌`` (the event's own time zone, as stored)."""
+    start = _aware(event.get("start"))
+    tz = start.tzinfo if start is not None else config.get_timezone()
+    try:
+        return event_summary(ProposedEvent.from_state(event, tz), now.astimezone(tz).date())
+    except (ValueError, TypeError, AttributeError):
+        return str(event.get("title") or "(제목 없음)")
+
+
+def item_question(proposal: Mapping[str, Any], asked: Sequence[Mapping[str, Any]], now: datetime) -> dict[str, Any] | None:
+    """The item question for ``asked`` (events of the confirmed ``proposal``, its category picked); None once it expired.
+
+    Same category, calendar and expiry as the proposal (``expires_at``; 24
+    hours from ``now`` for one that never was stored), like a retry.
+    """
+    expires = _aware(proposal.get("expires_at")) or now + PROPOSAL_TTL
+    if expires <= now or not asked:
+        return None
+    question = {name: proposal[name] for name in _RETRY_FIELDS if name in proposal}
+    question.update(
+        {
+            "id": secrets.token_hex(16),
+            "similar_items": True,
+            "events": [
+                {**event, "summary": _item_summary(event, now), "decision": ITEM_PENDING, "error": "", "retry": False}
+                for event in asked
+            ],
+            "expires_at": expires.isoformat(),
+        }
+    )
+    return question
+
+
+def keep_item_question(store: StateStore, key: str, question: Mapping[str, Any] | None, now: datetime) -> bool:
+    """Store ``question`` under ``item_question_key(key)`` until its ``expires_at``. False when it could not be."""
+    expires = _aware((question or {}).get("expires_at"))
+    if question is None or expires is None or expires <= now:
+        return False
+    try:
+        store.save_pending_proposal(item_question_key(key), dict(question), now, ttl=expires - now)
+    except OSError as exc:
+        log.warning("비슷한 일정을 물어보도록 저장하지 못했습니다: %s", safe_error(exc))
+        return False
+    return True
+
+
+def item_open(item: Mapping[str, Any]) -> bool:
+    """True while an item can still be answered: not decided yet, or clearly not added (다시 시도)."""
+    decision = item.get("decision")
+    return decision == ITEM_PENDING or (decision == ITEM_FAILED and bool(item.get("retry")))
+
+
+def item_final(item: Mapping[str, Any]) -> bool:
+    """True once an item is decided for good: added, skipped, or failed in a way that is never tried again."""
+    decision = item.get("decision")
+    return decision in (ITEM_ADDED, ITEM_SKIPPED) or (decision == ITEM_FAILED and not item.get("retry"))
+
+
+def _items(question: Mapping[str, Any] | None) -> list[Mapping[str, Any]]:
+    events = (question or {}).get("events")
+    return [item for item in events if isinstance(item, Mapping)] if isinstance(events, list) else []
+
+
+def items_done(question: Mapping[str, Any] | None) -> bool:
+    """True when every item of the question is decided for good (the question is then dropped)."""
+    items = _items(question)
+    return bool(items) and all(item_final(item) for item in items)
+
+
+def open_items(question: Mapping[str, Any] | None) -> list[int]:
+    """Indexes of the items that can still be answered."""
+    return [index for index, item in enumerate(_items(question)) if item_open(item)]
+
+
+def item_status_text(item: Mapping[str, Any]) -> str:
+    """``✅ 넣었어요``, ``⏭️ 건너뛰었어요``, ``⏳ 넣는 중이에요``, ``❌ 추가하지 못했어요: …``; "" while undecided."""
+    decision = item.get("decision")
+    if decision == ITEM_ADDED:
+        return ITEM_ADDED_TEXT
+    if decision == ITEM_SKIPPED:
+        return ITEM_SKIPPED_TEXT
+    if decision == ITEM_WORKING:
+        return ITEM_WORKING_TEXT
+    if decision == ITEM_FAILED:
+        return ITEM_FAILED_TEXT.format(reason=item.get("error") or "알 수 없는 오류")
+    return ""
+
+
+def item_title(question: Mapping[str, Any], index: int) -> str:
+    """``1) 11/18(수) 15:00–16:00 잡세미나 - 이승헌``."""
+    item = _items(question)[index]
+    return f"{index + 1}) {item.get('summary') or item.get('title') or '(제목 없음)'}"
+
+
+def item_text(question: Mapping[str, Any], index: int) -> str:
+    """One item: its line, the similar events already there (``↔ 이미 있음: …``), and its result once there is one."""
+    item = _items(question)[index]
+    lines = [item_title(question, index)]
+    lines += [ITEM_SIMILAR_LINE.format(text=text) for text in item.get("similar") or []]
+    status = item_status_text(item)
+    if status:
+        lines.append(f"   {status}")
+    return "\n".join(lines)
+
+
+def item_question_intro(question: Mapping[str, Any]) -> str:
+    count = len(_items(question))
+    if items_done(question):
+        return ITEMS_DONE_INTRO.format(n=count)
+    return ITEM_INTRO_ONE if count == 1 else ITEMS_INTRO.format(n=count)
+
+
+def item_question_text(question: Mapping[str, Any], *, typed_only: bool = False) -> str:
+    """The whole question as text: the intro, every item, and how to answer by typing while some are open."""
+    lines = [item_question_intro(question), *(item_text(question, index) for index in range(len(_items(question))))]
+    if open_items(question):
+        lines.append(ITEMS_TYPED_ONLY_NOTE if typed_only else ITEM_TYPED_HINT)
+    return "\n".join(lines)
+
+
+def cli_item_prompt(question: Mapping[str, Any], index: int) -> str:
+    """The terminal chat's input prompt for one item: ``[넣기/건너뛰기]``, or ``[다시/건너뛰기]`` after a failure."""
+    return CLI_ITEM_RETRY_PROMPT if _items(question)[index].get("decision") == ITEM_FAILED else CLI_ITEM_PROMPT
+
+
+@dataclass(frozen=True)
+class ItemAnswer:
+    """What a typed reply means for an item question: ``choices`` (index, ``ADD`` / ``SKIP``), or a ``hint`` to answer again."""
+
+    choices: tuple[tuple[int, str], ...] = ()
+    hint: str = ""
+
+
+def _item_hint(count: int) -> ItemAnswer:
+    return ItemAnswer(hint=ITEM_HINT.format(numbers="1번" if count == 1 else f"1~{count}번"))
+
+
+def _item_action(word: str) -> str | None:
+    if word in _ITEM_ADD_WORDS or word in RETRY_REPLIES:
+        return ADD
+    return SKIP if word in _ITEM_SKIP_WORDS else None
+
+
+def parse_item_answer(text: Any, question: Mapping[str, Any], *, current: int | None = None) -> ItemAnswer | None:
+    """What a reply means for an item question. Pure, no model.
+
+    ``1 넣기`` / ``1 넣어`` / ``2번 건너뛰기`` / ``2 빼``: that item (numbers as
+    in the question); ``모두 넣기`` / ``모두 건너뛰기`` (``전부``, ``다``): every
+    open item; ``다시``: the items that failed, when there are any. A bare
+    number, a bare 넣기 / 건너뛰기, "네" / "아니요", a number out of range or
+    "다시" with nothing failed get a ``hint``. ``current`` is the item the
+    terminal is asking about: there a bare 넣기 / 건너뛰기 / 다시 / 네 / 아니요
+    answers it. Everything else is None (a message for the model).
+    """
+    reply = normalize_reply(text)
+    if not reply or len(reply) > MAX_ITEM_REPLY_CHARS:
+        return None
+    count = len(_items(question))
+    still_open = open_items(question)
+    numbered = _ITEM_NUMBERED_RE.match(reply)
+    action = _item_action(numbered.group(2)) if numbered else None
+    if numbered and action:
+        number = int(numbered.group(1))
+        if not 1 <= number <= count:
+            return _item_hint(count)
+        return ItemAnswer(((number - 1, action),))
+    if _ITEM_NUMBER_RE.match(reply) or reply in _ITEM_ALL_WORDS:
+        return _item_hint(count)
+    for word in _ITEM_ALL_WORDS:
+        action = _item_action(reply[len(word):]) if reply.startswith(word) else None
+        if action:
+            return ItemAnswer(tuple((index, action) for index in still_open)) if still_open else ItemAnswer(hint=ITEMS_ALL_DONE_TEXT)
+    kind = reply_kind(text)
+    action = _item_action(reply) or (ADD if kind == YES else SKIP if kind == NO else None)
+    if action is None:
+        return None
+    if current is not None:
+        return ItemAnswer(((current, action),))
+    if reply in RETRY_REPLIES:
+        failed = [index for index in still_open if _items(question)[index].get("decision") == ITEM_FAILED]
+        if failed:
+            return ItemAnswer(tuple((index, ADD) for index in failed))
+    return _item_hint(count)
+
+
+@dataclass
+class ItemDecision:
+    """What answering some items did: the question as it is now, one line per item asked about, and how many changed."""
+
+    question: dict[str, Any]
+    lines: list[str] = field(default_factory=list)
+    changed: int = 0
+
+    @property
+    def done(self) -> bool:
+        return items_done(self.question)
+
+
+def decide_items(
+    store: StateStore,
+    key: str,
+    question_id: str,
+    choices: Sequence[tuple[int, str]],
+    *,
+    create: Callable[[Mapping[str, Any]], CreationOutcome] | None = None,
+    now: datetime | None = None,
+) -> ItemDecision | None:
+    """Apply 넣기 / 건너뛰기 to items of the item question waiting under ``key``; None when it is gone (answered, expired).
+
+    Only that very question (``question_id``) and only items still open: a
+    second answer for an item changes nothing (its line says
+    ``이미 처리했어요(…)``). Items to add are taken in the store first
+    ("working"), then created in the category picked for the proposal (or
+    their own), then marked ✅ or ❌: so a double click, a late click or a
+    second process never adds one twice. One the Calendar app clearly did
+    not add (or nothing could even be tried) stays open for 다시 시도; one
+    that may have been added after all never is. When every item is decided
+    the question is dropped. Blocking: EventKit runs here.
+    """
+    now = now or utcnow()
+    item_key = item_question_key(key)
+    wanted: list[tuple[int, str]] = []  # the first answer for each item
+    for index, action in choices:
+        if action in (ADD, SKIP) and all(index != earlier for earlier, _ in wanted):
+            wanted.append((index, action))
+
+    def claim(question: dict[str, Any]) -> tuple[dict[str, Any] | None, Any]:
+        items = question.get("events") or []
+        adds: list[int] = []
+        changed: list[int] = []
+        for index, action in wanted:
+            if not (isinstance(index, int) and 0 <= index < len(items)) or not item_open(items[index]):
+                continue
+            items[index].update(decision=ITEM_WORKING if action == ADD else ITEM_SKIPPED, error="", retry=False)
+            (adds if action == ADD else changed).append(index)
+        return (None if items_done(question) else question), (question, adds, changed)
+
+    found, claimed = store.update_pending_proposal(item_key, now, question_id, claim)
+    if not found:
+        return None
+    question, adds, changed = claimed
+    if adds:
+        batch = {**question, "events": [question["events"][index] for index in adds]}
+        try:
+            outcome = (create or create_proposal_events)(batch)
+            crashed = False
+        except Exception as exc:  # noqa: BLE001 - reported, never raised; may have added some: never retried
+            outcome, crashed = CreationOutcome(fatal=f"오류가 났어요 ({safe_error(exc)})"), True
+        results: dict[int, dict[str, Any]] = {}
+        for position, index in enumerate(adds):
+            result = outcome.results[position] if position < len(outcome.results) else None
+            if outcome.fatal:
+                # Nothing was tried (permission, mode), so it may be tried again; unless it crashed halfway.
+                results[index] = {"decision": ITEM_FAILED, "error": outcome.fatal, "retry": not crashed}
+            elif result is not None and result.ok:
+                results[index] = {"decision": ITEM_ADDED, "error": "", "retry": False}
+            else:
+                error = result.error if result is not None else "결과를 받지 못했어요"
+                retry = result is not None and result.retry_event is not None
+                results[index] = {"decision": ITEM_FAILED, "error": error or "알 수 없는 오류", "retry": retry}
+
+        def settle(current: dict[str, Any]) -> tuple[dict[str, Any] | None, Any]:
+            for index, result in results.items():
+                current["events"][index].update(result)
+            return (None if items_done(current) else current), current
+
+        found, settled = store.update_pending_proposal(item_key, now, question_id, settle)
+        if found:
+            question = settled
+        else:  # dropped meanwhile (a new message, expiry): the message still shows what happened
+            for index, result in results.items():
+                question["events"][index].update(result)
+        changed += adds
+    lines: list[str] = []
+    items = question["events"]
+    for index, _action in wanted:
+        if not (isinstance(index, int) and 0 <= index < len(items)):
+            continue
+        status = item_status_text(items[index])
+        if index not in changed and items[index].get("decision") != ITEM_WORKING:
+            status = ITEM_ALREADY_TEXT.format(status=status)
+        lines.append(f"{item_title(question, index)}: {status}")
+    return ItemDecision(question=question, lines=lines, changed=len(changed))

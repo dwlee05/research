@@ -272,3 +272,23 @@ def test_a_legacy_last_greeting_is_migrated_into_the_list(tmp_path):
     for junk in ({"date": "어제", "text": "안녕"}, {"date": "2026-10-08", "text": "  "}, "인사", None):
         path.write_text(json.dumps({"last_greeting": junk}, ensure_ascii=False), encoding="utf-8")
         assert store.recent_greetings() == []
+
+
+def test_update_pending_proposal_changes_only_that_live_proposal_and_keeps_its_expiry(tmp_path):
+    store = StateStore(tmp_path / "s.json")
+    saved = store.save_pending_proposal("k", {"id": "q1", "events": [{"decision": "pending"}]}, NOW)
+
+    def mark(proposal):
+        proposal["events"][0]["decision"] = "added"
+        return proposal, "done"
+
+    assert store.update_pending_proposal("k", NOW, "q1", mark) == (True, "done")
+    kept = store.pending_proposal("k", NOW)
+    assert kept["events"] == [{"decision": "added"}] and kept["expires_at"] == saved["expires_at"]
+    # Another id, another key, or an expired one: nothing is called or written.
+    assert store.update_pending_proposal("k", NOW, "old", mark) == (False, None)
+    assert store.update_pending_proposal("other", NOW, "q1", mark) == (False, None)
+    assert store.update_pending_proposal("k", NOW + timedelta(hours=25), "q1", mark) == (False, None)
+    # None drops it.
+    assert store.update_pending_proposal("k", NOW, "q1", lambda p: (None, 1)) == (True, 1)
+    assert store.pending_proposal("k", NOW) is None
