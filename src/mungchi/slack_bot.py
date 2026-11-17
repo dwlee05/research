@@ -12,7 +12,10 @@ answer to a calendar proposal waiting in the thread (events from a pasted
 note) is handled by code too, without an agent turn: a category picked by
 number or name ("2", "Research", "khu"), "네" (the suggested category),
 "아니요", or a click on one of the category buttons posted under the
-preview. The events are created, or the proposal dropped.
+preview. The events are created, or the proposal dropped. The reply says how
+it went ("6건 중 1건 추가, 5건은 추가하지 못했어요"); events that were not
+added wait for "다시" (or the "실패한 N건 다시 시도" button), which tries only
+those again.
 
 A photo (poster, email screenshot, timetable) sent to 업뎃 or 일정 (a mention
 with an image, or a DM) is downloaded with the bot token, shrunk in memory
@@ -104,6 +107,8 @@ CATEGORY_ACTION_RE = re.compile(rf"^{CATEGORY_ACTION_PREFIX}")
 PICK_ACTION = CATEGORY_ACTION_PREFIX + "pick_{index}"
 CONFIRM_ACTION = CATEGORY_ACTION_PREFIX + "confirm"
 CANCEL_ACTION = CATEGORY_ACTION_PREFIX + "cancel"
+# Under a report whose failed events wait for "다시".
+RETRY_ACTION = CATEGORY_ACTION_PREFIX + "retry"
 STALE_ACTION_TEXT = "이미 처리됐거나 만료된 요청이에요"
 BUTTONS_ANSWERED_TEXT = "버튼 대신 답장으로 처리했어요."
 BUTTONS_REPLACED_TEXT = "새 메시지가 와서 이 제안은 닫았어요."
@@ -317,13 +322,19 @@ def category_blocks(proposal: Mapping[str, Any] | None) -> tuple[str, list[dict[
     The suggested category is the primary button; 취소 comes last. Each
     button's value carries the proposal id (and the category), so a click only
     ever answers this very proposal. When every event already has its own
-    category there is one 추가 button instead. Pure.
+    category there is one 추가 button instead. A retry (the failed events of
+    a confirmed proposal, with or without categories) gets "실패한 N건 다시
+    시도" and 취소. Pure.
     """
     labels = event_proposals.category_labels(proposal)
     proposal_id = str((proposal or {}).get("id") or "")
-    if not labels or not proposal_id:
+    if event_proposals.is_retry(proposal) and proposal_id:
+        count = event_proposals.retry_count(proposal)
+        text = f"추가하지 못한 {count}건을 다시 시도할까요?"
+        buttons = [_button(RETRY_ACTION, f"실패한 {count}건 다시 시도", {"proposal_id": proposal_id, "retry": True}, primary=True)]
+    elif not labels or not proposal_id:
         return None
-    if event_proposals.all_events_assigned(proposal):
+    elif event_proposals.all_events_assigned(proposal):
         text = "일정마다 정한 카테고리로 추가할까요?"
         buttons = [_button(CONFIRM_ACTION, "추가", {"proposal_id": proposal_id, "confirm": True}, primary=True)]
     else:
@@ -350,6 +361,9 @@ def button_answer(value: Mapping[str, Any], proposal: Mapping[str, Any]) -> even
     """What a button click means for ``proposal`` (already matched by id); None for a button it does not offer."""
     if value.get("cancel"):
         return event_proposals.Answer(event_proposals.NO)
+    if event_proposals.is_retry(proposal) or value.get("retry"):
+        ok = value.get("retry") and event_proposals.is_retry(proposal)
+        return event_proposals.Answer(event_proposals.YES) if ok else None
     if value.get("confirm"):
         return event_proposals.Answer(event_proposals.YES) if event_proposals.all_events_assigned(proposal) else None
     category = value.get("category")
@@ -773,7 +787,8 @@ class SlackHandler:
             await self._update(channel, ts, text, blocks=[])
 
     async def _offer_category_buttons(self, channel: str, thread_ts: str) -> None:
-        """After an agent turn: post the category buttons for the proposal it left in this thread, if any."""
+        """Post the buttons of the proposal waiting in this thread, if any: after an agent turn the
+        category buttons, after a report with failed events the "다시 시도" button."""
         key = self._conversation_key(channel, thread_ts)
         try:
             pending = self.proposals.pending_proposal(key, utcnow())
@@ -840,10 +855,18 @@ class SlackHandler:
 
         Shared by text answers and button clicks. The proposal is taken out on
         the event loop, and only if it is still that very proposal (same id),
-        so it is never created twice. False: it was already gone.
+        so it is never created twice. Events the Calendar app did not add come
+        back as a retry under the same key (``event_proposals.settle_answer``),
+        and its "다시 시도" button goes right under the reply. False: it was
+        already gone.
         """
         key = self._conversation_key(channel, thread_ts)
-        what = "취소" if answer.kind == event_proposals.NO else f"추가 ({answer.category or '일정마다 정한 카테고리'})"
+        if answer.kind == event_proposals.NO:
+            what = "취소"
+        elif event_proposals.is_retry(pending):
+            what = f"다시 시도 ({event_proposals.retry_count(pending)}건)"
+        else:
+            what = f"추가 ({answer.category or '일정마다 정한 카테고리'})"
         log.info("%s: 스레드 %s:%s 캘린더 제안 %s (에이전트 실행 없음)", self.texts.label, channel, thread_ts, what)
         self._confirming[key] = pending
         try:
@@ -853,7 +876,9 @@ class SlackHandler:
                     if proposal is None:
                         return False
                     reply = await asyncio.to_thread(
-                        event_proposals.answer_text,
+                        event_proposals.settle_answer,
+                        self.proposals,
+                        key,
                         proposal,
                         answer.kind or "",
                         create=self.create_events,
@@ -865,6 +890,8 @@ class SlackHandler:
             await deliver(reply)
         finally:
             self._confirming.pop(key, None)
+        # The failed events kept for "다시": their button under the reply (nothing when all went in).
+        await self._offer_category_buttons(channel, thread_ts)
         return True
 
     async def handle_action(self, body: Mapping[str, Any]) -> None:

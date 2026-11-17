@@ -574,7 +574,7 @@ def test_creating_a_confirmed_proposal_calls_the_adapter_per_event():
     }
     assert outcome.created == 2 and not outcome.fatal
     assert creation_report(outcome) == (
-        "✅ 캘린더에 추가했어요\n"
+        "✅ 2건 모두 캘린더에 추가했어요\n"
         "• 10/22(목) 12:00–13:00 신임교수모임 (10월) · 캘린더: 연구\n"
         "• 11/19(목) 12:00–13:00 신임교수모임 (11월) · 캘린더: 연구"
     )
@@ -592,7 +592,7 @@ def test_partial_failures_skipped_items_and_crashes_are_reported_per_event():
     report = creation_report(create_proposal_events(proposal, env=ENV, now=NOW, adapter_factory=lambda tz: app, platform="darwin"))
     assert [c["title"] for c in app.created] == ["신임교수모임 (10월)", "실패할 일정", "터질 일정"]  # never the one without a time
     assert report.splitlines() == [
-        "✅ 캘린더에 추가했어요",
+        "⚠️ 3건 중 1건 추가, 2건은 추가하지 못했어요",
         "• 10/22(목) 12:00–13:00 신임교수모임 (10월) · 캘린더: 연구",
         "❌ 10/23(금) 10:00–11:00 실패할 일정 추가 실패: 캘린더에 저장하지 못했어요 (읽기 전용 캘린더)",
         "⏭️ 10/24(토) 시간 미정 시간 모름: 시작 시각이 없어 추가하지 않았어요. 시각을 알려 주시면 다시 제안할게요.",
@@ -620,7 +620,7 @@ def test_a_stored_proposal_that_cannot_be_read_back_is_reported():
         title="좋은 일정", day=date(2026, 10, 22), start=at(10, 22, 9), end=at(10, 22, 10)).to_state()}]}
     report = creation_report(create_proposal_events(proposal, env=ENV, now=NOW, adapter_factory=lambda tz: app, platform="darwin"))
     lines = report.splitlines()
-    assert lines[0] == "✅ 캘린더에 추가했어요"
+    assert lines[0] == "⚠️ 2건 중 1건 추가, 1건은 추가하지 못했어요"
     assert lines[1].startswith("❌ 1번 일정 추가 실패: 저장된 제안을 읽지 못했어요")
     assert lines[2] == "• 10/22(목) 09:00–10:00 좋은 일정 · 캘린더: 연구"
 
@@ -641,7 +641,138 @@ def test_answers_take_the_proposal_exactly_once(tmp_path):
 
 def test_report_when_nothing_could_be_added():
     outcome = CreationOutcome(results=[CreationResult(summary="10/22(목) 종일 x", error="거부됨")])
-    assert creation_report(outcome) == "❌ 캘린더에 추가하지 못했어요\n❌ 10/22(목) 종일 x 추가 실패: 거부됨"
+    assert creation_report(outcome) == "❌ 추가하지 못했어요\n❌ 10/22(목) 종일 x 추가 실패: 거부됨"
+
+
+def ok(summary, category="Event-KHU", calendar="Event-KHU"):
+    return CreationResult(summary=summary, ok=True, category=category, calendar=calendar)
+
+
+def failed(summary, error=macos_calendar.NO_CALENDARS_VISIBLE_TEXT, category="Event-KHU"):
+    return CreationResult(summary=summary, error=error, category=category, retry_event={"title": summary})
+
+
+def test_the_report_header_matches_the_outcome():
+    six = [f"11/{18 + i // 2}({'수목금토'[i // 2]}) {10 + i}:00–{11 + i}:00 세미나 {i}" for i in range(6)]
+    all_ok = creation_report(CreationOutcome(results=[ok(s) for s in six]))
+    assert all_ok.splitlines() == ["✅ 6건 모두 Event-KHU 캘린더에 추가했어요", *(f"• {s}" for s in six)]
+    one = creation_report(CreationOutcome(results=[ok(six[0])]))
+    assert one == f"✅ Event-KHU 캘린더에 추가했어요\n• {six[0]}"
+    mixed = creation_report(CreationOutcome(results=[ok(six[0]), ok(six[1], "Research", "Research")]))
+    assert mixed.splitlines()[0] == "✅ 2건 모두 캘린더에 추가했어요" and mixed.endswith("· 캘린더: Research")
+
+    partial = CreationOutcome(results=[failed(six[0]), ok(six[1]), *(failed(s) for s in six[2:])])
+    lines = creation_report(partial).splitlines()
+    assert lines == [
+        "⚠️ 6건 중 1건 추가, 5건은 추가하지 못했어요",
+        f"❌ {six[0]}",
+        f"• {six[1]} · 캘린더: Event-KHU",  # the header names no calendar, so the line does
+        *(f"❌ {s}" for s in six[2:]),
+        f"추가하지 못한 이유: {macos_calendar.NO_CALENDARS_VISIBLE_TEXT}",  # one shared reason, once
+    ]
+    # Different reasons stay on their own lines; skipped events are neither added nor failed.
+    varied = CreationOutcome(results=[
+        ok(six[0]), failed(six[1], "읽기 전용"), failed(six[2], "거부됨"), CreationResult(summary=six[3], skipped=True),
+    ])
+    assert creation_report(varied).splitlines()[:4] == [
+        "⚠️ 3건 중 1건 추가, 2건은 추가하지 못했어요",
+        f"• {six[0]} · 캘린더: Event-KHU",
+        f"❌ {six[1]} 추가 실패: 읽기 전용",
+        f"❌ {six[2]} 추가 실패: 거부됨",
+    ]
+    none = creation_report(CreationOutcome(results=[failed(s) for s in six[:3]]))
+    assert none.splitlines() == [
+        "❌ 추가하지 못했어요", *(f"❌ {s}" for s in six[:3]), f"추가하지 못한 이유: {macos_calendar.NO_CALENDARS_VISIBLE_TEXT}"
+    ]
+
+
+def test_the_report_ends_with_the_retry_hint_only_when_failures_were_kept():
+    partial = CreationOutcome(results=[ok("a"), failed("b"), failed("c")])
+    retry = {"events": [{"title": "b"}, {"title": "c"}]}
+    assert creation_report(partial, retry).splitlines()[-1] == "'다시'라고 답하시면 추가하지 못한 2건만 다시 시도할게요."
+    assert "'다시'" not in creation_report(partial)
+    none = CreationOutcome(results=[failed("b")])
+    assert creation_report(none, {"events": [{}]}).splitlines()[-1] == "'다시'라고 답하시면 1건을 다시 시도할게요."
+
+
+def test_only_clear_failures_are_kept_for_retry_with_the_same_category_and_expiry():
+    expires = NOW + timedelta(hours=5)
+    proposal = {
+        "id": "p1", "calendar": None, "calendar_label": "", "categories": [{"label": "Event-KHU", "calendar": "Event-KHU"}],
+        "suggested_category": "Research", "chosen_category": "Event-KHU", "source_excerpt": "메모", "expires_at": expires.isoformat(),
+        "events": [{"title": "x"}],
+    }
+    outcome = CreationOutcome(results=[
+        ok("added"), failed("refused"), CreationResult(summary="maybe", error="boom"),  # no retry_event: maybe added
+        CreationResult(summary="no time", skipped=True),
+    ])
+    retry = event_proposals.retry_proposal(proposal, outcome, NOW)
+    assert retry["events"] == [{"title": "refused"}] and retry["retry"] is True and retry["id"] != "p1"
+    assert retry["chosen_category"] == "Event-KHU" and retry["categories"] == proposal["categories"]
+    assert retry["expires_at"] == expires.isoformat() and retry["source_excerpt"] == "메모"
+    assert event_proposals.retry_proposal(proposal, CreationOutcome(results=[ok("a")]), NOW) is None
+    assert event_proposals.retry_proposal(proposal, CreationOutcome(fatal="권한"), NOW) is None
+    assert event_proposals.retry_proposal(proposal, outcome, expires) is None  # the preview has expired
+    # Never stored before (a test or a one-off): 24 hours from now.
+    fresh = event_proposals.retry_proposal({"events": []}, outcome, NOW)
+    assert fresh["expires_at"] == (NOW + timedelta(hours=24)).isoformat()
+
+
+def test_a_crashing_adapter_may_have_added_events_so_they_are_never_retried():
+    app = FakeCalendarApp(fail_titles={"실패할 일정"}, raise_titles={"터질 일정"})
+    events = [{"title": "실패할 일정", "date": "2026-10-23", "start_time": "10:00"}, {"title": "터질 일정", "date": "2026-10-25", "all_day": True}]
+    _, proposal = stored_proposal(app, events)
+    outcome = create_proposal_events(proposal, env=ENV, now=NOW, adapter_factory=lambda tz: app, platform="darwin")
+    assert [r.retry_event is not None for r in outcome.results] == [True, False]
+    assert [e["title"] for e in event_proposals.retry_proposal(proposal, outcome, NOW)["events"]] == ["실패할 일정"]
+
+    class Crashing(FakeCalendarApp):
+        def create_events(self, new_events):
+            raise RuntimeError("halfway")
+
+    crashing = Crashing()
+    outcome = create_proposal_events(proposal, env=ENV, now=NOW, adapter_factory=lambda tz: crashing, platform="darwin")
+    assert [r.ok for r in outcome.results] == [False, False] and all(r.retry_event is None for r in outcome.results)
+
+
+def test_confirm_keeps_the_failures_and_dasi_creates_only_those(tmp_path):
+    app = FakeCalendarApp(fail_titles={"실패할 일정"})
+    events = [EXAMPLE, {"title": "실패할 일정", "date": "2026-10-23", "start_time": "10:00"}]
+    store, _ = stored_proposal(app, events, store=StateStore(tmp_path / "s.json"))
+    first = store.pending_proposal(KEY, NOW)
+    reply = confirm_proposal(store, KEY, YES, now=NOW, create=creator(app))
+    assert reply.splitlines()[0] == "⚠️ 2건 중 1건 추가, 1건은 추가하지 못했어요"
+    assert reply.splitlines()[-1] == "'다시'라고 답하시면 추가하지 못한 1건만 다시 시도할게요."
+    retry = store.pending_proposal(KEY, NOW)
+    assert event_proposals.is_retry(retry) and retry["expires_at"] == first["expires_at"] and retry["calendar"] == "연구"
+    assert event_proposals.proposal_question(retry) == "추가하지 못한 1건을 다시 시도할까요? ('다시' / '아니요')"
+    assert event_proposals.cli_prompt(retry) == "추가하지 못한 1건을 다시 시도할까요? [다시/아니요] "
+    # The Calendar app takes it this time: only that event is created again, into the same calendar.
+    app.fail_titles.clear()
+    answer = parse_answer("다시", retry)
+    assert answer == Answer(YES)
+    assert confirm_proposal(store, KEY, answer.kind, now=NOW, create=creator(app)) == (
+        "✅ 캘린더에 추가했어요\n• 10/23(금) 10:00–11:00 실패할 일정 · 캘린더: 연구"
+    )
+    assert [(c["title"], c["calendar_name"]) for c in app.created] == [
+        ("신임교수모임 (10월)", "연구"), ("실패할 일정", "연구"), ("실패할 일정", "연구")
+    ]
+    assert store.pending_proposal(KEY, NOW) is None
+
+
+@pytest.mark.parametrize("text", ["다시", "재시도", "다시 해줘", "다시해 주세요", "다시 시도", "재시도해주세요", "Retry", "다시!"])
+def test_retry_words_answer_only_a_retry(text):
+    retry = {"retry": True, "events": [{}], "categories": [{"label": "Research", "calendar": "Research"}], "chosen_category": "Research"}
+    assert parse_answer(text, retry) == Answer(YES)  # the category was chosen already
+    assert parse_answer(text, {"events": [{}], "calendar": None}).kind is None  # not an answer to a preview
+    assert parse_answer(text, {**retry, "retry": False}).kind is None
+
+
+def test_a_retry_takes_no_yes_or_category_but_no_cancels():
+    retry = {"retry": True, "events": [{}], "categories": [{"label": "Research", "calendar": "Research"}], "chosen_category": "Research"}
+    for text in ("네", "1", "Research", "다시 하고 시간은 1시로"):
+        assert parse_answer(text, retry).kind is None
+    assert parse_answer("아니요", retry) == Answer(NO)
 
 
 # ---------------------------------------------------------------- pure adapter helpers
@@ -1575,7 +1706,7 @@ def test_creating_into_the_picked_category():
     reply = confirm_proposal(store, KEY, YES, now=NOW, create=category_creator(app), category="Event-KHU")
     assert [c["calendar_name"] for c in app.created] == ["Event-KHU", "Event-KHU"]
     assert reply == (
-        "✅ Event-KHU 캘린더에 추가했어요\n"
+        "✅ 2건 모두 Event-KHU 캘린더에 추가했어요\n"
         "• 10/22(목) 12:00–13:00 신임교수모임 (10월)\n"
         "• 11/19(목) 12:00–13:00 신임교수모임 (11월)"
     )
@@ -1602,7 +1733,7 @@ def test_per_event_categories_override_the_pick():
     reply = confirm_proposal(store, KEY, YES, now=NOW, create=category_creator(app), category="Family")
     assert [(c["title"], c["calendar_name"]) for c in app.created] == [("신임교수모임 (10월)", "Research"), ("학과 회의", "Family")]
     assert reply.splitlines() == [
-        "✅ 캘린더에 추가했어요",
+        "✅ 2건 모두 캘린더에 추가했어요",
         "• 10/22(목) 12:00–13:00 신임교수모임 (10월) · 캘린더: Research",
         "• 10/23(금) 12:00–13:00 학과 회의 · 캘린더: Family",
     ]
@@ -1631,7 +1762,7 @@ def test_no_event_is_created_without_a_category():
     _, store = run_categories(app, [EXAMPLE])
     reply = confirm_proposal(store, KEY, YES, now=NOW, create=category_creator(app))  # no pick: never a guess
     assert app.created == [] and reply == (
-        "❌ 캘린더에 추가하지 못했어요\n❌ 10/22(목) 12:00–13:00 신임교수모임 (10월) 추가 실패: 카테고리를 고르지 않아 추가하지 않았어요"
+        "❌ 추가하지 못했어요\n❌ 10/22(목) 12:00–13:00 신임교수모임 (10월) 추가 실패: 카테고리를 고르지 않아 추가하지 않았어요"
     )
 
 

@@ -2042,6 +2042,7 @@ def test_a_crashed_relay_still_answers_in_the_thread(tmp_path, monkeypatch, capl
 from datetime import timedelta  # noqa: E402
 
 from mungchi.state import utcnow  # noqa: E402
+from mungchi.tools import event_proposals  # noqa: E402
 from mungchi.tools.event_proposals import create_proposal_events, normalize_events, slack_conversation_key  # noqa: E402
 
 ROOT = "1700000000.000200"  # the DM (or channel message) the proposal was shown under
@@ -2110,7 +2111,7 @@ def test_yes_in_the_thread_creates_the_events_by_code_without_an_agent_turn(tmp_
     [post] = client.posts
     assert post["thread_ts"] == ROOT and post["channel"] == DM
     assert post["text"] == (
-        "✅ 캘린더에 추가했어요\n"
+        "✅ 2건 모두 캘린더에 추가했어요\n"
         "• 2099/10/22(목) 12:00–13:00 신임교수모임 (10월) · 캘린더: 연구\n"
         "• 2099/11/19(목) 12:00–13:00 신임교수모임 (11월) · 캘린더: 연구"
     )
@@ -2126,7 +2127,7 @@ def test_yes_by_mention_in_a_channel_thread(tmp_path, text):
     store_proposal(store, "schedule", CHANNEL, ROOT)
     asyncio.run(handler.handle_event(mention(text, ts="1700000000.000500", thread_ts=ROOT), event_id="Ev1", source="mention"))
     assert run.calls == [] and len(app.created) == 2
-    assert client.posts[-1]["text"].startswith("✅ 캘린더에 추가했어요") and client.posts[-1]["thread_ts"] == ROOT
+    assert client.posts[-1]["text"].startswith("✅ 2건 모두 캘린더에 추가했어요") and client.posts[-1]["thread_ts"] == ROOT
 
 
 @pytest.mark.parametrize("text", ["아니요", "취소", "no"])
@@ -2196,12 +2197,17 @@ def test_partial_failures_and_items_without_a_time_are_reported_per_event(tmp_pa
     store_proposal(store, "schedule", DM, ROOT, events=events)
     asyncio.run(handler.handle_event(dm("네", ts="1700000000.000300", thread_ts=ROOT), event_id="Ev1", source="dm"))
     assert app.created == ["신임교수모임 (10월)", "신임교수모임 (11월)"]  # never the one without a time
-    assert client.posts[-1]["text"].splitlines() == [
-        "✅ 캘린더에 추가했어요",
+    report, retry = client.posts
+    assert report["text"].splitlines() == [
+        "⚠️ 2건 중 1건 추가, 1건은 추가하지 못했어요",
         "• 2099/10/22(목) 12:00–13:00 신임교수모임 (10월) · 캘린더: 연구",
         "❌ 2099/11/19(목) 12:00–13:00 신임교수모임 (11월) 추가 실패: 읽기 전용 캘린더예요",
         "⏭️ 2099/11/26(목) 시간 미정 세미나: 시작 시각이 없어 추가하지 않았어요. 시각을 알려 주시면 다시 제안할게요.",
+        "'다시'라고 답하시면 추가하지 못한 1건만 다시 시도할게요.",
     ]
+    # The failed event waits for "다시", with its button right under the report.
+    assert retry["text"] == "추가하지 못한 1건을 다시 시도할까요?" and retry["thread_ts"] == ROOT
+    assert [b["text"]["text"] for b in retry["blocks"][1]["elements"]] == ["실패한 1건 다시 시도", "취소"]
     assert run.calls == []
 
 
@@ -2266,7 +2272,7 @@ def test_two_quick_yeses_create_the_events_once(tmp_path):
 
     asyncio.run(scenario())
     assert app.created == ["신임교수모임 (10월)", "신임교수모임 (11월)"]
-    assert [p["text"].splitlines()[0] for p in client.posts] == ["✅ 캘린더에 추가했어요"]
+    assert [p["text"].splitlines()[0] for p in client.posts] == ["✅ 2건 모두 캘린더에 추가했어요"]
     assert run.calls == []
 
 
@@ -2331,7 +2337,7 @@ def test_a_category_reply_creates_the_events_in_that_calendar_without_an_agent_t
     assert app.created == ["신임교수모임 (10월)", "신임교수모임 (11월)"] and app.calendars == [label, label]
     [post] = client.posts
     assert post["thread_ts"] == ROOT and post["text"] == (
-        f"✅ {label} 캘린더에 추가했어요\n"
+        f"✅ 2건 모두 {label} 캘린더에 추가했어요\n"
         "• 2099/10/22(목) 12:00–13:00 신임교수모임 (10월)\n"
         "• 2099/11/19(목) 12:00–13:00 신임교수모임 (11월)"
     )
@@ -2445,7 +2451,7 @@ def test_a_click_by_the_owner_creates_the_events_and_replaces_the_buttons(tmp_pa
     assert app.created == ["신임교수모임 (10월)", "신임교수모임 (11월)"] and app.calendars == ["Research", "Research"]
     update = client.updates[-1]
     assert update["ts"] == buttons_ts and update["channel"] == DM and update["blocks"] == []  # no buttons left
-    assert update["text"].startswith("✅ Research 캘린더에 추가했어요\n• 2099/10/22(목) 12:00–13:00 신임교수모임 (10월)")
+    assert update["text"].startswith("✅ 2건 모두 Research 캘린더에 추가했어요\n• 2099/10/22(목) 12:00–13:00 신임교수모임 (10월)")
     assert client.ephemerals == [] and len(run.calls) == 1
     assert store.pending_proposal(slack_conversation_key("update", DM, ROOT), utcnow()) is None
     # Clicking again (the message was already replaced, or a stale copy): nothing more is created.
@@ -2516,7 +2522,7 @@ def test_a_double_click_creates_the_events_once(tmp_path):
 
     asyncio.run(scenario())
     assert app.created == ["신임교수모임 (10월)", "신임교수모임 (11월)"] and app.calendars == ["Family", "Family"]
-    assert [u["text"].splitlines()[0] for u in client.updates] == ["✅ Family 캘린더에 추가했어요"]
+    assert [u["text"].splitlines()[0] for u in client.updates] == ["✅ 2건 모두 Family 캘린더에 추가했어요"]
     assert client.posts == [] and run.calls == []
 
 
@@ -2526,7 +2532,7 @@ def test_a_text_answer_closes_the_buttons(tmp_path):
     buttons_ts = client.posts[-1]["_ts"]
     asyncio.run(handler.handle_event(dm("3", ts="1700000000.000300", thread_ts=ROOT), event_id="Ev2", source="dm"))
     assert app.calendars == ["Research", "Research"]
-    assert client.posts[-1]["text"].startswith("✅ Research 캘린더에 추가했어요")
+    assert client.posts[-1]["text"].startswith("✅ 2건 모두 Research 캘린더에 추가했어요")
     closed = client.updates[-1]
     assert closed == {"channel": DM, "ts": buttons_ts, "text": slack_bot.BUTTONS_ANSWERED_TEXT, "blocks": []}
     assert handler._button_messages == {}
@@ -2577,6 +2583,183 @@ def test_buttons_route_through_bolt_with_an_ack_first(tmp_path, monkeypatch):
 
     asyncio.run(scenario())
     assert acks == ["ack"] and created.calendars == ["Teaching", "Teaching"]
+
+
+# ---------------------------------------------------------------- "다시": only the failed events, never twice
+
+# Like the poster the user sent: 6 events into Event-KHU; the Calendar app refused 5 the first time.
+SEMINARS = [
+    {"title": "잡세미나 - 이승헌", "date": "2099-11-18", "start_time": "15:00", "end_time": "16:00"},
+    {"title": "잡세미나 - 한요셉", "date": "2099-11-19", "start_time": "10:00", "end_time": "11:00"},
+    {"title": "잡세미나 - 김하늘", "date": "2099-11-19", "start_time": "13:00", "end_time": "14:00"},
+    {"title": "잡세미나 - 박바다", "date": "2099-11-20", "start_time": "10:00", "end_time": "11:00"},
+    {"title": "잡세미나 - 최구름", "date": "2099-11-20", "start_time": "15:00", "end_time": "16:00"},
+    {"title": "잡세미나 - 정하람", "date": "2099-11-21", "start_time": "11:00", "end_time": "12:00"},
+]
+NO_CALENDARS = "캘린더가 하나도 보이지 않아요. (테스트)"
+
+
+class FlakyWrites(CalendarWrites):
+    """Refuses ``fail_once`` titles the first time each (like the empty calendar list), then adds them."""
+
+    def __init__(self, fail_once=(), **kwargs):
+        super().__init__(**kwargs)
+        self.fail_once = set(fail_once)
+
+    def create_event(self, title, start, end, all_day, location=None, notes=None, calendar_name=None):
+        if title in self.fail_once:
+            self.fail_once.discard(title)
+            self.created.append(title)
+            self.calendars.append(calendar_name)
+            return {"ok": False, "id": None, "calendar": "", "error": NO_CALENDARS}
+        return super().create_event(title, start, end, all_day, location=location, notes=notes, calendar_name=calendar_name)
+
+
+def seminar_handler(tmp_path, channel=DM, thread_ts=ROOT, **kwargs):
+    titles = [e["title"] for e in SEMINARS]
+    app = FlakyWrites(fail_once=[t for t in titles if t != "잡세미나 - 한요셉"])
+    handler, client, run, app, store = proposal_handler(tmp_path, app=app, **kwargs)
+    key = store_category_proposal(store, "schedule", channel, thread_ts, events=SEMINARS, now=utcnow() - timedelta(hours=1))
+    return handler, client, run, app, store, key
+
+
+def test_a_partial_failure_says_so_and_keeps_only_the_failed_events_for_retry(tmp_path):
+    handler, client, run, app, store, key = seminar_handler(tmp_path)
+    original = store.pending_proposal(key, utcnow())
+    asyncio.run(handler.handle_event(dm("5", ts="1700000000.000300", thread_ts=ROOT), event_id="Ev1", source="dm"))
+    report, buttons = client.posts
+    assert report["text"].splitlines() == [
+        "⚠️ 6건 중 1건 추가, 5건은 추가하지 못했어요",
+        "❌ 2099/11/18(수) 15:00–16:00 잡세미나 - 이승헌",
+        "• 2099/11/19(목) 10:00–11:00 잡세미나 - 한요셉 · 캘린더: Event-KHU",
+        "❌ 2099/11/19(목) 13:00–14:00 잡세미나 - 김하늘",
+        "❌ 2099/11/20(금) 10:00–11:00 잡세미나 - 박바다",
+        "❌ 2099/11/20(금) 15:00–16:00 잡세미나 - 최구름",
+        "❌ 2099/11/21(토) 11:00–12:00 잡세미나 - 정하람",
+        f"추가하지 못한 이유: {NO_CALENDARS}",
+        "'다시'라고 답하시면 추가하지 못한 5건만 다시 시도할게요.",
+    ]
+    assert buttons["text"] == "추가하지 못한 5건을 다시 시도할까요?" and buttons["thread_ts"] == ROOT
+    [retry_button, cancel] = buttons["blocks"][1]["elements"]
+    assert retry_button["action_id"] == slack_bot.RETRY_ACTION and retry_button["style"] == "primary"
+    assert retry_button["text"]["text"] == "실패한 5건 다시 시도" and cancel["action_id"] == slack_bot.CANCEL_ACTION
+    retry = store.pending_proposal(key, utcnow())
+    assert retry["retry"] is True and retry["chosen_category"] == "Event-KHU" and retry["id"] != original["id"]
+    assert [e["title"] for e in retry["events"]] == [e["title"] for e in SEMINARS if e["title"] != "잡세미나 - 한요셉"]
+    assert retry["expires_at"] == original["expires_at"]  # the same 24 hours as the preview, not a new day
+    assert json.loads(retry_button["value"]) == {"proposal_id": retry["id"], "retry": True}
+
+
+@pytest.mark.parametrize("word", ["다시", "재시도", "다시 해줘", "다시!"])
+def test_dasi_retries_only_the_failed_events_in_the_same_category(tmp_path, word):
+    handler, client, run, app, store, key = seminar_handler(tmp_path)
+    asyncio.run(handler.handle_event(dm("5", ts="1700000000.000300", thread_ts=ROOT), event_id="Ev1", source="dm"))
+    first_round = list(app.created)
+    buttons_ts = client.posts[-1]["_ts"]
+    asyncio.run(handler.handle_event(dm(word, ts="1700000000.000400", thread_ts=ROOT), event_id="Ev2", source="dm"))
+    second_round = app.created[len(first_round):]
+    assert second_round == [e["title"] for e in SEMINARS if e["title"] != "잡세미나 - 한요셉"]  # never 한요셉 again
+    assert app.calendars[len(first_round):] == ["Event-KHU"] * 5 and run.calls == []
+    assert client.posts[-1]["text"].splitlines()[0] == "✅ 5건 모두 Event-KHU 캘린더에 추가했어요"
+    assert {"channel": DM, "ts": buttons_ts, "text": slack_bot.BUTTONS_ANSWERED_TEXT, "blocks": []} in client.updates
+    assert store.pending_proposal(key, utcnow()) is None and handler._button_messages == {}
+    # Nothing left: another "다시" is an ordinary message for the agent.
+    asyncio.run(handler.handle_event(dm("다시", ts="1700000000.000500", thread_ts=ROOT), event_id="Ev3", source="dm"))
+    assert [c["prompt"] for c in run.calls] == ["다시"] and len(app.created) == len(first_round) + 5
+
+
+def test_the_retry_button_retries_and_a_still_failing_event_waits_again(tmp_path):
+    handler, client, run, app, store, key = seminar_handler(tmp_path)
+    asyncio.run(handler.handle_event(dm("5", ts="1700000000.000300", thread_ts=ROOT), event_id="Ev1", source="dm"))
+    first = store.pending_proposal(key, utcnow())
+    app.fail_once = {"잡세미나 - 정하람"}  # still refused on the retry
+    buttons_ts = client.posts[-1]["_ts"]
+    asyncio.run(handler.handle_action(click({"proposal_id": first["id"], "retry": True}, message_ts=buttons_ts, action_id=slack_bot.RETRY_ACTION)))
+    result = client.updates[-1]
+    assert result["ts"] == buttons_ts and result["blocks"] == []
+    assert result["text"].splitlines()[0] == "⚠️ 5건 중 4건 추가, 1건은 추가하지 못했어요"
+    assert result["text"].splitlines()[-1] == "'다시'라고 답하시면 추가하지 못한 1건만 다시 시도할게요."
+    second = store.pending_proposal(key, utcnow())
+    assert [e["title"] for e in second["events"]] == ["잡세미나 - 정하람"] and second["expires_at"] == first["expires_at"]
+    assert client.posts[-1]["text"] == "추가하지 못한 1건을 다시 시도할까요?"
+    # The old button (and its proposal id) answers nothing any more.
+    asyncio.run(handler.handle_action(click({"proposal_id": first["id"], "retry": True}, message_ts=buttons_ts, action_id=slack_bot.RETRY_ACTION)))
+    assert client.ephemerals[-1]["text"] == slack_bot.STALE_ACTION_TEXT
+    assert app.created.count("잡세미나 - 한요셉") == 1 and app.created.count("잡세미나 - 이승헌") == 2
+
+
+def test_no_or_another_message_drops_the_retry(tmp_path):
+    handler, client, run, app, store, key = seminar_handler(tmp_path)
+    asyncio.run(handler.handle_event(dm("5", ts="1700000000.000300", thread_ts=ROOT), event_id="Ev1", source="dm"))
+    created = len(app.created)
+    asyncio.run(handler.handle_event(dm("아니요", ts="1700000000.000400", thread_ts=ROOT), event_id="Ev2", source="dm"))
+    assert client.posts[-1]["text"] == "취소했어요" and store.pending_proposal(key, utcnow()) is None
+    assert len(app.created) == created
+
+    (tmp_path / "b").mkdir()
+    handler, client, run, app, store, key = seminar_handler(tmp_path / "b")
+    asyncio.run(handler.handle_event(dm("5", ts="1700000000.000300", thread_ts=ROOT), event_id="Ev1", source="dm"))
+    created = len(app.created)
+    for answer in ("네", "1"):  # a category or "네" is not "다시"
+        asyncio.run(handler.handle_event(dm(answer, ts=f"1700000000.00040{len(run.calls)}", thread_ts=ROOT), event_id=f"Ev-{answer}", source="dm"))
+    assert [c["prompt"] for c in run.calls] == ["네", "1"] and len(app.created) == created
+    assert store.pending_proposal(key, utcnow()) is None
+
+
+def test_an_expired_preview_keeps_no_retry(tmp_path):
+    titles = [e["title"] for e in SEMINARS]
+    app = FlakyWrites(fail_once=titles[:2])
+    handler, client, run, app, store = proposal_handler(tmp_path, app=app)
+    key = store_category_proposal(store, "schedule", DM, ROOT, events=SEMINARS[:2])
+    proposal = store.pending_proposal(key, utcnow())
+    reply = event_proposals.settle_answer(
+        store, key, proposal, event_proposals.YES, create=handler.create_events, category="Event-KHU",
+        now=utcnow() + timedelta(hours=25),
+    )
+    assert reply.splitlines()[0] == "❌ 추가하지 못했어요" and "'다시'" not in reply
+    assert store.pending_proposal(key, utcnow() + timedelta(hours=25)) is None
+
+
+@pytest.mark.parametrize("where", ["channel_thread", "top_level"])
+def test_dasi_works_in_a_channel_thread_and_at_the_top_level_of_the_brief_channel(tmp_path, where):
+    if where == "top_level":
+        handler, client, run, app, store, key = seminar_handler(tmp_path, ROOM, slack_bot.TOP_LEVEL, brief_room=ROOM, clock=Clock())
+        say = lambda text, ts: room_mention(f"<@UBOT> {text}", ts=ts)  # noqa: E731
+    else:
+        handler, client, run, app, store, key = seminar_handler(tmp_path, CHANNEL, ROOT)
+        say = lambda text, ts: mention(f"<@UBOT> {text}", ts=ts, thread_ts=ROOT)  # noqa: E731
+    asyncio.run(handler.handle_event(say("Event-KHU", "1700000000.000300"), event_id="Ev1", source="mention"))
+    report, buttons = client.posts
+    assert report["text"].startswith("⚠️ 6건 중 1건 추가, 5건은 추가하지 못했어요")
+    assert buttons["text"] == "추가하지 못한 5건을 다시 시도할까요?"
+    if where == "top_level":
+        assert top_level(client.posts)
+        retry = store.pending_proposal(key, utcnow())
+        body = top_click({"proposal_id": retry["id"], "retry": True}, message_ts=buttons["_ts"])
+        body["actions"][0]["action_id"] = slack_bot.RETRY_ACTION
+        asyncio.run(handler.handle_action(body))
+        assert client.updates[-1]["text"].startswith("✅ 5건 모두 Event-KHU 캘린더에 추가했어요")
+    else:
+        assert all(p["thread_ts"] == ROOT for p in client.posts)
+        asyncio.run(handler.handle_event(say("다시", "1700000000.000400"), event_id="Ev2", source="mention"))
+        assert client.posts[-1]["text"].startswith("✅ 5건 모두 Event-KHU 캘린더에 추가했어요")
+    assert app.created.count("잡세미나 - 한요셉") == 1 and len(app.created) == 11 and run.calls == []
+    assert store.pending_proposal(key, utcnow()) is None
+
+
+def test_the_retry_buttons_payload_and_what_a_click_means():
+    retry = {"id": "r1", "retry": True, "events": [{}, {}], "categories": CATEGORY_ROWS, "chosen_category": "Event-KHU"}
+    text, blocks = slack_bot.category_blocks(retry)
+    assert text == "추가하지 못한 2건을 다시 시도할까요?"
+    assert [(b["action_id"], b["text"]["text"]) for b in blocks[1]["elements"]] == [
+        (slack_bot.RETRY_ACTION, "실패한 2건 다시 시도"), (slack_bot.CANCEL_ACTION, "취소")
+    ]
+    assert slack_bot.button_answer({"proposal_id": "r1", "retry": True}, retry) == event_proposals.Answer(event_proposals.YES)
+    assert slack_bot.button_answer({"proposal_id": "r1", "cancel": True}, retry) == event_proposals.Answer(event_proposals.NO)
+    # A category button never answers a retry, and a retry button never a preview.
+    assert slack_bot.button_answer({"proposal_id": "r1", "category": "Family"}, retry) is None
+    preview = {**retry, "retry": False}
+    assert slack_bot.button_answer({"proposal_id": "r1", "retry": True}, preview) is None
 
 
 @pytest.mark.parametrize("name", sorted(MANIFESTS))
@@ -3086,7 +3269,7 @@ def test_a_top_level_proposal_gets_buttons_and_a_click_creates_the_events(tmp_pa
     assert app.created == ["신임교수모임 (10월)", "신임교수모임 (11월)"] and app.calendars == ["Research", "Research"]
     result = client.updates[-1]
     assert result["ts"] == buttons["_ts"] and result["channel"] == ROOM and result["blocks"] == []
-    assert result["text"].startswith("✅ Research 캘린더에 추가했어요")
+    assert result["text"].startswith("✅ 2건 모두 Research 캘린더에 추가했어요")
     assert client.ephemerals == [] and len(client.posts) == 2 and store.pending_proposal(key, utcnow()) is None
     assert handler._button_messages == {} and handler._confirming == {} and handler._turns == {}
     # Clicking again creates nothing; the note only the clicker sees is not in a thread either.
@@ -3101,7 +3284,7 @@ def test_a_typed_answer_at_the_top_level_creates_the_events(tmp_path):
     buttons_ts = client.posts[-1]["_ts"]
     asyncio.run(handler.handle_event(room_mention("<@UBOT> 3", ts="1700000000.000300"), event_id="Ev2", source="mention"))
     assert len(run.calls) == 1 and app.calendars == ["Research", "Research"]  # code only, no second agent turn
-    assert client.posts[-1]["text"].startswith("✅ Research 캘린더에 추가했어요") and top_level(client.posts)
+    assert client.posts[-1]["text"].startswith("✅ 2건 모두 Research 캘린더에 추가했어요") and top_level(client.posts)
     assert {"channel": ROOM, "ts": buttons_ts, "text": slack_bot.BUTTONS_ANSWERED_TEXT, "blocks": []} in client.updates
     assert handler._button_messages == {}
     assert store.pending_proposal(slack_conversation_key("schedule", ROOM, slack_bot.TOP_LEVEL), utcnow()) is None

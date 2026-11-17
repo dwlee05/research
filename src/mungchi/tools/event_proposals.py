@@ -22,6 +22,11 @@ one bot (``slack_conversation_key``) or one terminal chat
 (``cli_conversation_key``). It is bound into each run's tool when the run's
 options are built, never global, so concurrent runs never share proposals.
 Proposals live in the state file (``StateStore``) and expire after 24 hours.
+
+The reply after creating says how it went (``creation_report``: all added,
+"6건 중 1건 추가, 5건은 추가하지 못했어요", or none). Events the Calendar app
+did not add wait under the same key as a retry (same category, same expiry):
+"다시" tries only those again, never the ones already added.
 """
 
 from __future__ import annotations
@@ -38,7 +43,7 @@ from typing import Any, Callable, Mapping, Sequence
 from .. import config
 from ..personas import PERSONAS
 from ..slack_format import WEEKDAYS_KO
-from ..state import StateStore, utcnow
+from ..state import PROPOSAL_TTL, StateStore, utcnow
 from . import macos_calendar
 from .common import safe_error, scrub
 
@@ -60,7 +65,15 @@ CONFIRM_QUESTION = "캘린더에 추가할까요? (네 / 아니요 / 고칠 내�
 CLI_CONFIRM_PROMPT = "캘린더에 추가할까요? [네/아니요] "
 CANCELLED_TEXT = "취소했어요"
 ADDED_HEADER = "✅ 캘린더에 추가했어요"
+# Nothing could even be tried (permission, mode): with the reason after a colon.
 NONE_ADDED_HEADER = "❌ 캘린더에 추가하지 못했어요"
+# Every event was tried and none went in.
+ALL_FAILED_HEADER = "❌ 추가하지 못했어요"
+# The last line of a report whose failed events wait for "다시".
+RETRY_HINT = "'다시'라고 답하시면 {n}건을 다시 시도할게요."
+RETRY_HINT_PARTIAL = "'다시'라고 답하시면 추가하지 못한 {n}건만 다시 시도할게요."
+RETRY_QUESTION = "추가하지 못한 {n}건을 다시 시도할까요? ('다시' / '아니요')"
+CLI_RETRY_PROMPT = "추가하지 못한 {n}건을 다시 시도할까요? [다시/아니요] "
 DEFAULT_CALENDAR_LABEL = "기본 캘린더"
 MAC_ONLY_TEXT = "Mac 캘린더 모드에서만 일정을 추가할 수 있어요."
 ICS_SOURCE_NOTE = (
@@ -123,6 +136,13 @@ NEGATIVE_REPLIES = frozenset(
     {
         "아니", "아니요", "아뇨", "취소", "됐어", "no", "n",
         "아니오", "취소해", "취소해줘", "취소해주세요", "됐어요",
+    }
+)
+# What tries the failed events of a confirmed proposal again (after ``normalize_reply``: no spaces).
+RETRY_REPLIES = frozenset(
+    {
+        "다시", "재시도", "다시해", "다시해줘", "다시해주세요", "다시시도", "다시시도해줘", "다시시도해주세요",
+        "재시도해줘", "재시도해주세요", "다시추가해줘", "다시추가해주세요", "다시넣어줘", "다시넣어주세요", "retry",
     }
 )
 _SKIN_TONE_CODE_RE = re.compile(r"::skin-tone-\d:")
@@ -227,7 +247,12 @@ def category_question(labels: Sequence[str], suggested: str | None = None, *, as
 
 
 def proposal_question(proposal: Mapping[str, Any]) -> str:
-    """The question a stored proposal waits on: the category question, or ``CONFIRM_QUESTION`` without categories."""
+    """The question a stored proposal waits on: the category question, or ``CONFIRM_QUESTION`` without categories.
+
+    A retry (the failed events of a confirmed proposal) waits on ``RETRY_QUESTION``.
+    """
+    if is_retry(proposal):
+        return RETRY_QUESTION.format(n=retry_count(proposal))
     labels = category_labels(proposal)
     if not labels:
         return CONFIRM_QUESTION
@@ -235,7 +260,9 @@ def proposal_question(proposal: Mapping[str, Any]) -> str:
 
 
 def cli_prompt(proposal: Mapping[str, Any]) -> str:
-    """The terminal chat's input prompt after a proposal (numbered categories, or ``[네/아니요]``)."""
+    """The terminal chat's input prompt after a proposal (numbered categories, or ``[네/아니요]``; ``[다시/아니요]`` for a retry)."""
+    if is_retry(proposal):
+        return CLI_RETRY_PROMPT.format(n=retry_count(proposal))
     labels = category_labels(proposal)
     if not labels:
         return CLI_CONFIRM_PROMPT
@@ -285,9 +312,18 @@ def parse_answer(text: Any, proposal: Mapping[str, Any]) -> Answer:
     the suggestion, "아니요" to cancel. A reply that fits several categories,
     a number out of range, or "네" without a suggestion gets ``CLARIFY``.
     Everything else is None (for the model).
+
+    A retry (``is_retry``: the failed events of a confirmed proposal) takes
+    only "다시" (``RETRY_REPLIES``: "재시도", "다시 해줘", …) for ``YES``, with
+    its own category kept, and "아니요" to drop it.
     """
-    categories = proposal_categories(proposal)
     kind = reply_kind(text)
+    if is_retry(proposal):
+        reply = normalize_reply(text)
+        if reply in RETRY_REPLIES:
+            return Answer(YES)
+        return Answer(NO) if kind == NO else Answer(None)
+    categories = proposal_categories(proposal)
     if not categories:
         return Answer(kind)
     labels = [str(c["label"]) for c in categories]
@@ -858,6 +894,9 @@ class CreationResult:
     error: str = ""
     # The category label the event went to (categories only).
     category: str = ""
+    # The stored event (``ProposedEvent.to_state``) when the Calendar app said it was not added:
+    # it can be tried again. None when it was added, skipped, or may have been added after all.
+    retry_event: dict[str, Any] | None = None
 
 
 @dataclass
@@ -870,6 +909,11 @@ class CreationOutcome:
     @property
     def created(self) -> int:
         return sum(1 for result in self.results if result.ok)
+
+    @property
+    def failed(self) -> list[CreationResult]:
+        """Events tried (or meant to be) that are not in the calendar; skipped ones (no time) are not failures."""
+        return [result for result in self.results if not result.ok and not result.skipped]
 
 
 def create_proposal_events(
@@ -920,8 +964,8 @@ def create_proposal_events(
     calendar_name = proposal.get("calendar") or None
     by_label = {str(c["label"]): str(c["calendar"]) for c in proposal_categories(proposal)}
     chosen = str(proposal.get("chosen_category") or "") or None
-    # In proposal order: a result already known, or (summary, label, what to create).
-    planned: list[CreationResult | tuple[str, str, dict[str, Any]]] = []
+    # In proposal order: a result already known, or (summary, label, what to create, the stored event).
+    planned: list[CreationResult | tuple[str, str, dict[str, Any], dict[str, Any]]] = []
     for event in events:
         if isinstance(event, CreationResult):
             planned.append(event)
@@ -946,28 +990,40 @@ def create_proposal_events(
             "notes": event.notes or None,
             "calendar_name": calendar_name,
         }
-        planned.append((summary, label, new_event))
+        planned.append((summary, label, new_event, event.to_state()))
     to_create = [item[2] for item in planned if isinstance(item, tuple)]
     created = iter(_create_all(adapter, to_create))
     for item in planned:
         if isinstance(item, CreationResult):
             outcome.results.append(item)
             continue
-        summary, label, new_event = item
-        result = next(created, None) or {"ok": False, "error": "결과를 받지 못했어요"}
+        summary, label, new_event, state = item
+        result = next(created, None) or {"ok": False, "error": "결과를 받지 못했어요", "uncertain": True}
         ok = bool(result.get("ok"))
         error = str(result.get("error") or ("" if ok else "알 수 없는 오류"))
         if not ok:  # the event's title stays out of the log, like every message text
             where = label or new_event.get("calendar_name") or DEFAULT_CALENDAR_LABEL
             log.warning("캘린더 일정 추가 실패 (%s): %s", where, scrub(error))
         outcome.results.append(
-            CreationResult(summary=summary, ok=ok, calendar=str(result.get("calendar") or ""), error=error, category=label)
+            CreationResult(
+                summary=summary,
+                ok=ok,
+                calendar=str(result.get("calendar") or ""),
+                error=error,
+                category=label,
+                # Only a clear "not added" may be tried again: never twice in the calendar.
+                retry_event=None if ok or result.get("uncertain") else state,
+            )
         )
     return outcome
 
 
 def _create_all(adapter: macos_calendar.CalendarAdapter, new_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """``create_event`` results for ``new_events``, in order: one batch (``create_events``) when the adapter has it."""
+    """``create_event`` results for ``new_events``, in order: one batch (``create_events``) when the adapter has it.
+
+    An adapter that raised (they should report per event) may have added some
+    events first, so those results are ``uncertain`` and never tried again.
+    """
     if not new_events:
         return []
     batch = getattr(adapter, "create_events", None)
@@ -975,40 +1031,143 @@ def _create_all(adapter: macos_calendar.CalendarAdapter, new_events: list[dict[s
         try:
             return list(batch(new_events))
         except Exception as exc:  # noqa: BLE001 - adapters report per event; this is the last line
-            return [{"ok": False, "error": safe_error(exc)} for _ in new_events]
+            return [{"ok": False, "error": safe_error(exc), "uncertain": True} for _ in new_events]
     results = []
     for new_event in new_events:
         try:
             results.append(adapter.create_event(**new_event))
         except Exception as exc:  # noqa: BLE001 - the other events still go in
-            results.append({"ok": False, "error": safe_error(exc)})
+            results.append({"ok": False, "error": safe_error(exc), "uncertain": True})
     return results
 
 
-def creation_report(outcome: CreationOutcome) -> str:
-    """Korean reply after the answer: ``✅ 캘린더에 추가했어요`` and one line per event (❌ for failures).
+def creation_report(outcome: CreationOutcome, retry: Mapping[str, Any] | None = None) -> str:
+    """Korean reply after the answer: a header that matches the outcome, then one line per event.
 
-    When every added event went to one category: ``✅ Event-KHU 캘린더에 추가했어요``
-    and the lines without the calendar.
+    Headers: ``✅ 6건 모두 Event-KHU 캘린더에 추가했어요`` (one event:
+    ``✅ Event-KHU 캘린더에 추가했어요``; without one category the lines name
+    the calendar), ``⚠️ 6건 중 1건 추가, 5건은 추가하지 못했어요`` (each added
+    line names its calendar) or ``❌ 추가하지 못했어요``. Failures sharing one
+    reason list it once at the end. With ``retry`` (the failed events kept for
+    "다시") the last line says how to try them again. Skipped events (no
+    time) are neither added nor failed.
     """
     if outcome.fatal:
         return f"{NONE_ADDED_HEADER}: {outcome.fatal}"
     added = [result for result in outcome.results if result.ok]
+    failed = outcome.failed
     labels = {result.category for result in added}
     single = labels.pop() if len(labels) == 1 and all(result.category for result in added) else ""
-    if not added:
-        lines = [NONE_ADDED_HEADER]
+    if added and failed:
+        header = f"⚠️ {len(added) + len(failed)}건 중 {len(added)}건 추가, {len(failed)}건은 추가하지 못했어요"
+        single = ""  # the header names no calendar, so every added line does
+    elif added:
+        where = f"{single} 캘린더에" if single else "캘린더에"
+        header = f"✅ {len(added)}건 모두 {where} 추가했어요" if len(added) > 1 else f"✅ {where} 추가했어요"
     else:
-        lines = [f"✅ {single} 캘린더에 추가했어요" if single else ADDED_HEADER]
+        header = ALL_FAILED_HEADER
+    reasons = {result.error for result in failed}
+    shared_reason = reasons.pop() if len(failed) > 1 and len(reasons) == 1 else ""
+    lines = [header]
     for result in outcome.results:
         if result.ok:
             where = "" if single else (result.category or result.calendar)
             lines.append(f"• {result.summary}" + (f" · 캘린더: {where}" if where else ""))
         elif result.skipped:
             lines.append(f"⏭️ {result.summary}: 시작 시각이 없어 추가하지 않았어요. 시각을 알려 주시면 다시 제안할게요.")
+        elif shared_reason:
+            lines.append(f"❌ {result.summary}")
         else:
             lines.append(f"❌ {result.summary} 추가 실패: {result.error}")
+    if shared_reason:
+        lines.append(f"추가하지 못한 이유: {shared_reason}")
+    count = len((retry or {}).get("events") or [])
+    if count:
+        lines.append(RETRY_HINT_PARTIAL.format(n=count) if added else RETRY_HINT.format(n=count))
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- "다시": the failed events of a confirmed proposal
+
+# Kept from the proposal when its failed events wait for "다시": where they go stays the same.
+_RETRY_FIELDS = ("calendar", "calendar_label", "categories", "suggested_category", "chosen_category", "source_excerpt")
+
+
+def is_retry(proposal: Mapping[str, Any] | None) -> bool:
+    """True for the failed events of a confirmed proposal, waiting for "다시"."""
+    return bool((proposal or {}).get("retry"))
+
+
+def retry_count(proposal: Mapping[str, Any] | None) -> int:
+    return len((proposal or {}).get("events") or [])
+
+
+def _aware(value: Any) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def retry_proposal(proposal: Mapping[str, Any], outcome: CreationOutcome, now: datetime) -> dict[str, Any] | None:
+    """The events the Calendar app did not add, as a new pending proposal for "다시"; None when there are none.
+
+    Only events with a clear "not added" (``CreationResult.retry_event``):
+    never one that was added, skipped (no time) or maybe added. Same category
+    (``chosen_category`` and the events' own) and calendar as the proposal,
+    and the proposal's own expiry (``expires_at``; 24 hours from ``now`` for
+    one that never was stored), so a retry never outlives the preview.
+    """
+    events = [dict(result.retry_event) for result in outcome.results if result.retry_event and not result.ok]
+    if outcome.fatal or not events:
+        return None
+    expires = _aware(proposal.get("expires_at")) or now + PROPOSAL_TTL
+    if expires <= now:
+        return None
+    retry = {name: proposal[name] for name in _RETRY_FIELDS if name in proposal}
+    retry.update({"id": secrets.token_hex(16), "retry": True, "events": events, "expires_at": expires.isoformat()})
+    return retry
+
+
+def keep_retry(store: StateStore, key: str, retry: Mapping[str, Any], now: datetime) -> bool:
+    """Store ``retry`` as the pending proposal of ``key`` until its ``expires_at``. False when it could not be."""
+    expires = _aware(retry.get("expires_at"))
+    if expires is None or expires <= now:
+        return False
+    try:
+        store.save_pending_proposal(key, dict(retry), now, ttl=expires - now)
+    except OSError as exc:
+        log.warning("추가하지 못한 일정을 다시 시도하도록 저장하지 못했습니다: %s", safe_error(exc))
+        return False
+    return True
+
+
+def apply_answer(
+    proposal: Mapping[str, Any],
+    kind: str,
+    *,
+    create: Callable[[Mapping[str, Any]], CreationOutcome] | None = None,
+    category: str | None = None,
+    now: datetime | None = None,
+) -> tuple[CreationOutcome | None, dict[str, Any] | None]:
+    """``(outcome, retry)`` for an answer to a proposal already taken out of the store.
+
+    Only ``YES`` creates anything (``outcome`` is None for a cancel), with
+    categories into ``category`` (the user's pick; events with their own
+    category keep it, a retry keeps its ``chosen_category``). ``retry``: the
+    failed events for "다시" (``retry_proposal``). Blocking: EventKit runs
+    here. Never raises.
+    """
+    if kind != YES:
+        return None, None
+    if category:
+        proposal = {**proposal, "chosen_category": category}
+    try:
+        outcome = (create or create_proposal_events)(proposal)
+    except Exception as exc:  # noqa: BLE001 - reported, never raised
+        outcome = CreationOutcome(fatal=f"오류가 났어요 ({safe_error(exc)})")
+    return outcome, retry_proposal(proposal, outcome, now or utcnow())
 
 
 def answer_text(
@@ -1018,21 +1177,35 @@ def answer_text(
     create: Callable[[Mapping[str, Any]], CreationOutcome] | None = None,
     category: str | None = None,
 ) -> str:
-    """The reply to an answer (``parse_answer``) for a proposal already taken out of the store.
+    """The reply to an answer (``parse_answer``) for a proposal already taken out of the store, keeping nothing for "다시".
 
-    Only ``YES`` creates anything, with categories into ``category`` (the
-    user's pick; events with their own category keep it). Blocking: EventKit
-    runs here. Never raises.
+    Blocking: EventKit runs here. Never raises.
     """
-    if kind != YES:
+    outcome, _retry = apply_answer(proposal, kind, create=create, category=category)
+    return CANCELLED_TEXT if outcome is None else creation_report(outcome)
+
+
+def settle_answer(
+    store: StateStore,
+    key: str,
+    proposal: Mapping[str, Any],
+    kind: str,
+    *,
+    create: Callable[[Mapping[str, Any]], CreationOutcome] | None = None,
+    category: str | None = None,
+    now: datetime | None = None,
+) -> str:
+    """Like ``answer_text``, and the events the Calendar app did not add wait under ``key`` for "다시".
+
+    The reply ends with how to try them again only when they were kept.
+    Blocking: EventKit runs here. Never raises (a failure to keep them is logged).
+    """
+    now = now or utcnow()
+    outcome, retry = apply_answer(proposal, kind, create=create, category=category, now=now)
+    if outcome is None:
         return CANCELLED_TEXT
-    if category:
-        proposal = {**proposal, "chosen_category": category}
-    try:
-        outcome = (create or create_proposal_events)(proposal)
-    except Exception as exc:  # noqa: BLE001 - reported, never raised
-        outcome = CreationOutcome(fatal=f"오류가 났어요 ({safe_error(exc)})")
-    return creation_report(outcome)
+    kept = retry is not None and keep_retry(store, key, retry, now)
+    return creation_report(outcome, retry if kept else None)
 
 
 def confirm_proposal(
@@ -1048,10 +1221,12 @@ def confirm_proposal(
     """Apply an answer to the pending proposal of ``key``; the reply text, or None if none is pending.
 
     The proposal is taken out of the store first (so it is never created
-    twice) and is gone afterwards whatever happens. With ``proposal_id`` only
-    that very proposal is taken. Blocking: EventKit runs here.
+    twice) and is gone afterwards whatever happens; only the events the
+    Calendar app did not add come back, as a retry for "다시". With
+    ``proposal_id`` only that very proposal is taken. Blocking: EventKit runs here.
     """
-    proposal = store.take_pending_proposal(key, now or utcnow(), proposal_id=proposal_id)
+    now = now or utcnow()
+    proposal = store.take_pending_proposal(key, now, proposal_id=proposal_id)
     if proposal is None:
         return None
-    return answer_text(proposal, kind, create=create, category=category)
+    return settle_answer(store, key, proposal, kind, create=create, category=category, now=now)

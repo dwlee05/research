@@ -592,39 +592,43 @@ async def confirm_in_terminal(
     the agent), "아니요" cancels, a reply that fits several categories is
     asked about again. Without categories: ``캘린더에 추가할까요? [네/아니요]``.
     Anything else cancels the proposal and is returned, to be sent to the
-    agent as the next message (e.g. "시간은 1시로 바꿔줘").
+    agent as the next message (e.g. "시간은 1시로 바꿔줘"). Events the
+    Calendar app did not add are asked about right away
+    (``추가하지 못한 5건을 다시 시도할까요? [다시/아니요]``): "다시" tries only those.
     Returns None when nothing more is to be sent, ``CHAT_EXIT`` on end of input.
     """
     pending = store.pending_proposal(conversation_key, (now or utcnow)())
-    if pending is None:
-        return None
-    while True:
-        try:
-            reply = (await asyncio.to_thread(input, event_proposals.cli_prompt(pending))).strip()
-        except EOFError:
-            print()
-            store.clear_pending_proposal(conversation_key)
-            return CHAT_EXIT
-        if not reply:
-            continue
-        answer = event_proposals.parse_answer(reply, pending)
-        if answer.kind != event_proposals.CLARIFY:
-            break
-        print(answer.message)
-    if answer.kind is None:
-        store.clear_pending_proposal(conversation_key)  # replaced by whatever the agent does next
-        return reply
-    result = await asyncio.to_thread(
-        event_proposals.confirm_proposal,
-        store,
-        conversation_key,
-        answer.kind,
-        now=(now or utcnow)(),
-        create=create,
-        category=answer.category,
-        proposal_id=pending.get("id"),
-    )
-    print(result or event_proposals.CANCELLED_TEXT)
+    while pending is not None:
+        while True:
+            try:
+                reply = (await asyncio.to_thread(input, event_proposals.cli_prompt(pending))).strip()
+            except EOFError:
+                print()
+                store.clear_pending_proposal(conversation_key)
+                return CHAT_EXIT
+            if not reply:
+                continue
+            answer = event_proposals.parse_answer(reply, pending)
+            if answer.kind != event_proposals.CLARIFY:
+                break
+            print(answer.message)
+        if answer.kind is None:
+            store.clear_pending_proposal(conversation_key)  # replaced by whatever the agent does next
+            return reply
+        result = await asyncio.to_thread(
+            event_proposals.confirm_proposal,
+            store,
+            conversation_key,
+            answer.kind,
+            now=(now or utcnow)(),
+            create=create,
+            category=answer.category,
+            proposal_id=pending.get("id"),
+        )
+        print(result or event_proposals.CANCELLED_TEXT)
+        pending = store.pending_proposal(conversation_key, (now or utcnow)())
+        if not event_proposals.is_retry(pending):
+            return None
     return None
 
 

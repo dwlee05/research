@@ -1458,6 +1458,39 @@ def test_chat_asks_again_for_an_unclear_category_and_cancels_on_no(chat, monkeyp
     assert created == [] and prompts == ["메모"]
 
 
+def test_chat_asks_to_retry_the_failed_events_right_away(monkeypatch, capsys, tmp_path):
+    store, key = StateStore(tmp_path / "state.json"), "cli:test"
+    ProposingSDKClient.store, ProposingSDKClient.key, ProposingSDKClient.propose_on = store, key, {"메모"}
+    FakeSDKClient.instances = []
+    monkeypatch.setattr(main_module, "ClaudeSDKClient", ProposingSDKClient)
+    feed, asked, attempts = iter(["메모", "네", "다시", "종료"]), [], []
+
+    def fake_input(prompt=""):
+        asked.append(prompt)
+        try:
+            return next(feed)
+        except StopIteration:
+            raise EOFError from None
+
+    def create(proposal):  # the Calendar app refuses the first time, takes it the second
+        attempts.append([event["title"] for event in proposal["events"]])
+        if len(attempts) == 1:
+            return CreationOutcome(results=[CreationResult(summary="10/22(목) 신임교수모임", error="캘린더가 하나도 보이지 않아요.", retry_event=proposal["events"][0])])
+        return CreationOutcome(results=[CreationResult(summary="10/22(목) 신임교수모임", ok=True, calendar="연구")])
+
+    monkeypatch.setattr("builtins.input", fake_input)
+    options = build_options(persona="schedule", conversation_key=key)
+    assert asyncio.run(run_chat(options, "schedule", conversation_key=key, store=store, create=create)) == 0
+    assert asked == ["\n나> ", QUESTION, "추가하지 못한 1건을 다시 시도할까요? [다시/아니요] ", "\n나> "]
+    assert len(attempts) == 2 and attempts[0] == attempts[1]
+    out = capsys.readouterr().out
+    assert "❌ 추가하지 못했어요\n❌ 10/22(목) 신임교수모임 추가 실패: 캘린더가 하나도 보이지 않아요.\n'다시'라고 답하시면 1건을 다시 시도할게요." in out
+    assert "✅ 캘린더에 추가했어요\n• 10/22(목) 신임교수모임 · 캘린더: 연구" in out
+    assert store.pending_proposal(key, utcnow()) is None
+    [client] = FakeSDKClient.instances[-1:]
+    assert [without_now_line(p) for p in client.prompts] == ["메모"]  # "네" and "다시" never reach the agent
+
+
 def test_chat_sends_anything_else_to_the_agent_with_categories(chat, monkeypatch):
     monkeypatch.setattr(main_module, "ClaudeSDKClient", CategoryProposingSDKClient)
     asked, created, store, prompts = chat(["메모", "1번은 Research로", "5", "종료"], {"메모", "1번은 Research로"})
