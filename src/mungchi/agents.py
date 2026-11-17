@@ -103,6 +103,41 @@ def with_now_line(prompt: str, now: datetime) -> str:
     return f"{now_line(now)}\n{prompt}"
 
 
+# ---------------------------------------------------------------- fresh schedules in continued conversations
+#
+# A resumed conversation (a Slack thread, or #비서실's channel conversation
+# within the hour) still holds earlier calendar results, and a model may
+# answer "이번 주 일정" from them instead of looking again (a stale "일정 없음").
+# The rule below is part of the constant system prompts; the reminder goes,
+# per turn and only on resumed sessions, in front of the user message (like
+# the time line), so the system prompts stay byte-identical.
+
+RESUMED_SCHEDULE_REMINDERS = {
+    SCHEDULE: "[이전 대화의 일정 정보는 오래됐을 수 있어요. 일정 관련 질문이면 도구로 다시 확인하세요]",
+    MUNGCHI: "[이전 대화의 일정 정보는 오래됐을 수 있어요. 일정 관련 질문이면 '일정' 에이전트에게 다시 맡기세요]",
+}
+
+_REMINDER_NOTE = "이어지는 대화에서는 사용자 메시지 앞에 [이전 대화의 일정 정보는 …] 줄이 붙을 수 있다. 이 줄은 답에 옮기지 않는다."
+
+# 일정 (direct and as 고뭉치's subagent).
+FRESH_SCHEDULE_RULE = (
+    "일정·약속·회의 시간처럼 일정에 관한 질문에는 이 대화에서 앞서 답한 적이 있어도 매번 get_schedule을 다시 불러 확인한다. "
+    "앞서 받은 도구 결과나 앞의 답(일정이 없다는 답 포함)을 다시 쓰지 않는다. 그사이 일정이 바뀌었을 수 있다. " + _REMINDER_NOTE
+)
+
+# 고뭉치, who delegates schedule questions to 일정.
+MUNGCHI_FRESH_SCHEDULE_RULE = (
+    "일정·약속·회의 시간처럼 일정에 관한 질문은 이 대화에서 앞서 답한 적이 있어도 매번 '일정' 에이전트에게 새로 맡긴다. "
+    "앞서 받은 보고나 앞의 답(일정이 없다는 답 포함)을 다시 쓰지 않는다. 그사이 일정이 바뀌었을 수 있다. " + _REMINDER_NOTE
+)
+
+
+def with_resume_reminder(prompt: str, persona: str) -> str:
+    """``prompt`` with ``persona``'s resumed-session reminder in front (고뭉치 and 일정; 업뎃 has no calendar)."""
+    reminder = RESUMED_SCHEDULE_REMINDERS.get(persona)
+    return f"{reminder}\n{prompt}" if reminder else prompt
+
+
 # ---------------------------------------------------------------- voices
 #
 # How each persona talks. Constant text like the rest of the system prompts
@@ -244,6 +279,7 @@ MUNGCHI_SYSTEM_PROMPT = """\
 
 ## 그 밖의 요청
 - Dropbox 업데이트(누가 어떤 파일을 고쳤는지)에 관한 질문은 업뎃에게, 일정에 관한 질문은 '일정' 에이전트에게만 맡긴다. 둘 다 필요하면 동시에 맡긴다.
+- {fresh_schedule}
 - 날씨만 묻는 질문은 위처럼 get_weather로 직접 답한다. 날씨 때문에 야외 일정이나 이동(출퇴근 등)이 달라질 수 있는지 묻는 질문(예: "내일 비 오면 일정 바꿔야 할까?")처럼 날씨와 일정이 함께 걸린 질문만 '일정' 에이전트에게 맡긴다. '일정' 에이전트도 오늘·내일 날씨만 안다.
 - 크레딧(토큰) 질문은 get_credits로 직접 답한다. 팀원에게 맡기지 않는다.
 - 데이터가 필요 없는 질문(사용법, 일반 대화)은 팀원에게 맡기지 말고 직접 짧게 답한다.
@@ -262,7 +298,11 @@ MUNGCHI_SYSTEM_PROMPT = """\
 ## 출력
 - 터미널에서 읽기 좋게 간결하게 쓴다. 표 대신 짧은 목록을 쓴다.
 """.format(
-    now_guidance=NOW_GUIDANCE, example_link=EXAMPLE_FOLDER_LINK, confirm=CONFIRM_QUESTION, voice=voice_section(MUNGCHI)
+    now_guidance=NOW_GUIDANCE,
+    example_link=EXAMPLE_FOLDER_LINK,
+    confirm=CONFIRM_QUESTION,
+    voice=voice_section(MUNGCHI),
+    fresh_schedule=MUNGCHI_FRESH_SCHEDULE_RULE,
 )
 
 
@@ -380,6 +420,7 @@ _SCHEDULE_BODY = """\
 2. 도구 결과에 있는 일정만 알린다. 일정이나 시간을 지어내지 않는다. {no_trivia}
 3. 시간은 결과의 timezone 기준 24시간제(HH:MM)로 쓴다.
 4. 날씨도 get_weather 결과에 있는 것만 알린다. ok: false이면 다시 시도하지 말고 error를 짧게 {to} 전한다. 오늘·내일 말고 다른 날의 날씨는 알 수 없다고 한다.
+5. {fresh_schedule}
 
 ## {form} 형식 (짧게)
 지금 / 바로 다음 일정: <now의 일정, 없으면 "진행 중인 일정 없음"> / <next_event의 시작 시각·제목·장소, 지금부터 남은 시간>
@@ -516,6 +557,7 @@ def build_schedule_prompt(*, direct: bool = False) -> str:
         **_FRAMING["direct" if direct else "subagent"],
         voice=voice_section(SCHEDULE) if direct else SUBAGENT_VOICE,
         no_trivia=NO_CALENDAR_TRIVIA,
+        fresh_schedule=FRESH_SCHEDULE_RULE,
     )
 
 

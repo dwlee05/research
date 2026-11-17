@@ -35,6 +35,7 @@ from .agents import (
     build_direct_prompt,
     build_system_prompt,
     with_now_line,
+    with_resume_reminder,
 )
 from .personas import DIRECT_PERSONAS, MUNGCHI, PERSONA_LABELS, PERSONAS, SCHEDULE, UPDATE, call_name, josa
 from .state import StateStore, utcnow
@@ -515,6 +516,10 @@ async def run_turn(
     ``images.prepare_image``, at most 5) go with the text as image content
     blocks; only 업뎃 and 일정 answering directly take them. An empty prompt
     with images asks for the events in them (``images.DEFAULT_IMAGE_PROMPT``).
+
+    A resumed session of 고뭉치 or 일정 also gets, in the same message under
+    the time line, a reminder that earlier schedule answers may be stale
+    (``agents.with_resume_reminder``); the system prompt stays the same.
     """
     if images:
         if persona not in DIRECT_PERSONAS:
@@ -522,6 +527,8 @@ async def run_turn(
         if len(images) > image_prep.MAX_IMAGES:
             raise ValueError(f"사진은 한 번에 {image_prep.MAX_IMAGES}장까지만 보낼 수 있습니다.")
         prompt = prompt.strip() or image_prep.DEFAULT_IMAGE_PROMPT
+    if resume:
+        prompt = with_resume_reminder(prompt, persona)
     options = build_options(
         resume=resume,
         extra_system_prompt=extra_system_prompt,

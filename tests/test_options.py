@@ -25,9 +25,12 @@ from mungchi import config
 from mungchi import main as main_module
 from mungchi.agents import (
     AGENT_LABELS,
+    FRESH_SCHEDULE_RULE,
+    MUNGCHI_FRESH_SCHEDULE_RULE,
     MUNGCHI_SYSTEM_PROMPT,
     NOW_GUIDANCE,
     PERSONA_TOOLS,
+    RESUMED_SCHEDULE_REMINDERS,
     TOOL_GATES,
     build_schedule_prompt,
     build_update_prompt,
@@ -277,7 +280,8 @@ def test_run_turn_resumes_reports_status_and_returns_answer(fake_sdk, capsys):
     assert not result.failed and result.error is None
     assert seen == ["→ 업뎃이에게 물어보는 중..."]
     [client] = fake_sdk.instances
-    assert [without_now_line(p) for p in client.prompts] == ["질문"]
+    # A resumed session: the schedule reminder under the time line, then the question.
+    assert [without_now_line(p) for p in client.prompts] == [f"{RESUMED_SCHEDULE_REMINDERS['mungchi']}\n질문"]
     opts = client.options
     assert opts.resume == "sess-0"
     assert opts.system_prompt.rstrip().endswith("## Slack 규칙")
@@ -841,7 +845,7 @@ def test_run_turn_puts_the_current_time_in_the_user_message(fake_sdk, monkeypatc
     asyncio.run(run_turn("이어서", resume="sess-final", clock=next_day, extra_system_prompt=SLACK_FORMAT_PROMPT))
     first, second = fake_sdk.instances
     assert first.prompts == ["[지금: 2026-10-06(화) 14:20 KST]\n최근 3일 업데이트 알려줘"]
-    assert second.prompts == ["[지금: 2026-10-07(수) 09:05 KST]\n이어서"]
+    assert second.prompts == [f"[지금: 2026-10-07(수) 09:05 KST]\n{RESUMED_SCHEDULE_REMINDERS['mungchi']}\n이어서"]
     # Same system prompt on both turns, so the cached prefix is reused.
     assert first.options.system_prompt == second.options.system_prompt
     assert "2026-10-0" not in first.options.system_prompt
@@ -852,6 +856,46 @@ def test_run_turn_puts_the_current_time_in_the_user_message(fake_sdk, monkeypatc
     for persona in ("update", "schedule"):
         asyncio.run(run_turn("내일 일정은?", persona=persona, clock=first_turn))
     assert [c.prompts for c in fake_sdk.instances] == [["[지금: 2026-10-06(화) 14:20 JST]\n내일 일정은?"]] * 2
+
+
+def test_schedule_questions_are_always_looked_up_again_by_rule(monkeypatch):
+    """A resumed conversation once answered "이번 주 일정" from old context, without the tool."""
+    direct, subagent = build_options(persona="schedule").system_prompt, build_options().agents[SCHEDULE].prompt
+    mungchi = build_options().system_prompt
+    for prompt in (direct, subagent):
+        assert FRESH_SCHEDULE_RULE in prompt
+    assert MUNGCHI_FRESH_SCHEDULE_RULE in mungchi and FRESH_SCHEDULE_RULE not in mungchi
+    assert "매번 get_schedule을 다시 불러 확인한다" in FRESH_SCHEDULE_RULE
+    assert "앞서 받은 도구 결과나 앞의 답(일정이 없다는 답 포함)을 다시 쓰지 않는다" in FRESH_SCHEDULE_RULE
+    assert "매번 '일정' 에이전트에게 새로 맡긴다" in MUNGCHI_FRESH_SCHEDULE_RULE
+    assert "이 줄은 답에 옮기지 않는다" in FRESH_SCHEDULE_RULE and "이 줄은 답에 옮기지 않는다" in MUNGCHI_FRESH_SCHEDULE_RULE
+    # 업뎃 has no calendar: neither the rule nor the reminder.
+    assert FRESH_SCHEDULE_RULE not in build_options(persona="update").system_prompt and "update" not in RESUMED_SCHEDULE_REMINDERS
+    # Byte-stable: built again (and for a resumed session) the system prompts are the same bytes.
+    for persona in ("mungchi", "schedule"):
+        fresh = build_options(persona=persona).system_prompt.encode("utf-8")
+        assert build_options(persona=persona, resume="sess-1").system_prompt.encode("utf-8") == fresh
+        assert not any(reminder in fresh.decode("utf-8") for reminder in RESUMED_SCHEDULE_REMINDERS.values())
+
+
+def test_the_stale_schedule_reminder_goes_only_in_front_of_resumed_turns(fake_sdk):
+    clock = lambda: datetime(2026, 10, 6, 5, 20, tzinfo=timezone.utc)  # noqa: E731 - 14:20 in Seoul
+    stamp = "[지금: 2026-10-06(화) 14:20 KST]"
+    for persona in ("schedule", "mungchi", "update"):
+        asyncio.run(run_turn("이번 주 일정 알려줘", persona=persona, clock=clock))
+        asyncio.run(run_turn("이번 주 일정 알려줘", persona=persona, clock=clock, resume="sess-1"))
+    prompts = [client.prompts for client in fake_sdk.instances]
+    assert prompts == [
+        [f"{stamp}\n이번 주 일정 알려줘"],
+        [f"{stamp}\n[이전 대화의 일정 정보는 오래됐을 수 있어요. 일정 관련 질문이면 도구로 다시 확인하세요]\n이번 주 일정 알려줘"],
+        [f"{stamp}\n이번 주 일정 알려줘"],
+        [f"{stamp}\n[이전 대화의 일정 정보는 오래됐을 수 있어요. 일정 관련 질문이면 '일정' 에이전트에게 다시 맡기세요]\n이번 주 일정 알려줘"],
+        [f"{stamp}\n이번 주 일정 알려줘"],
+        [f"{stamp}\n이번 주 일정 알려줘"],  # 업뎃: no reminder
+    ]
+    # Same system prompt with and without resume (the cached prefix is reused).
+    first, second = fake_sdk.instances[:2]
+    assert first.options.system_prompt == second.options.system_prompt and second.options.resume == "sess-1"
 
 
 def test_chat_loop_puts_the_current_time_in_every_message(fake_sdk, monkeypatch, capsys):
