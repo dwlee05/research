@@ -1,0 +1,2007 @@
+"""Adding calendar events from a pasted note, without macOS, network or a model.
+
+Normalization and the preview are pure. The propose tool and event creation
+run against a fake Calendar app adapter; the real EventKit adapter runs
+against fake EventKit / Foundation objects that answer the selectors PyObjC
+exposes (as far as they could be checked without a Mac).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import io
+import json
+import logging
+import threading
+import time as time_module
+import unicodedata
+from datetime import date, datetime, time, timedelta, timezone
+from types import SimpleNamespace
+from zoneinfo import ZoneInfo
+
+import pytest
+
+from mungchi import config
+from mungchi.calendar_setup import run_calendar_setup, write_target_lines
+from mungchi.state import StateStore
+from mungchi.tools import event_proposals, macos_calendar
+from mungchi.tools.event_proposals import (
+    CONFIRM_QUESTION,
+    NO,
+    YES,
+    CreationOutcome,
+    CreationResult,
+    ProposedEvent,
+    answer_text,
+    cli_conversation_key,
+    confirm_proposal,
+    create_proposal_events,
+    creation_report,
+    normalize_event,
+    normalize_events,
+    preview_text,
+    reply_kind,
+    resolve_event_date,
+    run_propose,
+    slack_conversation_key,
+)
+from mungchi.tools.macos_calendar import (
+    DENIED,
+    GRANTED,
+    NOT_DETERMINED,
+    RESTRICTED,
+    WRITE_ONLY,
+    EventKitCalendar,
+    duplicate_window,
+    resolve_write_calendar,
+    save_outcome,
+    similar_events,
+    titles_similar,
+)
+from mungchi.tools.calendar_tool import run_schedule
+from mungchi.tools.propose_tool import make_propose_calendar_events
+
+SEOUL = ZoneInfo("Asia/Seoul")
+# Wednesday 2026-10-07, 10:00 in Seoul.
+NOW = datetime(2026, 10, 7, 10, 0, tzinfo=SEOUL)
+TODAY = NOW.date()
+# The yes / no flow (no categories); the category tests use CAT_ENV.
+ENV = {"TIMEZONE": "Asia/Seoul", "CALENDAR_CATEGORIES": ""}
+KEY = slack_conversation_key("schedule", "D0123ABCD", "1700000000.000200")
+OTHER_KEY = slack_conversation_key("schedule", "D0123ABCD", "1700000000.000900")
+
+# The user's example note, as the model is told to extract it.
+NOTE = (
+    "문 결과, 가장 많은 교수님께서 참석 가능하신 날짜를 기준으로 10월과 11월 신임교수모임 일정을 아래와 같이 정하였습니다.\n\n"
+    "* 10월 모임: 10월 22일(목) 오후 12시\n발표: 홍길동 교수님"
+)
+EXAMPLE = {
+    "title": "신임교수모임 (10월)",
+    "date": "2026-10-22",
+    "start_time": "12:00",
+    "end_time": None,
+    "all_day": False,
+    "notes": "발표: 홍길동 교수님",
+    "weekday_in_text": "목",
+}
+EXAMPLE_LINE = "• 10/22(목) 12:00–13:00 신임교수모임 (10월) · 메모: 발표: 홍길동 교수님 · 캘린더: 연구"
+WRITABLE = [
+    {"name": "연구", "source": "iCloud", "is_default": True},
+    {"name": "Work", "source": "Exchange", "is_default": False},
+]
+
+
+def at(month: int, day: int, hour: int = 0, minute: int = 0, year: int = 2026) -> datetime:
+    return datetime(year, month, day, hour, minute, tzinfo=SEOUL)
+
+
+def norm(raw, now=NOW, minutes=60):
+    event, problems = normalize_event(raw, tz=SEOUL, now=now, default_minutes=minutes)
+    assert problems == [], problems
+    return event
+
+
+def record(title, start, end, calendar="연구", all_day=False):
+    return {"title": title, "start": start, "end": end, "all_day": all_day, "location": "", "calendar": calendar}
+
+
+class FakeCalendarApp:
+    """The Calendar app behind the adapter protocol: permission, writable calendars, events, writes."""
+
+    def __init__(self, status=GRANTED, writable=WRITABLE, existing=(), fail_titles=(), raise_titles=()):
+        self.status = status
+        self.writable = [dict(c) for c in writable]
+        self.existing = list(existing)
+        self.fail_titles = set(fail_titles)
+        self.raise_titles = set(raise_titles)
+        self.created: list[dict] = []
+        self.similar_calls: list[tuple] = []
+
+    def authorization_status(self):
+        return self.status
+
+    def list_writable_calendars(self, required=()):
+        return [dict(c) for c in self.writable]
+
+    def fetch_events(self, start, end, names=None):
+        return [dict(r) for r in self.existing if r["start"] < end and r["end"] > start]
+
+    def find_similar_events(self, start, end, title):
+        self.similar_calls.append((start, end, title))
+        window_start, window_end = duplicate_window(start, end)
+        return similar_events(self.fetch_events(window_start, window_end), start, end, title)
+
+    def create_event(self, title, start, end, all_day, location=None, notes=None, calendar_name=None):
+        self.created.append(
+            {
+                "title": title,
+                "start": start,
+                "end": end,
+                "all_day": all_day,
+                "location": location,
+                "notes": notes,
+                "calendar_name": calendar_name,
+            }
+        )
+        if title in self.raise_titles:
+            raise RuntimeError("objc.error: boom")
+        if title in self.fail_titles:
+            return {"ok": False, "id": None, "calendar": "", "error": "캘린더에 저장하지 못했어요 (읽기 전용 캘린더)"}
+        return {"ok": True, "id": f"EV-{len(self.created)}", "calendar": calendar_name or "연구", "error": None}
+
+
+def propose(app, events, key=KEY, store=None, env=None, now=NOW, platform="darwin", **args):
+    store = store or StateStore(config.get_state_path())
+    payload = run_propose(
+        {"events": events, "source_note": NOTE, **args},
+        key,
+        env={**ENV, **(env or {})},
+        now=now,
+        store=store,
+        adapter_factory=lambda tz: app,
+        platform=platform,
+    )
+    return payload, store
+
+
+def creator(app, env=None):
+    return lambda proposal: create_proposal_events(
+        proposal, env={**ENV, **(env or {})}, now=NOW, adapter_factory=lambda tz: app, platform="darwin"
+    )
+
+
+# ---------------------------------------------------------------- pure normalization
+
+
+def test_the_example_note_becomes_thursday_october_22_noon_to_one():
+    event = norm(EXAMPLE)
+    assert event.title == "신임교수모임 (10월)"
+    assert (event.start, event.end) == (at(10, 22, 12), at(10, 22, 13))
+    assert event.day == date(2026, 10, 22) and event.to_payload()["weekday"] == "목"
+    assert event.notes == "발표: 홍길동 교수님" and event.location == ""
+    assert event.end_defaulted and not event.needs_time and not event.all_day
+    assert event.warnings == []  # (목) matches, not past, not midnight
+    assert preview_text([event], "연구", TODAY) == EXAMPLE_LINE
+
+
+def test_default_duration_and_explicit_end():
+    assert norm({**EXAMPLE, "end_time": "14:30"}).end == at(10, 22, 14, 30)
+    ninety = norm(EXAMPLE, minutes=90)
+    assert ninety.end == at(10, 22, 13, 30) and ninety.end_defaulted
+    # The end before the start: the default length, with a warning instead of a guess.
+    backwards = norm({**EXAMPLE, "end_time": "11:00"})
+    assert backwards.end == at(10, 22, 13) and "끝 시각(11:00)이 시작(12:00)보다 빨라서" in backwards.warnings[0]
+    # DEFAULT_EVENT_MINUTES: whole minutes from 5 to 1440, anything else is the default.
+    assert config.get_default_event_minutes({}) == 60
+    assert config.get_default_event_minutes({"DEFAULT_EVENT_MINUTES": "90"}) == 90
+    for bad in ("abc", "0", "-30", "2000", "1.5"):
+        assert config.get_default_event_minutes({"DEFAULT_EVENT_MINUTES": bad}) == 60
+
+
+def test_all_day_events_span_the_whole_day():
+    event = norm({"title": "학과 체육대회", "date": "2026-10-23", "all_day": True, "start_time": None})
+    assert (event.start, event.end) == (at(10, 23), at(10, 24)) and event.all_day
+    assert preview_text([event], "연구", TODAY) == "• 10/23(금) 종일 학과 체육대회 · 캘린더: 연구"
+
+
+def test_a_missing_start_time_is_flagged_never_guessed():
+    event = norm({"title": "세미나", "date": "2026-10-28", "start_time": None, "end_time": None})
+    assert event.needs_time and event.start is None and event.end is None
+    assert event.warnings == [event_proposals.NEEDS_TIME_WARNING]
+    assert preview_text([event], "연구", TODAY).splitlines() == [
+        "• 10/28(수) 시간 미정 세미나 · 캘린더: 연구",
+        f"  ⚠️ {event_proposals.NEEDS_TIME_WARNING}",
+    ]
+
+
+def test_a_weekday_that_does_not_match_the_date_is_warned_about():
+    event = norm({**EXAMPLE, "date": "2026-10-21"})  # a Wednesday
+    assert event.warnings == ["요일 불일치: 본문은 (목)인데 날짜는 수요일"]
+    # "(목)", "목요일" and no weekday at all are understood too.
+    assert norm({**EXAMPLE, "date": "2026-10-21", "weekday_in_text": "(목)"}).warnings == event.warnings
+    assert norm({**EXAMPLE, "date": "2026-10-21", "weekday_in_text": "목요일"}).warnings == event.warnings
+    assert norm({**EXAMPLE, "weekday_in_text": None}).warnings == []
+
+
+def test_past_dates_and_times_are_warned_about():
+    past = norm({**EXAMPLE, "date": "2026-10-01", "weekday_in_text": None})
+    assert past.warnings == ["지난 날짜예요: 10/01(목). 연도나 날짜가 맞는지 확인해 주세요."]
+    earlier_today = norm({**EXAMPLE, "date": "2026-10-07", "start_time": "09:00", "weekday_in_text": None})
+    assert earlier_today.warnings == ["이미 지난 시각이에요: 오늘 09:00."]
+    later_today = norm({**EXAMPLE, "date": "2026-10-07", "start_time": "15:00", "weekday_in_text": None})
+    assert later_today.warnings == []
+    assert norm({"title": "x", "date": "2026-10-07", "all_day": True}).warnings == []  # today, all day
+
+
+def test_midnight_is_flagged_for_a_possible_am_12():
+    event = norm({**EXAMPLE, "start_time": "00:00", "date": "2026-10-23", "weekday_in_text": None})
+    assert event.warnings == [event_proposals.MIDNIGHT_WARNING]
+    assert "'오전 12시'" in event_proposals.MIDNIGHT_WARNING
+
+
+def test_more_than_ten_events_are_rejected():
+    events, problems = normalize_events([EXAMPLE] * 11, tz=SEOUL, now=NOW)
+    assert events == [] and problems == ["한 번에 10개까지만 제안할 수 있어요(받은 일정 11개). 나눠서 제안하세요."]
+    events, problems = normalize_events([EXAMPLE] * 10, tz=SEOUL, now=NOW)
+    assert len(events) == 10 and problems == []
+    for empty in ([], None, "x"):
+        assert normalize_events(empty, tz=SEOUL, now=NOW) == ([], ["events에 일정을 하나 이상 넣으세요."])
+
+
+def test_unreadable_input_rejects_the_whole_proposal():
+    bad = [EXAMPLE, {"title": "", "date": "10월 22일", "start_time": "오후 12시"}, "not an event"]
+    events, problems = normalize_events(bad, tz=SEOUL, now=NOW)
+    assert events == []
+    assert problems[0] == "2번 일정: 제목(title)이 없어요."
+    assert problems[1] == "2번 일정: 날짜(date) 값을 읽지 못했어요: '10월 22일'. YYYY-MM-DD로 적으세요."
+    assert problems[2] == "2번 일정: start_time 값을 읽지 못했어요: '오후 12시'. 24시간제 HH:MM으로 적으세요(없으면 null)."
+    assert problems[3].startswith("3번 일정:")
+
+
+def test_the_year_rule_uses_the_injected_clock():
+    assert resolve_event_date("2026-10-22", TODAY) == date(2026, 10, 22)
+    assert resolve_event_date("10-22", TODAY) == date(2026, 10, 22)
+    assert resolve_event_date("10/7", TODAY) == date(2026, 10, 7)  # today counts
+    assert resolve_event_date("01-05", TODAY) == date(2027, 1, 5)  # already past this year
+    assert resolve_event_date("10-06", TODAY) == date(2027, 10, 6)
+    assert resolve_event_date("02-29", TODAY) == date(2028, 2, 29)
+    assert resolve_event_date("01-05", date(2026, 1, 2)) == date(2026, 1, 5)
+    for bad in ("", "22일", "13-01", "2026-02-30"):
+        with pytest.raises(ValueError):
+            resolve_event_date(bad, TODAY)
+    # Through the normalizer, and the preview names a year that is not this one.
+    january = norm({"title": "신년회", "date": "1-5", "start_time": "18:00"})
+    assert january.start == at(1, 5, 18, year=2027)
+    assert preview_text([january], "연구", TODAY) == "• 2027/01/05(화) 18:00–19:00 신년회 · 캘린더: 연구"
+
+
+def test_preview_lines_carry_location_notes_and_warnings():
+    event = norm(
+        {
+            **EXAMPLE,
+            "date": "2026-10-21",
+            "location": "  본관 302호 ",
+            "notes": "발표: 홍길동 교수님\n\n  준비물: 노트북  ",
+        }
+    )
+    assert event.notes == "발표: 홍길동 교수님\n준비물: 노트북"  # lines kept, blanks dropped
+    lines = preview_text([event], "연구", TODAY, ["전체 안내"]).splitlines()
+    assert lines == [
+        "• 10/21(수) 12:00–13:00 신임교수모임 (10월) · 장소: 본관 302호 · 메모: 발표: 홍길동 교수님 / 준비물: 노트북 · 캘린더: 연구",
+        "  ⚠️ 요일 불일치: 본문은 (목)인데 날짜는 수요일",
+        "⚠️ 전체 안내",
+    ]
+    late = norm({"title": "야간 실험", "date": "2026-10-22", "start_time": "23:30"})
+    assert preview_text([late], "", TODAY) == "• 10/22(목) 23:30–10/23 00:30 야간 실험"
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["네", "예", "응", "ㅇㅇ", "좋아", "추가해", "추가해줘", "추가해 줘", "등록해", "등록해줘", "넣어줘", "ok", "OK", "Okay",
+     "yes", "Y", "👍", "👍🏻", ":+1:", ":+1::skin-tone-2:", "네!", " 네. ", "넵", "추가해 주세요"],
+)
+def test_affirmative_replies(text):
+    assert reply_kind(text) == YES
+
+
+@pytest.mark.parametrize("text", ["아니", "아니요", "아뇨", "취소", "됐어", "no", "N", "아니오", "취소해 줘"])
+def test_negative_replies(text):
+    assert reply_kind(text) == NO
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["", "시간은 1시로 바꿔줘", "네 근데 시간은 1시로", "네, 그리고 11월 것도", "아니 1시야", "응응응응응응응응응응응응응",
+     "추가해줘 연구 캘린더에", "좋아요 근데", "nope", "yess"],
+)
+def test_anything_else_is_not_an_answer(text):
+    assert reply_kind(text) is None
+
+
+def test_conversation_keys():
+    assert slack_conversation_key("update", "C1", "1.0") == "slack:update:C1:1.0"
+    assert slack_conversation_key("update", "C1", "1.0") != slack_conversation_key("schedule", "C1", "1.0")
+    with pytest.raises(ValueError):
+        slack_conversation_key("nobody", "C1", "1.0")
+    first, second = cli_conversation_key(), cli_conversation_key()
+    assert first.startswith("cli:") and first != second
+
+
+# ---------------------------------------------------------------- pending proposals in the state file
+
+
+def test_pending_proposals_persist_expire_and_are_taken_once(tmp_path):
+    path = tmp_path / "state.json"
+    store = StateStore(path)
+    store.mark_brief_date("2026-10-07")
+    stored = store.save_pending_proposal(KEY, {"id": "p1", "events": []}, NOW)
+    assert stored["expires_at"] == (NOW + timedelta(hours=24)).astimezone(timezone.utc).isoformat()
+    reopened = StateStore(path)  # e.g. after a bot restart
+    assert reopened.pending_proposal(KEY, NOW + timedelta(hours=23))["id"] == "p1"
+    assert reopened.pending_proposal(KEY, NOW + timedelta(hours=24)) is None  # expired
+    assert reopened.pending_proposal(OTHER_KEY, NOW) is None
+    assert reopened.last_brief_date() == "2026-10-07"  # other keys untouched
+    assert reopened.take_pending_proposal(KEY, NOW)["id"] == "p1"
+    assert reopened.take_pending_proposal(KEY, NOW) is None  # never twice
+    store.save_pending_proposal(KEY, {"id": "p2", "events": []}, NOW)
+    assert store.take_pending_proposal(KEY, NOW + timedelta(days=2)) is None  # expired: nothing to take
+    assert store.pending_proposal(KEY, NOW) is None  # and it is gone
+    store.save_pending_proposal(KEY, {"id": "p3", "events": []}, NOW)
+    assert store.clear_pending_proposal(KEY) is True and store.clear_pending_proposal(KEY) is False
+
+
+def test_pending_proposals_are_capped_and_tolerate_junk(tmp_path, monkeypatch):
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"pending_events": {"a": "junk", "b": {"events": []}, "c": [1]}}), encoding="utf-8")
+    store = StateStore(path)
+    assert store.pending_proposal("b", NOW) is None  # no expiry: ignored
+    monkeypatch.setattr("mungchi.state.MAX_PENDING_PROPOSALS", 3)
+    for i in range(5):
+        store.save_pending_proposal(f"k{i}", {"id": str(i), "events": []}, NOW + timedelta(minutes=i))
+    assert list(store.load()["pending_events"]) == ["k2", "k3", "k4"]
+    # An old proposal is dropped when a newer one is saved after it expired.
+    store.save_pending_proposal("late", {"id": "late", "events": []}, NOW + timedelta(days=2))
+    assert list(store.load()["pending_events"]) == ["late"]
+
+
+# ---------------------------------------------------------------- the propose tool's work
+
+
+def test_propose_stores_the_proposal_under_the_bound_key_and_returns_a_preview():
+    app = FakeCalendarApp()
+    payload, store = propose(app, [EXAMPLE])
+    assert payload["ok"] is True and payload["can_confirm"] is True
+    assert payload["calendar"] == "연구"  # the default calendar
+    assert payload["preview"] == EXAMPLE_LINE
+    assert payload["confirm_question"] == CONFIRM_QUESTION == "캘린더에 추가할까요? (네 / 아니요 / 고칠 내용)"
+    assert payload["warnings"] == [] and payload["needs_time"] == 0
+    [event] = payload["events"]
+    assert event == {
+        "title": "신임교수모임 (10월)",
+        "date": "2026-10-22",
+        "weekday": "목",
+        "start_time": "12:00",
+        "end_time": "13:00",
+        "all_day": False,
+        "location": "",
+        "notes": "발표: 홍길동 교수님",
+        "needs_time": False,
+        "end_defaulted": True,
+        "warnings": [],
+    }
+    pending = store.pending_proposal(KEY, NOW)
+    assert pending["calendar"] == "연구" and pending["calendar_label"] == "연구"
+    assert pending["events"] == [
+        {
+            "title": "신임교수모임 (10월)",
+            "date": "2026-10-22",
+            "start": "2026-10-22T12:00:00+09:00",
+            "end": "2026-10-22T13:00:00+09:00",
+            "all_day": False,
+            "location": "",
+            "notes": "발표: 홍길동 교수님",
+            "needs_time": False,
+        }
+    ]
+    assert pending["source_excerpt"].startswith("문 결과")
+    assert store.pending_proposal(OTHER_KEY, NOW) is None
+    assert app.created == []  # proposing never creates anything
+
+
+def test_a_new_proposal_replaces_the_old_one_and_a_failed_one_leaves_none():
+    app = FakeCalendarApp()
+    _, store = propose(app, [EXAMPLE])
+    first = store.pending_proposal(KEY, NOW)["id"]
+    propose(app, [{**EXAMPLE, "start_time": "13:00"}], store=store)
+    second = store.pending_proposal(KEY, NOW)
+    assert second["id"] != first and second["events"][0]["start"] == "2026-10-22T13:00:00+09:00"
+    payload, _ = propose(app, [{**EXAMPLE, "date": "언젠가"}], store=store)
+    assert payload["ok"] is False and payload["errors"] and store.pending_proposal(KEY, NOW) is None
+
+
+def test_two_runs_with_different_keys_never_collide():
+    app = FakeCalendarApp()
+    _, store = propose(app, [EXAMPLE], key=KEY)
+    propose(app, [{**EXAMPLE, "title": "11월 모임", "date": "2026-11-19"}], key=OTHER_KEY, store=store)
+    assert store.pending_proposal(KEY, NOW)["events"][0]["title"] == "신임교수모임 (10월)"
+    assert store.pending_proposal(OTHER_KEY, NOW)["events"][0]["title"] == "11월 모임"
+    assert store.take_pending_proposal(KEY, NOW) is not None
+    assert store.pending_proposal(OTHER_KEY, NOW) is not None
+
+
+def test_concurrent_tool_runs_keep_their_own_keys(monkeypatch):
+    """Two runs' tools in one process (two Slack threads), called at the same time."""
+    app = FakeCalendarApp()
+    monkeypatch.setenv("CALENDAR_CATEGORIES", "")
+    monkeypatch.setattr(config, "current_platform", lambda: "darwin")
+    monkeypatch.setattr(macos_calendar, "default_adapter", lambda tz: app)
+    monkeypatch.setattr(event_proposals, "utcnow", lambda: NOW)
+    first, second = make_propose_calendar_events(KEY), make_propose_calendar_events(OTHER_KEY)
+
+    async def both():
+        return await asyncio.gather(
+            first.handler({"events": [EXAMPLE], "source_note": NOTE}),
+            second.handler({"events": [{**EXAMPLE, "title": "다른 스레드"}], "source_note": "x"}),
+        )
+
+    results = asyncio.run(both())
+    payloads = [json.loads(r["content"][0]["text"]) for r in results]
+    assert all(p["ok"] and p["can_confirm"] for p in payloads)
+    store = StateStore(config.get_state_path())
+    assert store.pending_proposal(KEY, NOW)["events"][0]["title"] == "신임교수모임 (10월)"
+    assert store.pending_proposal(OTHER_KEY, NOW)["events"][0]["title"] == "다른 스레드"
+
+
+def test_without_a_key_the_preview_is_shown_but_nothing_is_stored(tmp_path):
+    app = FakeCalendarApp()
+    store = StateStore(tmp_path / "s.json")
+    payload, _ = propose(app, [EXAMPLE], key=None, store=store)
+    assert payload["ok"] is True and payload["can_confirm"] is False
+    assert "confirm_question" not in payload and payload["note"] == event_proposals.ONE_SHOT_NOTE
+    assert "대화 모드" in payload["note"] and "Slack" in payload["note"]
+    assert payload["preview"] == EXAMPLE_LINE
+    assert store.load() == {}
+
+
+def test_proposals_need_mac_calendar_mode():
+    app = FakeCalendarApp()
+    ics, store = propose(app, [EXAMPLE], env={"CALENDAR_ICS_URLS": "https://example.com/a.ics"})
+    assert ics["ok"] is False and ics["error"].startswith("Mac 캘린더 모드에서만 일정을 추가할 수 있어요.")
+    assert "CALENDAR_ICS_URLS" in ics["error"]
+    off_mac, _ = propose(app, [EXAMPLE], platform="linux", store=store)
+    assert off_mac["ok"] is False and off_mac["error"].startswith("Mac 캘린더 모드에서만 일정을 추가할 수 있어요.")
+    assert store.pending_proposal(KEY, NOW) is None
+
+    def missing(tz):
+        raise macos_calendar.EventKitUnavailable("no pyobjc")
+
+    payload = run_propose({"events": [EXAMPLE]}, KEY, env=ENV, now=NOW, store=store, adapter_factory=missing, platform="darwin")
+    assert payload["ok"] is False and "pip install -e ." in payload["error"]
+
+
+@pytest.mark.parametrize("status", [DENIED, RESTRICTED, NOT_DETERMINED])
+def test_proposals_without_write_permission_explain_the_fix(status):
+    payload, store = propose(FakeCalendarApp(status=status), [EXAMPLE])
+    assert payload["ok"] is False and store.pending_proposal(KEY, NOW) is None
+    if status == NOT_DETERMINED:
+        assert "--calendar-setup" in payload["error"]
+    else:
+        assert macos_calendar.SETTINGS_PATH in payload["error"] and "'전체 접근'" in payload["error"]
+
+
+def test_write_only_permission_proposes_without_the_duplicate_check():
+    app = FakeCalendarApp(status=WRITE_ONLY, existing=[record("신임교수모임", at(10, 22, 12), at(10, 22, 13))])
+    payload, _ = propose(app, [EXAMPLE])
+    assert payload["ok"] and payload["calendar"] == "기본 캘린더" and app.similar_calls == []
+    assert payload["warnings"] == [event_proposals.WRITE_ONLY_NOTE]
+    assert payload["preview"].endswith(f"⚠️ {event_proposals.WRITE_ONLY_NOTE}")
+    chosen, _ = propose(app, [EXAMPLE], env={"CALENDAR_WRITE_TARGET": "연구"})
+    assert chosen["ok"] is False and chosen["error"] == event_proposals.WRITE_ONLY_CHOICE_TEXT
+
+
+def test_choosing_the_calendar():
+    app = FakeCalendarApp()
+    target, _ = propose(app, [EXAMPLE], env={"CALENDAR_WRITE_TARGET": " work "})
+    assert target["calendar"] == "Work" and "· 캘린더: Work" in target["preview"]
+    asked, store = propose(app, [EXAMPLE], env={"CALENDAR_WRITE_TARGET": "Work"}, calendar=unicodedata.normalize("NFD", "연구"))
+    assert asked["calendar"] == "연구" and store.pending_proposal(KEY, NOW)["calendar"] == "연구"
+    unknown, store = propose(app, [EXAMPLE], env={"CALENDAR_WRITE_TARGET": "가족"})
+    assert unknown["ok"] is False and store.pending_proposal(KEY, NOW) is None
+    assert unknown["error"] == (
+        "CALENDAR_WRITE_TARGET의 '가족' 캘린더가 없거나 일정을 추가할 수 없는 캘린더예요. "
+        "일정을 추가할 수 있는 캘린더: 연구, Work"
+    )
+    no_default = FakeCalendarApp(writable=[{"name": "연구", "source": "iCloud", "is_default": False}])
+    payload, store = propose(no_default, [EXAMPLE])
+    assert payload["calendar"] == "기본 캘린더" and store.pending_proposal(KEY, NOW)["calendar"] is None
+
+
+def test_likely_duplicates_are_warned_about():
+    existing = [
+        record("신임교수모임", at(10, 22, 12), at(10, 22, 13)),  # same title word, same day
+        record("학과 회의", at(10, 22, 12), at(10, 22, 13), calendar="Work"),  # exact same time
+        record("점심 약속", at(10, 22, 11), at(10, 22, 12)),  # unrelated
+        record("신임교수모임 (11월)", at(11, 19, 12), at(11, 19, 13)),  # another day
+    ]
+    payload, _ = propose(FakeCalendarApp(existing=existing), [EXAMPLE])
+    assert payload["events"][0]["warnings"] == [
+        "비슷한 일정이 이미 있어요: 10/22(목) 12:00–13:00 신임교수모임 (연구)",
+        "비슷한 일정이 이미 있어요: 10/22(목) 12:00–13:00 학과 회의 (Work)",
+    ]
+    assert payload["warnings"][0] == "1번 신임교수모임 (10월): 비슷한 일정이 이미 있어요: 10/22(목) 12:00–13:00 신임교수모임 (연구)"
+    assert "  ⚠️ 비슷한 일정이 이미 있어요: 10/22(목) 12:00–13:00 학과 회의 (Work)" in payload["preview"]
+
+
+def test_a_failing_duplicate_check_never_blocks_the_proposal():
+    class Broken(FakeCalendarApp):
+        def find_similar_events(self, start, end, title):
+            raise RuntimeError("EKErrorDomain 1")
+
+    payload, store = propose(Broken(), [EXAMPLE])
+    assert payload["ok"] and store.pending_proposal(KEY, NOW) is not None
+    assert "이미 있는 일정과 겹치는지 확인하지 못했어요" in payload["events"][0]["warnings"][0]
+
+
+def test_the_tool_result_is_json_and_reports_errors_in_korean(monkeypatch):
+    monkeypatch.setattr(event_proposals, "run_propose", lambda args, key: (_ for _ in ()).throw(RuntimeError("boom")))
+    result = asyncio.run(make_propose_calendar_events("k").handler({"events": []}))
+    data = json.loads(result["content"][0]["text"])
+    assert data == {"ok": False, "error": "일정을 제안하지 못했어요: RuntimeError: boom"}
+
+
+# ---------------------------------------------------------------- creating (code only, after "네")
+
+
+def stored_proposal(app, events, **kwargs):
+    _, store = propose(app, events, **kwargs)
+    return store, store.pending_proposal(KEY, NOW)
+
+
+def test_creating_a_confirmed_proposal_calls_the_adapter_per_event():
+    app = FakeCalendarApp()
+    store, proposal = stored_proposal(app, [EXAMPLE, {**EXAMPLE, "title": "신임교수모임 (11월)", "date": "2026-11-19"}])
+    outcome = create_proposal_events(proposal, env=ENV, now=NOW, adapter_factory=lambda tz: app, platform="darwin")
+    assert [c["title"] for c in app.created] == ["신임교수모임 (10월)", "신임교수모임 (11월)"]
+    assert app.created[0] == {
+        "title": "신임교수모임 (10월)",
+        "start": at(10, 22, 12),
+        "end": at(10, 22, 13),
+        "all_day": False,
+        "location": None,
+        "notes": "발표: 홍길동 교수님",
+        "calendar_name": "연구",
+    }
+    assert outcome.created == 2 and not outcome.fatal
+    assert creation_report(outcome) == (
+        "✅ 2건 모두 캘린더에 추가했어요\n"
+        "• 10/22(목) 12:00–13:00 신임교수모임 (10월) · 캘린더: 연구\n"
+        "• 11/19(목) 12:00–13:00 신임교수모임 (11월) · 캘린더: 연구"
+    )
+
+
+def test_partial_failures_skipped_items_and_crashes_are_reported_per_event():
+    app = FakeCalendarApp(fail_titles={"실패할 일정"}, raise_titles={"터질 일정"})
+    events = [
+        EXAMPLE,
+        {"title": "실패할 일정", "date": "2026-10-23", "start_time": "10:00"},
+        {"title": "시간 모름", "date": "2026-10-24", "start_time": None},
+        {"title": "터질 일정", "date": "2026-10-25", "all_day": True},
+    ]
+    _, proposal = stored_proposal(app, events)
+    report = creation_report(create_proposal_events(proposal, env=ENV, now=NOW, adapter_factory=lambda tz: app, platform="darwin"))
+    assert [c["title"] for c in app.created] == ["신임교수모임 (10월)", "실패할 일정", "터질 일정"]  # never the one without a time
+    assert report.splitlines() == [
+        "⚠️ 3건 중 1건 추가, 2건은 추가하지 못했어요",
+        "• 10/22(목) 12:00–13:00 신임교수모임 (10월) · 캘린더: 연구",
+        "❌ 10/23(금) 10:00–11:00 실패할 일정 추가 실패: 캘린더에 저장하지 못했어요 (읽기 전용 캘린더)",
+        "⏭️ 10/24(토) 시간 미정 시간 모름: 시작 시각이 없어 추가하지 않았어요. 시각을 알려 주시면 다시 제안할게요.",
+        "❌ 10/25(일) 종일 터질 일정 추가 실패: RuntimeError: objc.error: boom",
+    ]
+    assert app.created[2]["all_day"] is True and app.created[2]["end"] - app.created[2]["start"] == timedelta(days=1)
+
+
+def test_nothing_is_created_without_mac_mode_or_permission():
+    app = FakeCalendarApp()
+    _, proposal = stored_proposal(app, [EXAMPLE])
+    ics = create_proposal_events(proposal, env={**ENV, "CALENDAR_SOURCE": "ics", "CALENDAR_ICS_URLS": "https://x/a.ics"}, adapter_factory=lambda tz: app, platform="darwin")
+    assert ics.fatal.startswith("Mac 캘린더 모드에서만") and app.created == []
+    assert creation_report(ics).startswith("❌ 캘린더에 추가하지 못했어요: Mac 캘린더 모드에서만 일정을 추가할 수 있어요.")
+    app.status = DENIED
+    denied = create_proposal_events(proposal, env=ENV, adapter_factory=lambda tz: app, platform="darwin")
+    assert macos_calendar.SETTINGS_PATH in denied.fatal and app.created == []
+    app.status = WRITE_ONLY
+    assert create_proposal_events(proposal, env=ENV, adapter_factory=lambda tz: app, platform="darwin").created == 1
+
+
+def test_a_stored_proposal_that_cannot_be_read_back_is_reported():
+    app = FakeCalendarApp()
+    proposal = {"calendar": None, "events": [{"title": "x", "date": "nope"}, {**ProposedEvent(
+        title="좋은 일정", day=date(2026, 10, 22), start=at(10, 22, 9), end=at(10, 22, 10)).to_state()}]}
+    report = creation_report(create_proposal_events(proposal, env=ENV, now=NOW, adapter_factory=lambda tz: app, platform="darwin"))
+    lines = report.splitlines()
+    assert lines[0] == "⚠️ 2건 중 1건 추가, 1건은 추가하지 못했어요"
+    assert lines[1].startswith("❌ 1번 일정 추가 실패: 저장된 제안을 읽지 못했어요")
+    assert lines[2] == "• 10/22(목) 09:00–10:00 좋은 일정 · 캘린더: 연구"
+
+
+def test_answers_take_the_proposal_exactly_once(tmp_path):
+    app = FakeCalendarApp()
+    store, _ = stored_proposal(app, [EXAMPLE], store=StateStore(tmp_path / "s.json"))
+    assert confirm_proposal(store, KEY, NO, now=NOW, create=creator(app)) == "취소했어요"
+    assert app.created == [] and store.pending_proposal(KEY, NOW) is None
+    assert confirm_proposal(store, KEY, YES, now=NOW, create=creator(app)) is None  # nothing pending any more
+    propose(app, [EXAMPLE], store=store)
+    assert confirm_proposal(store, KEY, YES, now=NOW, create=creator(app)).startswith("✅ 캘린더에 추가했어요")
+    assert len(app.created) == 1 and store.pending_proposal(KEY, NOW) is None
+    # A crash while creating is a short note, never raised.
+    boom = answer_text({"events": []}, YES, create=lambda p: (_ for _ in ()).throw(RuntimeError("down")))
+    assert boom == "❌ 캘린더에 추가하지 못했어요: 오류가 났어요 (RuntimeError: down)"
+
+
+def test_report_when_nothing_could_be_added():
+    outcome = CreationOutcome(results=[CreationResult(summary="10/22(목) 종일 x", error="거부됨")])
+    assert creation_report(outcome) == "❌ 추가하지 못했어요\n❌ 10/22(목) 종일 x 추가 실패: 거부됨"
+
+
+def ok(summary, category="Event-KHU", calendar="Event-KHU"):
+    return CreationResult(summary=summary, ok=True, category=category, calendar=calendar)
+
+
+def failed(summary, error=macos_calendar.NO_CALENDARS_VISIBLE_TEXT, category="Event-KHU"):
+    return CreationResult(summary=summary, error=error, category=category, retry_event={"title": summary})
+
+
+def test_the_report_header_matches_the_outcome():
+    six = [f"11/{18 + i // 2}({'수목금토'[i // 2]}) {10 + i}:00–{11 + i}:00 세미나 {i}" for i in range(6)]
+    all_ok = creation_report(CreationOutcome(results=[ok(s) for s in six]))
+    assert all_ok.splitlines() == ["✅ 6건 모두 Event-KHU 캘린더에 추가했어요", *(f"• {s}" for s in six)]
+    one = creation_report(CreationOutcome(results=[ok(six[0])]))
+    assert one == f"✅ Event-KHU 캘린더에 추가했어요\n• {six[0]}"
+    mixed = creation_report(CreationOutcome(results=[ok(six[0]), ok(six[1], "Research", "Research")]))
+    assert mixed.splitlines()[0] == "✅ 2건 모두 캘린더에 추가했어요" and mixed.endswith("· 캘린더: Research")
+
+    partial = CreationOutcome(results=[failed(six[0]), ok(six[1]), *(failed(s) for s in six[2:])])
+    lines = creation_report(partial).splitlines()
+    assert lines == [
+        "⚠️ 6건 중 1건 추가, 5건은 추가하지 못했어요",
+        f"❌ {six[0]}",
+        f"• {six[1]} · 캘린더: Event-KHU",  # the header names no calendar, so the line does
+        *(f"❌ {s}" for s in six[2:]),
+        f"추가하지 못한 이유: {macos_calendar.NO_CALENDARS_VISIBLE_TEXT}",  # one shared reason, once
+    ]
+    # Different reasons stay on their own lines; skipped events are neither added nor failed.
+    varied = CreationOutcome(results=[
+        ok(six[0]), failed(six[1], "읽기 전용"), failed(six[2], "거부됨"), CreationResult(summary=six[3], skipped=True),
+    ])
+    assert creation_report(varied).splitlines()[:4] == [
+        "⚠️ 3건 중 1건 추가, 2건은 추가하지 못했어요",
+        f"• {six[0]} · 캘린더: Event-KHU",
+        f"❌ {six[1]} 추가 실패: 읽기 전용",
+        f"❌ {six[2]} 추가 실패: 거부됨",
+    ]
+    none = creation_report(CreationOutcome(results=[failed(s) for s in six[:3]]))
+    assert none.splitlines() == [
+        "❌ 추가하지 못했어요", *(f"❌ {s}" for s in six[:3]), f"추가하지 못한 이유: {macos_calendar.NO_CALENDARS_VISIBLE_TEXT}"
+    ]
+
+
+def test_the_report_ends_with_the_retry_hint_only_when_failures_were_kept():
+    partial = CreationOutcome(results=[ok("a"), failed("b"), failed("c")])
+    retry = {"events": [{"title": "b"}, {"title": "c"}]}
+    assert creation_report(partial, retry).splitlines()[-1] == "'다시'라고 답하시면 추가하지 못한 2건만 다시 시도할게요."
+    assert "'다시'" not in creation_report(partial)
+    none = CreationOutcome(results=[failed("b")])
+    assert creation_report(none, {"events": [{}]}).splitlines()[-1] == "'다시'라고 답하시면 1건을 다시 시도할게요."
+
+
+def test_only_clear_failures_are_kept_for_retry_with_the_same_category_and_expiry():
+    expires = NOW + timedelta(hours=5)
+    proposal = {
+        "id": "p1", "calendar": None, "calendar_label": "", "categories": [{"label": "Event-KHU", "calendar": "Event-KHU"}],
+        "suggested_category": "Research", "chosen_category": "Event-KHU", "source_excerpt": "메모", "expires_at": expires.isoformat(),
+        "events": [{"title": "x"}],
+    }
+    outcome = CreationOutcome(results=[
+        ok("added"), failed("refused"), CreationResult(summary="maybe", error="boom"),  # no retry_event: maybe added
+        CreationResult(summary="no time", skipped=True),
+    ])
+    retry = event_proposals.retry_proposal(proposal, outcome, NOW)
+    assert retry["events"] == [{"title": "refused"}] and retry["retry"] is True and retry["id"] != "p1"
+    assert retry["chosen_category"] == "Event-KHU" and retry["categories"] == proposal["categories"]
+    assert retry["expires_at"] == expires.isoformat() and retry["source_excerpt"] == "메모"
+    assert event_proposals.retry_proposal(proposal, CreationOutcome(results=[ok("a")]), NOW) is None
+    assert event_proposals.retry_proposal(proposal, CreationOutcome(fatal="권한"), NOW) is None
+    assert event_proposals.retry_proposal(proposal, outcome, expires) is None  # the preview has expired
+    # Never stored before (a test or a one-off): 24 hours from now.
+    fresh = event_proposals.retry_proposal({"events": []}, outcome, NOW)
+    assert fresh["expires_at"] == (NOW + timedelta(hours=24)).isoformat()
+
+
+def test_a_crashing_adapter_may_have_added_events_so_they_are_never_retried():
+    app = FakeCalendarApp(fail_titles={"실패할 일정"}, raise_titles={"터질 일정"})
+    events = [{"title": "실패할 일정", "date": "2026-10-23", "start_time": "10:00"}, {"title": "터질 일정", "date": "2026-10-25", "all_day": True}]
+    _, proposal = stored_proposal(app, events)
+    outcome = create_proposal_events(proposal, env=ENV, now=NOW, adapter_factory=lambda tz: app, platform="darwin")
+    assert [r.retry_event is not None for r in outcome.results] == [True, False]
+    assert [e["title"] for e in event_proposals.retry_proposal(proposal, outcome, NOW)["events"]] == ["실패할 일정"]
+
+    class Crashing(FakeCalendarApp):
+        def create_events(self, new_events):
+            raise RuntimeError("halfway")
+
+    crashing = Crashing()
+    outcome = create_proposal_events(proposal, env=ENV, now=NOW, adapter_factory=lambda tz: crashing, platform="darwin")
+    assert [r.ok for r in outcome.results] == [False, False] and all(r.retry_event is None for r in outcome.results)
+
+
+def test_confirm_keeps_the_failures_and_dasi_creates_only_those(tmp_path):
+    app = FakeCalendarApp(fail_titles={"실패할 일정"})
+    events = [EXAMPLE, {"title": "실패할 일정", "date": "2026-10-23", "start_time": "10:00"}]
+    store, _ = stored_proposal(app, events, store=StateStore(tmp_path / "s.json"))
+    first = store.pending_proposal(KEY, NOW)
+    reply = confirm_proposal(store, KEY, YES, now=NOW, create=creator(app))
+    assert reply.splitlines()[0] == "⚠️ 2건 중 1건 추가, 1건은 추가하지 못했어요"
+    assert reply.splitlines()[-1] == "'다시'라고 답하시면 추가하지 못한 1건만 다시 시도할게요."
+    retry = store.pending_proposal(KEY, NOW)
+    assert event_proposals.is_retry(retry) and retry["expires_at"] == first["expires_at"] and retry["calendar"] == "연구"
+    assert event_proposals.proposal_question(retry) == "추가하지 못한 1건을 다시 시도할까요? ('다시' / '아니요')"
+    assert event_proposals.cli_prompt(retry) == "추가하지 못한 1건을 다시 시도할까요? [다시/아니요] "
+    # The Calendar app takes it this time: only that event is created again, into the same calendar.
+    app.fail_titles.clear()
+    answer = parse_answer("다시", retry)
+    assert answer == Answer(YES)
+    assert confirm_proposal(store, KEY, answer.kind, now=NOW, create=creator(app)) == (
+        "✅ 캘린더에 추가했어요\n• 10/23(금) 10:00–11:00 실패할 일정 · 캘린더: 연구"
+    )
+    assert [(c["title"], c["calendar_name"]) for c in app.created] == [
+        ("신임교수모임 (10월)", "연구"), ("실패할 일정", "연구"), ("실패할 일정", "연구")
+    ]
+    assert store.pending_proposal(KEY, NOW) is None
+
+
+@pytest.mark.parametrize("text", ["다시", "재시도", "다시 해줘", "다시해 주세요", "다시 시도", "재시도해주세요", "Retry", "다시!"])
+def test_retry_words_answer_only_a_retry(text):
+    retry = {"retry": True, "events": [{}], "categories": [{"label": "Research", "calendar": "Research"}], "chosen_category": "Research"}
+    assert parse_answer(text, retry) == Answer(YES)  # the category was chosen already
+    assert parse_answer(text, {"events": [{}], "calendar": None}).kind is None  # not an answer to a preview
+    assert parse_answer(text, {**retry, "retry": False}).kind is None
+
+
+def test_a_retry_takes_no_yes_or_category_but_no_cancels():
+    retry = {"retry": True, "events": [{}], "categories": [{"label": "Research", "calendar": "Research"}], "chosen_category": "Research"}
+    for text in ("네", "1", "Research", "다시 하고 시간은 1시로"):
+        assert parse_answer(text, retry).kind is None
+    assert parse_answer("아니요", retry) == Answer(NO)
+
+
+# ---------------------------------------------------------------- pure adapter helpers
+
+
+def test_resolve_write_calendar():
+    nfd = unicodedata.normalize("NFD", "연구")
+    writable = [{"name": nfd, "is_default": False}, {"name": "Work", "is_default": True}]
+    assert resolve_write_calendar(writable, "연구") == (nfd, None)  # NFC, as the Calendar app writes it
+    assert resolve_write_calendar(writable, " WORK ") == ("Work", None)
+    assert resolve_write_calendar(writable, None, "연구") == (nfd, None)
+    assert resolve_write_calendar(writable, "work", "연구") == ("Work", None)  # the request wins
+    assert resolve_write_calendar(writable, None, "") == ("Work", None)  # the default
+    assert resolve_write_calendar([{"name": "A", "is_default": False}], None) == (None, None)  # the store's default
+    name, error = resolve_write_calendar(writable, "생일")
+    assert name is None and error.startswith("'생일' 캘린더가 없거나 일정을 추가할 수 없는 캘린더예요.")
+    assert resolve_write_calendar([], "x")[1].endswith("일정을 추가할 수 있는 캘린더: (없음)")
+
+
+def test_title_similarity():
+    assert titles_similar("신임교수모임 (10월)", "신임교수모임")
+    assert titles_similar("신임교수 모임", "신임교수모임 (10월)")  # spaces ignored
+    assert titles_similar("Lab Meeting", "lab meeting (weekly)")
+    assert titles_similar(unicodedata.normalize("NFD", "논문 심사"), "박사 논문 심사")
+    assert not titles_similar("학과 회의", "연구 회의")  # only a generic word in common
+    assert not titles_similar("10월 모임", "11월 모임")
+    assert not titles_similar("점심", "저녁")
+    assert not titles_similar("", "신임교수모임")
+
+
+def test_duplicate_window_and_similar_events():
+    assert duplicate_window(at(10, 22, 12), at(10, 22, 13)) == (at(10, 22, 10), at(10, 22, 15))
+    assert duplicate_window(at(10, 22, 1), at(10, 22, 23)) == (at(10, 22), at(10, 23))  # never another day
+    records = [
+        record("신임교수모임", at(10, 22, 14, 30), at(10, 22, 15, 30)),  # inside the window
+        record("신임교수모임", at(10, 22, 16), at(10, 22, 17)),  # outside
+        record("다른 일", at(10, 22, 12), at(10, 22, 13)),  # exact same time
+        record("종일 행사", at(10, 22), at(10, 23), all_day=True),  # all-day: never by time alone
+        record("신임교수모임 리마인더", at(10, 22, 11), at(10, 22, 11)),  # zero length, inside
+    ]
+    found = similar_events(records, at(10, 22, 12), at(10, 22, 13), "신임교수모임 (10월)")
+    assert [(r["title"], r["start"].hour) for r in found] == [("신임교수모임", 14), ("다른 일", 12), ("신임교수모임 리마인더", 11)]
+
+
+def test_save_outcome_accepts_tuples_and_bools():
+    error = SimpleNamespace(localizedDescription=lambda: "The calendar is read only.")
+    assert save_outcome((True, None)) == (True, None)
+    assert save_outcome((False, error)) == (False, error)
+    assert save_outcome([1]) == (True, None)
+    assert save_outcome(True) == (True, None) and save_outcome(0) == (False, None)
+    assert save_outcome(()) == (False, None)
+    assert macos_calendar.error_text(error) == "The calendar is read only."
+    assert macos_calendar.error_text("plain\ntext") == "plain text" and macos_calendar.error_text(None) == ""
+
+
+# ---------------------------------------------------------------- the real adapter, on fake EventKit objects
+
+
+class NSDate:
+    def __init__(self, ts):
+        self.ts = ts
+
+    @classmethod
+    def dateWithTimeIntervalSince1970_(cls, ts):
+        return cls(ts)
+
+    def timeIntervalSince1970(self):
+        return self.ts
+
+
+class Source:
+    def __init__(self, title):
+        self._title = title
+
+    def title(self):
+        return self._title
+
+
+class Calendar:
+    def __init__(self, title, source="iCloud", writable=True, ident=None):
+        self._title, self._source, self._writable, self._ident = title, Source(source), writable, ident or f"id-{title}"
+
+    def title(self):
+        return self._title
+
+    def source(self):
+        return self._source
+
+    def allowsContentModifications(self):
+        return self._writable
+
+    def calendarIdentifier(self):
+        return self._ident
+
+
+class World:
+    """``empty_reads``: how many calendar list reads come back empty (the intermittent bug on the user's Mac)."""
+
+    def __init__(self, status=3, save_result=(True, None), empty_reads=0):
+        self.status = status
+        self.save_result = save_result
+        self.empty_reads = empty_reads
+        self.calendars: list = []
+        self.default = None
+        self.events: list = []  # existing EKEvents for find_similar_events
+        self.built: list = []
+        self.saves: list = []
+        self.predicates: list = []
+        self.stores: list = []
+        self.resets: list = []
+        self.calendar_reads = 0
+        self.sleeps: list = []  # the waits between retries (never really slept)
+        # Concurrency check: EventKit calls running at the same time (must never exceed 1).
+        self.pause = 0.0
+        self.busy = 0
+        self.max_busy = 0
+        self.guard = threading.Lock()
+
+    @contextlib.contextmanager
+    def call(self):
+        with self.guard:
+            self.busy += 1
+            self.max_busy = max(self.max_busy, self.busy)
+        try:
+            if self.pause:
+                time_module.sleep(self.pause)
+            yield
+        finally:
+            with self.guard:
+                self.busy -= 1
+
+
+class ExistingEvent:
+    def __init__(self, title, start, end, calendar, all_day=False):
+        self._title, self._calendar, self._all_day = title, calendar, all_day
+        self._start, self._end = NSDate(start.timestamp()), NSDate(end.timestamp())
+
+    def title(self):
+        return self._title
+
+    def startDate(self):
+        return self._start
+
+    def endDate(self):
+        return self._end
+
+    def isAllDay(self):
+        return self._all_day
+
+    def location(self):
+        return None
+
+    def calendar(self):
+        return self._calendar
+
+    def status(self):
+        return 1
+
+
+def fake_eventkit(world: World) -> SimpleNamespace:
+    class EKEvent:
+        def __init__(self, store):
+            self.store = store
+            self.fields: dict = {}
+
+        @classmethod
+        def eventWithEventStore_(cls, store):
+            event = cls(store)
+            world.built.append(event)
+            return event
+
+        def setTitle_(self, value):
+            self.fields["title"] = value
+
+        def setStartDate_(self, value):
+            self.fields["start"] = value.ts
+
+        def setEndDate_(self, value):
+            self.fields["end"] = value.ts
+
+        def setAllDay_(self, value):
+            self.fields["all_day"] = value
+
+        def setLocation_(self, value):
+            self.fields["location"] = value
+
+        def setNotes_(self, value):
+            self.fields["notes"] = value
+
+        def setCalendar_(self, value):
+            if value.title() == "터지는 캘린더":
+                raise TypeError("depythonifying 'id'")
+            self.fields["calendar"] = value
+
+        def eventIdentifier(self):
+            return f"EV-{len(world.saves)}"
+
+    class EKEventStore:
+        @classmethod
+        def alloc(cls):
+            return cls()
+
+        def init(self):
+            world.stores.append(self)
+            return self
+
+        def reset(self):
+            world.resets.append(self)
+
+        @classmethod
+        def authorizationStatusForEntityType_(cls, entity_type):
+            return world.status
+
+        def calendarsForEntityType_(self, entity_type):
+            with world.call():
+                world.calendar_reads += 1
+                if world.empty_reads > 0:
+                    world.empty_reads -= 1
+                    return []
+                return list(world.calendars) if world.status == 3 else []
+
+        def defaultCalendarForNewEvents(self):
+            return world.default
+
+        def saveEvent_span_commit_error_(self, event, span, commit, error):
+            assert event.store is self  # EventKit only saves an event through the store that made it
+            with world.call():
+                world.saves.append((event, span, commit, error))
+                return world.save_result
+
+        def predicateForEventsWithStartDate_endDate_calendars_(self, start, end, calendars):
+            return (start, end, calendars)
+
+        def eventsMatchingPredicate_(self, predicate):
+            with world.call():
+                world.predicates.append(predicate)
+                start, end, calendars = predicate
+                return [
+                    e for e in world.events
+                    if (calendars is None or e.calendar() in calendars)
+                    and e.startDate().ts < end.ts and e.endDate().ts > start.ts
+                ]
+
+    return SimpleNamespace(
+        EKEventStore=EKEventStore,
+        EKEvent=EKEvent,
+        EKEntityTypeEvent=0,
+        EKSpanThisEvent=0,
+        EKAuthorizationStatusNotDetermined=0,
+        EKAuthorizationStatusRestricted=1,
+        EKAuthorizationStatusDenied=2,
+        EKAuthorizationStatusFullAccess=3,
+        EKAuthorizationStatusWriteOnly=4,
+        EKEventStatusCanceled=3,
+    )
+
+
+def adapter(world, env=None, shared=None, sleep=None):
+    """The real adapter on fake EventKit (a new fake module, so a new store holder, unless ``shared`` is given)."""
+    eventkit = shared.eventkit if shared is not None else fake_eventkit(world)
+    return EventKitCalendar(
+        SEOUL,
+        eventkit=eventkit,
+        foundation=SimpleNamespace(NSDate=NSDate),
+        local_tz=SEOUL,
+        env=env or {},
+        shared=shared,
+        sleep=sleep or world.sleeps.append,
+    )
+
+
+def calendars_world(**kwargs):
+    world = World(**kwargs)
+    research, work, holidays = Calendar("연구"), Calendar("Work", "Exchange"), Calendar("대한민국 공휴일", "구독", writable=False)
+    world.calendars = [research, work, holidays]
+    world.default = research
+    return world, research, work
+
+
+def test_writable_calendars_and_the_default():
+    world, research, work = calendars_world()
+    assert adapter(world).list_writable_calendars() == [
+        {"name": "연구", "source": "iCloud", "is_default": True},
+        {"name": "Work", "source": "Exchange", "is_default": False},
+    ]
+    world.default = None
+    assert all(not c["is_default"] for c in adapter(world).list_writable_calendars())
+    world.status = 4  # write-only: no calendars to list
+    assert adapter(world).list_writable_calendars() == []
+
+
+def test_create_event_sets_every_field_and_saves_once():
+    world, research, work = calendars_world()
+    result = adapter(world).create_event(
+        "신임교수모임 (10월)", at(10, 22, 12), at(10, 22, 13), False, location="본관 302호", notes="발표: 홍길동 교수님"
+    )
+    assert result == {"ok": True, "id": "EV-1", "calendar": "연구", "error": None}
+    [event] = world.built
+    assert event.fields == {
+        "title": "신임교수모임 (10월)",
+        "start": at(10, 22, 12).timestamp(),
+        "end": at(10, 22, 13).timestamp(),
+        "all_day": False,
+        "location": "본관 302호",
+        "notes": "발표: 홍길동 교수님",
+        "calendar": research,
+    }
+    [(saved, span, commit, error)] = world.saves
+    assert saved is event and (span, commit, error) == (0, True, None)
+
+
+def test_all_day_events_end_on_their_last_day_eventkit_style():
+    world, research, _ = calendars_world()
+    adapter(world).create_event("체육대회", at(10, 23), at(10, 24), True)
+    one_day = world.built[-1].fields
+    assert (one_day["start"], one_day["end"], one_day["all_day"]) == (at(10, 23).timestamp(), at(10, 23).timestamp(), True)
+    adapter(world).create_event("학회", at(10, 23), at(10, 26), True)
+    three_days = world.built[-1].fields
+    assert (three_days["start"], three_days["end"]) == (at(10, 23).timestamp(), at(10, 25).timestamp())
+    assert "location" not in three_days and "notes" not in three_days
+
+
+def test_create_event_picks_the_calendar_by_name_target_or_default():
+    world, research, work = calendars_world()
+    adapter(world).create_event("a", at(10, 22, 9), at(10, 22, 10), False, calendar_name=" WORK ")
+    assert world.built[-1].fields["calendar"] is work
+    adapter(world, env={"CALENDAR_WRITE_TARGET": unicodedata.normalize("NFD", "work")}).create_event(
+        "b", at(10, 22, 9), at(10, 22, 10), False
+    )
+    assert world.built[-1].fields["calendar"] is work
+    adapter(world, env={"CALENDAR_WRITE_TARGET": "Work"}).create_event(
+        "c", at(10, 22, 9), at(10, 22, 10), False, calendar_name="연구"
+    )
+    assert world.built[-1].fields["calendar"] is research
+    saves = len(world.saves)
+    for name in ("가족", "대한민국 공휴일"):  # unknown, and read-only
+        result = adapter(world).create_event("d", at(10, 22, 9), at(10, 22, 10), False, calendar_name=name)
+        assert result["ok"] is False and result["id"] is None
+        assert result["error"].endswith("일정을 추가할 수 있는 캘린더: 연구, Work")
+    assert len(world.saves) == saves  # nothing saved
+
+
+def test_create_event_permission_and_failures():
+    for status, hint in ((2, "'전체 접근'"), (1, "기기 관리 정책"), (0, "--calendar-setup")):
+        world, _, _ = calendars_world(status=status)
+        result = adapter(world).create_event("x", at(10, 22, 9), at(10, 22, 10), False)
+        assert result["ok"] is False and hint in result["error"] and world.saves == []
+    # Write-only access may add to the default calendar.
+    world, research, _ = calendars_world(status=4)
+    assert adapter(world).create_event("x", at(10, 22, 9), at(10, 22, 10), False)["ok"] is True
+    assert world.built[-1].fields["calendar"] is research
+    world.default = None
+    assert "기본 캘린더를 찾지 못했어요" in adapter(world).create_event("x", at(10, 22, 9), at(10, 22, 10), False)["error"]
+    # EventKit says no: its own description is shown.
+    error = SimpleNamespace(localizedDescription=lambda: "No calendar has been set.")
+    world, _, _ = calendars_world(save_result=(False, error))
+    assert adapter(world).create_event("x", at(10, 22, 9), at(10, 22, 10), False) == {
+        "ok": False,
+        "id": None,
+        "calendar": "연구",
+        "error": "캘린더에 저장하지 못했어요 (No calendar has been set.)",
+    }
+    world, _, _ = calendars_world(save_result=True)  # a bare BOOL
+    assert adapter(world).create_event("x", at(10, 22, 9), at(10, 22, 10), False)["ok"] is True
+    # A PyObjC exception is reported, never raised.
+    world, _, _ = calendars_world()
+    world.calendars.append(Calendar("터지는 캘린더"))
+    result = adapter(world).create_event("x", at(10, 22, 9), at(10, 22, 10), False, calendar_name="터지는 캘린더")
+    assert result["ok"] is False and "TypeError: depythonifying 'id'" in result["error"]
+
+
+def test_find_similar_events_reads_two_hours_around_on_that_day_only():
+    world, research, work = calendars_world()
+    world.events = [
+        ExistingEvent("신임교수모임", at(10, 22, 12), at(10, 22, 13), research),
+        ExistingEvent("점심", at(10, 22, 11), at(10, 22, 12), work),
+        ExistingEvent("세미나", at(10, 22, 12), at(10, 22, 13), work),
+    ]
+    found = adapter(world).find_similar_events(at(10, 22, 12), at(10, 22, 13), "신임교수모임 (10월)")
+    start, end, calendars = world.predicates[-1]
+    assert (start.ts, end.ts, calendars) == (at(10, 22, 10).timestamp(), at(10, 22, 15).timestamp(), None)
+    assert [(r["title"], r["calendar"]) for r in found] == [("신임교수모임", "연구"), ("세미나", "Work")]
+
+
+# ---------------------------------------------------------------- one store, the safety net, CALENDAR_EXCLUDE on the write path
+
+
+def test_the_write_path_reuses_one_store():
+    world, research, work = calendars_world()
+    shared = macos_calendar.SharedEventStore(fake_eventkit(world))
+    app = adapter(world, shared=shared)
+    assert [c["name"] for c in app.list_writable_calendars()] == ["연구", "Work"]
+    world.calendars.remove(work)  # removed in the Calendar app while the bot runs
+    assert [c["name"] for c in adapter(world, shared=shared).list_writable_calendars()] == ["연구"]
+    app.find_similar_events(at(10, 22, 12), at(10, 22, 13), "x")
+    assert adapter(world, shared=shared).create_event("x", at(10, 22, 9), at(10, 22, 10), False)["ok"] is True
+    [store] = world.stores
+    # The event is built and saved on the store its calendar came from (asserted by the fake's saveEvent).
+    assert world.built[-1].store is store and shared.created == 1
+
+
+def batch(*titles, calendar_name=None, day=22):
+    return [
+        {
+            "title": title,
+            "start": at(10, day, 9 + index),
+            "end": at(10, day, 10 + index),
+            "all_day": False,
+            "location": None,
+            "notes": None,
+            "calendar_name": calendar_name,
+        }
+        for index, title in enumerate(titles)
+    ]
+
+
+def test_a_batch_is_created_on_one_store_in_order_with_the_calendars_read_once():
+    world, research, work = calendars_world()
+    shared = macos_calendar.SharedEventStore(fake_eventkit(world))
+    results = adapter(world, shared=shared).create_events(batch("a", "b", "c", "d", "e", "f", calendar_name="Work"))
+    assert [r["ok"] for r in results] == [True] * 6 and {r["calendar"] for r in results} == {"Work"}
+    assert [event.fields["title"] for event, *_ in world.saves] == ["a", "b", "c", "d", "e", "f"]
+    assert len(world.stores) == 1 and all(event.store is world.stores[0] for event in world.built)
+    assert world.calendar_reads == 1  # one read of the calendars for the whole batch
+    assert adapter(world, shared=shared).create_events([]) == []
+
+
+def test_a_batch_holds_the_lock_so_other_reads_wait_until_it_is_done():
+    world, research, work = calendars_world()
+    world.pause = 0.01
+    shared = macos_calendar.SharedEventStore(fake_eventkit(world))
+    order: list[str] = []
+    real_save = shared.eventkit.EKEventStore.saveEvent_span_commit_error_
+
+    def save(store, event, span, commit, error):
+        order.append(f"save {event.fields['title']}")
+        return real_save(store, event, span, commit, error)
+
+    shared.eventkit.EKEventStore.saveEvent_span_commit_error_ = save
+    writer = threading.Thread(target=lambda: adapter(world, shared=shared).create_events(batch("a", "b", "c", "d")))
+    writer.start()
+    while not world.saves:  # the batch has started saving
+        time_module.sleep(0.001)
+    reader = threading.Thread(
+        target=lambda: order.append(f"read {len(adapter(world, shared=shared).fetch_events(at(10, 22), at(10, 23)))}")
+    )
+    reader.start()
+    writer.join(5)
+    reader.join(5)
+    assert order == ["save a", "save b", "save c", "save d", "read 0"]
+    assert world.max_busy == 1 and len(world.stores) == 1
+
+
+def test_one_saved_event_is_never_reported_as_failed():
+    world, research, work = calendars_world()
+    results = adapter(world).create_events([*batch("a"), {**batch("b")[0], "unknown": 1}, *batch("c", day=23)])
+    assert [r["ok"] for r in results] == [True, False, True]
+    assert "TypeError" in results[1]["error"] and len(world.saves) == 2
+
+    # An event id that cannot be read after a successful save is still a success (a retry would add it twice).
+    class NoId:
+        def __init__(self, event):
+            self.event = event
+
+        def __getattr__(self, name):
+            return getattr(self.event, name)
+
+        def eventIdentifier(self):
+            raise RuntimeError("gone")
+
+    world, research, work = calendars_world()
+    shared = macos_calendar.SharedEventStore(fake_eventkit(world))
+    make = shared.eventkit.EKEvent.eventWithEventStore_
+    shared.eventkit.EKEvent.eventWithEventStore_ = lambda store: NoId(make(store))
+    real_save = shared.eventkit.EKEventStore.saveEvent_span_commit_error_
+    shared.eventkit.EKEventStore.saveEvent_span_commit_error_ = lambda store, event, *rest: real_save(store, event.event, *rest)
+    assert adapter(world, shared=shared).create_event("x", at(10, 22, 9), at(10, 22, 10), False) == {
+        "ok": True, "id": None, "calendar": "연구", "error": None
+    }
+
+
+def category_world(**kwargs):
+    world = World(**kwargs)
+    world.calendars = [Calendar(name) for name in CATEGORY_NAMES] + [Calendar("연구")]
+    world.default = world.calendars[-1]
+    return world
+
+
+def test_the_production_path_uses_one_store_for_reads_proposals_and_creations(monkeypatch):
+    world = category_world()
+    eventkit = fake_eventkit(world)
+    monkeypatch.setattr(macos_calendar, "load_eventkit", lambda: (eventkit, SimpleNamespace(NSDate=NSDate)))
+    store = StateStore(config.get_state_path())
+    env = {**CAT_ENV, "CALENDAR_EXCLUDE": "대한민국 공휴일"}
+    for _ in range(2):
+        assert run_schedule(env=env, now=NOW, platform="darwin")["ok"] is True
+    payload = run_propose({"events": [EXAMPLE, {**EXAMPLE, "date": "2026-10-29"}]}, KEY, env=env, now=NOW, store=store, platform="darwin")
+    assert payload["ok"] is True and payload["categories"] == CATEGORY_NAMES
+    proposal = {**store.pending_proposal(KEY, NOW), "chosen_category": "Event-KHU"}
+    outcome = create_proposal_events(proposal, env=env, now=NOW, platform="darwin")
+    assert outcome.created == 2
+    assert len(world.stores) == 1  # every read and write of the process on one store
+
+
+def test_concurrent_proposals_and_creations_share_one_store_one_call_at_a_time():
+    world = category_world()
+    world.pause = 0.002
+    shared = macos_calendar.SharedEventStore(fake_eventkit(world))
+    errors: list = []
+
+    def work(index):
+        try:
+            app = adapter(world, shared=shared)
+            if index % 2:
+                assert all(r["ok"] for r in app.create_events(batch(f"w{index}", calendar_name="Research")))
+            else:
+                assert len(app.list_writable_calendars(required=CATEGORY_NAMES)) == 6
+                app.find_similar_events(at(10, 22, 12), at(10, 22, 13), "x")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=work, args=(i,)) for i in range(16)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    assert errors == [] and len(world.saves) == 8
+    assert len(world.stores) == 1 and world.max_busy == 1
+
+
+def real_categories(world, events, env=None, store=None):
+    store = store or StateStore(config.get_state_path())
+    payload = run_propose(
+        {"events": events, "source_note": NOTE}, KEY, env={**CAT_ENV, **(env or {})}, now=NOW, store=store,
+        adapter_factory=lambda tz: adapter(world, env={**CAT_ENV, **(env or {})}), platform="darwin",
+    )
+    return payload, store
+
+
+def test_proposals_and_creations_succeed_after_empty_reads(caplog):
+    world = category_world(empty_reads=2)
+    with caplog.at_level(logging.WARNING, logger="mungchi.calendar"):
+        payload, store = real_categories(world, [EXAMPLE])
+    assert payload["ok"] is True and payload["categories"] == CATEGORY_NAMES
+    assert world.sleeps == [1.0, 1.0] and len(world.resets) == 2
+    assert "캘린더 목록을 다시 읽습니다 (1/3): 보이는 캘린더 0개" in caplog.text
+
+    world.empty_reads = 2
+    proposal = {**store.pending_proposal(KEY, NOW), "chosen_category": "Event-KHU"}
+    outcome = create_proposal_events(
+        proposal, env=CAT_ENV, now=NOW, adapter_factory=lambda tz: adapter(world, env=CAT_ENV), platform="darwin"
+    )
+    assert outcome.created == 1 and world.saves[-1][0].fields["calendar"].title() == "Event-KHU"
+
+
+def test_a_missing_category_calendar_is_read_again_before_a_creation():
+    world = category_world()
+    khu = world.calendars.pop(4)
+
+    def sleep(seconds):  # the calendar shows up again by the next read
+        world.sleeps.append(seconds)
+        if khu not in world.calendars:
+            world.calendars.insert(4, khu)
+
+    [result] = adapter(world, sleep=sleep).create_events(batch("x", calendar_name="Event-KHU"))
+    assert result["ok"] is True and result["calendar"] == "Event-KHU" and world.sleeps == [1.0]
+
+
+def test_no_calendar_at_all_gives_the_permission_message_not_the_category_hint():
+    world = category_world(empty_reads=99)
+    payload, store = real_categories(world, [EXAMPLE])
+    assert payload == {"ok": False, "error": macos_calendar.NO_CALENDARS_VISIBLE_TEXT}
+    assert event_proposals.CATEGORY_FIX_HINT not in payload["error"] and store.pending_proposal(KEY, NOW) is None
+    assert world.sleeps == [1.0, 1.0, 1.0]
+    # Without categories (the yes / no flow) too.
+    world = category_world(empty_reads=99)
+    payload, _ = real_categories(world, [EXAMPLE], env={"CALENDAR_CATEGORIES": ""})
+    assert payload == {"ok": False, "error": macos_calendar.NO_CALENDARS_VISIBLE_TEXT}
+    # Creating: every event says so.
+    world = category_world(empty_reads=99)
+    proposal = {
+        "calendar": None,
+        "categories": [{"label": "Event-KHU", "calendar": "Event-KHU", "aliases": []}],
+        "chosen_category": "Event-KHU",
+        "events": [ProposedEvent(title=t, day=date(2026, 10, 22), start=at(10, 22, 9), end=at(10, 22, 10)).to_state() for t in "ab"],
+    }
+    outcome = create_proposal_events(proposal, env=CAT_ENV, now=NOW, adapter_factory=lambda tz: adapter(world), platform="darwin")
+    assert [r.error for r in outcome.results] == [macos_calendar.NO_CALENDARS_VISIBLE_TEXT] * 2 and world.saves == []
+
+
+def test_calendars_visible_but_no_category_calendar_gives_the_category_hint():
+    world = World()
+    world.calendars = [Calendar("연구"), Calendar("Work")]
+    payload, _ = real_categories(world, [EXAMPLE])
+    assert payload["ok"] is False and payload["error"].endswith(event_proposals.CATEGORY_FIX_HINT)
+    assert macos_calendar.NO_CALENDARS_VISIBLE_TEXT not in payload["error"]
+    assert world.sleeps == [1.0, 1.0, 1.0]  # the category calendars were looked for again first
+
+
+def test_a_fake_adapter_that_sees_no_calendar_can_say_so():
+    class Empty(FakeCalendarApp):
+        def list_writable_calendars(self, required=()):
+            raise macos_calendar.NoCalendarsVisible()
+
+    payload, _ = run_categories(Empty(), [EXAMPLE])
+    assert payload == {"ok": False, "error": macos_calendar.NO_CALENDARS_VISIBLE_TEXT}
+
+
+def test_failed_proposals_and_creations_are_logged_at_warning(caplog, monkeypatch):
+    monkeypatch.setattr(config, "current_platform", lambda: "darwin")
+    monkeypatch.setattr(macos_calendar, "default_adapter", lambda tz: FakeCalendarApp(fail_titles={"실패할 일정"}))
+    monkeypatch.setenv("CALENDAR_CATEGORIES", "")
+    secret = "-".join(["xoxb", "123456789012", "abcdefghijklmnop"])  # a token shape, built so scanners skip it
+    tool = make_propose_calendar_events(KEY)
+    with caplog.at_level(logging.WARNING, logger="mungchi.calendar"):
+        asyncio.run(tool.handler({"events": [{"title": "", "date": f"x {secret}"}]}))
+    [record] = [r for r in caplog.records if "propose_calendar_events 실패" in r.getMessage()]
+    assert record.levelno == logging.WARNING
+    assert "일정을 제안하지 못했어요. 아래를 고쳐 다시 부르세요. / 1번 일정: 제목(title)이 없어요." in record.getMessage()
+    assert secret not in record.getMessage()
+
+    caplog.clear()
+    app = FakeCalendarApp(fail_titles={"실패할 일정"})
+    _, proposal = stored_proposal(app, [EXAMPLE, {"title": "실패할 일정", "date": "2026-10-23", "start_time": "10:00"}])
+    with caplog.at_level(logging.WARNING, logger="mungchi.calendar"):
+        create_proposal_events(proposal, env=ENV, now=NOW, adapter_factory=lambda tz: app, platform="darwin")
+    failures = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert failures == ["캘린더 일정 추가 실패 (연구): 캘린더에 저장하지 못했어요 (읽기 전용 캘린더)"]
+
+
+def test_excluded_calendars_are_never_write_targets_or_duplicates():
+    world, research, work = calendars_world()
+    world.events = [
+        ExistingEvent("신임교수모임", at(10, 22, 12), at(10, 22, 13), work),
+        ExistingEvent("신임교수모임 리허설", at(10, 22, 11), at(10, 22, 12), research),
+    ]
+    env = {"CALENDAR_EXCLUDE": "work"}
+    app = adapter(world, env=env)
+    assert app.list_writable_calendars() == [{"name": "연구", "source": "iCloud", "is_default": True}]
+    found = app.find_similar_events(at(10, 22, 12), at(10, 22, 13), "신임교수모임 (10월)")
+    assert [(r["title"], r["calendar"]) for r in found] == [("신임교수모임 리허설", "연구")]
+    assert [c.title() for c in world.predicates[-1][2]] == ["연구", "대한민국 공휴일"]  # every calendar but Work
+    for kwargs, target_env in (({"calendar_name": "Work"}, env), ({}, {**env, "CALENDAR_WRITE_TARGET": "WORK"})):
+        result = adapter(world, env=target_env).create_event("x", at(10, 22, 9), at(10, 22, 10), False, **kwargs)
+        assert result["ok"] is False and result["error"].endswith("일정을 추가할 수 있는 캘린더: 연구")
+    assert world.saves == []
+
+
+def test_an_excluded_default_calendar_is_never_written_to():
+    world, research, work = calendars_world()
+    world.default = work
+    result = adapter(world, env={"CALENDAR_EXCLUDE": "Work"}).create_event("x", at(10, 22, 9), at(10, 22, 10), False)
+    assert result["ok"] is False and "기본 캘린더 'Work'은(는) CALENDAR_EXCLUDE에 있어" in result["error"]
+    assert "CALENDAR_WRITE_TARGET" in result["error"] and world.saves == []
+    # Write-only access lists no calendars; the excluded default is still refused.
+    world.status = 4
+    assert adapter(world, env={"CALENDAR_EXCLUDE": "Work"}).create_event("x", at(10, 22, 9), at(10, 22, 10), False)["ok"] is False
+    assert adapter(world).create_event("x", at(10, 22, 9), at(10, 22, 10), False)["ok"] is True
+
+
+# ---------------------------------------------------------------- --calendar-setup
+
+
+def test_calendar_setup_lists_where_new_events_go():
+    app = FakeCalendarApp()
+    assert write_target_lines(app, ENV) == [
+        "일정을 추가할 수 있는 캘린더 2개 (메모로 일정 추가):",
+        "    - 연구 (iCloud) [기본]",
+        "    - Work (Exchange)",
+        "추가할 캘린더: 연구 (CALENDAR_WRITE_TARGET이 비어 있어 기본 캘린더에 넣습니다)",
+    ]
+    assert write_target_lines(app, {**ENV, "CALENDAR_WRITE_TARGET": "work"})[-1] == "추가할 캘린더: Work (CALENDAR_WRITE_TARGET)"
+    assert write_target_lines(app, {**ENV, "CALENDAR_WRITE_TARGET": "가족"})[-1].startswith("[경고] CALENDAR_WRITE_TARGET의 '가족'")
+
+    class Broken(FakeCalendarApp):
+        def list_writable_calendars(self, required=()):
+            raise RuntimeError("EKErrorDomain")
+
+    assert write_target_lines(Broken(), {})[0].startswith("[경고] 일정을 추가할 수 있는 캘린더를 확인하지 못했습니다")
+
+
+def test_calendar_setup_run_shows_the_write_target():
+    class SetupApp(FakeCalendarApp):
+        def list_calendars(self, required=()):
+            return [{"name": c["name"], "source": c["source"]} for c in self.writable]
+
+    out = io.StringIO()
+    code = run_calendar_setup(
+        {**ENV, "CALENDAR_WRITE_TARGET": "Work"}, adapter_factory=lambda tz: SetupApp(), platform="darwin", now=NOW, out=out
+    )
+    assert code == 0
+    text = out.getvalue()
+    assert "일정을 추가할 수 있는 캘린더 2개 (메모로 일정 추가):\n    - 연구 (iCloud) [기본]\n    - Work (Exchange)\n" in text
+    assert "추가할 캘린더: Work (CALENDAR_WRITE_TARGET)" in text
+    assert text.index("추가할 캘린더") < text.index("연결 완료")
+
+
+def test_calendar_write_target_setting():
+    assert config.get_calendar_write_target({}) == ""
+    assert config.get_calendar_write_target({"CALENDAR_WRITE_TARGET": "  연구   캘린더 "}) == "연구 캘린더"
+    assert time(12, 0) == event_proposals.parse_clock("12:00") and event_proposals.parse_clock(None) is None
+
+
+# ---------------------------------------------------------------- categories (CALENDAR_CATEGORIES)
+
+from mungchi.tools.event_proposals import (  # noqa: E402
+    CLARIFY,
+    Answer,
+    category_question,
+    cli_prompt,
+    parse_answer,
+    proposal_question,
+)
+
+# Categories on: the default five (CALENDAR_CATEGORIES unset).
+CAT_ENV = {"TIMEZONE": "Asia/Seoul"}
+CATEGORY_NAMES = ["Family", "Teaching", "Research", "Event-Outside", "Event-KHU"]
+CATEGORY_WRITABLE = [{"name": name, "source": "iCloud", "is_default": False} for name in CATEGORY_NAMES] + WRITABLE
+QUESTION_KHU = (
+    "카테고리를 골라주세요 (추천: Event-KHU) — 1 Family · 2 Teaching · 3 Research · 4 Event-Outside · 5 Event-KHU"
+    " · 번호/이름으로 답하거나 '네'(추천대로), '아니요'(취소)"
+)
+
+
+def category_app(**kwargs):
+    return FakeCalendarApp(writable=kwargs.pop("writable", CATEGORY_WRITABLE), **kwargs)
+
+
+def run_categories(app, events, store=None, env=None, key=KEY, **args):
+    """``run_propose`` with categories on (no CALENDAR_CATEGORIES in the env: the default five)."""
+    store = store or StateStore(config.get_state_path())
+    payload = run_propose(
+        {"events": events, "source_note": NOTE, **args},
+        key,
+        env={**CAT_ENV, **(env or {})},
+        now=NOW,
+        store=store,
+        adapter_factory=lambda tz: app,
+        platform="darwin",
+    )
+    return payload, store
+
+
+def category_creator(app, env=None):
+    return lambda proposal: create_proposal_events(
+        proposal, env={**CAT_ENV, **(env or {})}, now=NOW, adapter_factory=lambda tz: app, platform="darwin"
+    )
+
+
+def test_calendar_categories_setting():
+    default = config.get_calendar_categories({})
+    assert [c.label for c in default] == CATEGORY_NAMES and [c.calendar for c in default] == CATEGORY_NAMES
+    assert dict((c.label, c.aliases) for c in default) == {
+        "Family": ("가족", "집", "개인"),
+        "Teaching": ("강의", "수업", "티칭", "교육"),
+        "Research": ("연구",),
+        "Event-Outside": ("외부", "외부행사", "학회"),
+        "Event-KHU": ("경희", "학교", "교내", "khu"),
+    }
+    assert config.get_calendar_categories({"CALENDAR_CATEGORIES": ""}) == []  # off: the yes / no flow
+    assert config.get_calendar_categories({"CALENDAR_CATEGORIES": "  ,  "}) == []
+    custom = config.get_calendar_categories({"CALENDAR_CATEGORIES": "Family=가족, Research , research, 수업=  Teaching 2026 "})
+    assert [(c.label, c.calendar) for c in custom] == [("Family", "가족"), ("Research", "Research"), ("수업", "Teaching 2026")]
+    assert custom[0].aliases == ("가족", "집", "개인") and custom[2].aliases == ()
+    aliased = config.get_calendar_categories({"CALENDAR_CATEGORY_ALIASES": "family=우리집|애들, Event-KHU=", "CALENDAR_CATEGORIES": "Family,Event-KHU"})
+    assert [c.aliases for c in aliased] == [("우리집", "애들"), ()]
+    many = ",".join(f"C{i}" for i in range(15))
+    assert len(config.get_calendar_categories({"CALENDAR_CATEGORIES": many})) == config.MAX_CALENDAR_CATEGORIES
+
+
+def test_the_category_question_and_the_cli_prompt():
+    assert category_question(CATEGORY_NAMES, "Event-KHU") == QUESTION_KHU
+    assert category_question(CATEGORY_NAMES[:2]) == "카테고리를 골라주세요 — 1 Family · 2 Teaching · 번호/이름으로 답하거나 '아니요'(취소)"
+    assert category_question(CATEGORY_NAMES, assigned=True) == "일정마다 정한 카테고리로 추가할까요? (네 / 아니요 / 고칠 내용)"
+    proposal = {"categories": [{"label": n, "calendar": n} for n in CATEGORY_NAMES], "suggested_category": "Research", "events": [{}]}
+    assert cli_prompt(proposal) == (
+        "카테고리를 골라주세요 (추천: Research) [1 Family · 2 Teaching · 3 Research · 4 Event-Outside · 5 Event-KHU / 네 / 아니요] "
+    )
+    assert cli_prompt({**proposal, "suggested_category": None}).endswith("5 Event-KHU / 아니요] ")
+    assert cli_prompt({"events": [{}]}) == event_proposals.CLI_CONFIRM_PROMPT
+    assert proposal_question({"events": [{}]}) == CONFIRM_QUESTION
+
+
+def _pending(suggested="Event-KHU", events=({},)):
+    categories = [{"label": c.label, "calendar": c.calendar, "aliases": list(c.aliases)} for c in config.get_calendar_categories({})]
+    return {"id": "p1", "categories": categories, "suggested_category": suggested, "events": [dict(e) for e in events]}
+
+
+@pytest.mark.parametrize(
+    "text,label",
+    [
+        ("1", "Family"), ("2", "Teaching"), (" 5 ", "Event-KHU"), ("3번", "Research"), ("4번이요", "Event-Outside"), ("2️⃣", "Teaching"),
+        ("Research", "Research"), ("research", "Research"), ("RESEARCH!", "Research"), ("event-khu", "Event-KHU"),
+        ("Event KHU", "Event-KHU"), ("event_outside", "Event-Outside"),
+        ("연구", "Research"), (unicodedata.normalize("NFD", "연구"), "Research"), ("가족", "Family"), ("집", "Family"),
+        ("수업", "Teaching"), ("강의", "Teaching"), ("학회", "Event-Outside"), ("외부행사", "Event-Outside"),
+        ("경희", "Event-KHU"), ("학교", "Event-KHU"), ("교내", "Event-KHU"), ("KHU", "Event-KHU"),
+        # A part of one category's name.
+        ("outside", "Event-Outside"), ("khu", "Event-KHU"), ("teach", "Teaching"), ("fam", "Family"),
+        # Polite endings.
+        ("Research로", "Research"), ("연구로 넣어줘", "Research"), ("khu로 해줘", "Event-KHU"), ("Teaching 캘린더에", "Teaching"),
+        ("수업 캘린더로 넣어주세요", "Teaching"),
+        # "네" means the suggestion.
+        ("네", "Event-KHU"), ("응", "Event-KHU"), ("👍", "Event-KHU"), ("ok", "Event-KHU"),
+    ],
+)
+def test_category_replies_pick_one_category(text, label):
+    assert parse_answer(text, _pending()) == Answer(event_proposals.YES, label)
+
+
+@pytest.mark.parametrize("text", ["아니요", "취소", "no", "됐어요"])
+def test_negative_replies_cancel_a_category_proposal(text):
+    assert parse_answer(text, _pending()) == Answer(NO)
+
+
+def test_unclear_category_replies_are_asked_about_once_more():
+    ambiguous = parse_answer("event", _pending())
+    assert ambiguous.kind == CLARIFY and ambiguous.category is None
+    assert ambiguous.message == "'event'에 맞는 카테고리가 여러 개예요: 4 Event-Outside · 5 Event-KHU. 번호나 전체 이름으로 골라 주세요."
+    out_of_range = parse_answer("7", _pending())
+    assert out_of_range.kind == CLARIFY and out_of_range.message.startswith("1~5 가운데 번호로 골라 주세요: 1 Family")
+    no_suggestion = parse_answer("네", _pending(suggested=None))
+    assert no_suggestion.kind == CLARIFY
+    assert no_suggestion.message == (
+        "추천한 카테고리가 없어요. 번호나 이름으로 골라 주세요: 1 Family · 2 Teaching · 3 Research · 4 Event-Outside · 5 Event-KHU"
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "", "시간은 1시로 바꿔줘", "연구실 미팅 시간 바꿔줘", "네 근데 Research로", "1시", "2026", "Research 말고 다른 거", "e",
+        "그냥 넣지 마세요 나중에",
+        # Too short for a part of a name, or a part of an alias only.
+        "re", "se", "행사", "외",
+    ],
+)
+def test_anything_else_goes_to_the_model(text):
+    assert parse_answer(text, _pending()) == Answer(None)
+
+
+def test_without_categories_only_yes_and_no_count():
+    old = {"id": "p1", "events": [{}]}
+    assert parse_answer("네", old) == Answer(YES) and parse_answer("아니요", old) == Answer(NO)
+    assert parse_answer("2", old) == Answer(None) and parse_answer("Research", old) == Answer(None)
+
+
+def test_when_every_event_has_its_own_category_only_yes_and_no_count():
+    assigned = _pending(suggested=None, events=({"category": "Research"}, {"category": "Event-KHU"}))
+    assert parse_answer("네", assigned) == Answer(YES)  # each keeps its own category
+    assert parse_answer("아니요", assigned) == Answer(NO)
+    assert parse_answer("Family", assigned) == Answer(None)  # a change: for the model
+    assert proposal_question(assigned) == event_proposals.ASSIGNED_QUESTION
+    mixed = _pending(suggested=None, events=({"category": "Research"}, {}))
+    assert parse_answer("네", mixed).kind == CLARIFY and parse_answer("1", mixed) == Answer(YES, "Family")
+
+
+def test_category_proposal_is_stored_with_the_suggestion_and_asks_for_a_category():
+    app = category_app()
+    payload, store = run_categories(app, [EXAMPLE], suggested_category="event-khu")
+    assert payload["ok"] and payload["can_confirm"]
+    assert payload["categories"] == CATEGORY_NAMES and payload["suggested_category"] == "Event-KHU"
+    assert payload["confirm_question"] == QUESTION_KHU
+    assert "calendar" not in payload and payload["warnings"] == []
+    # No calendar in the preview line: the user picks it.
+    assert payload["preview"] == "• 10/22(목) 12:00–13:00 신임교수모임 (10월) · 메모: 발표: 홍길동 교수님"
+    pending = store.pending_proposal(KEY, NOW)
+    assert pending["suggested_category"] == "Event-KHU" and pending["calendar"] is None
+    assert [(c["label"], c["calendar"]) for c in pending["categories"]] == [(n, n) for n in CATEGORY_NAMES]
+    assert pending["categories"][4]["aliases"] == ["경희", "학교", "교내", "khu"]
+    assert len(pending["id"]) == 32 and pending["id"] != run_categories(app, [EXAMPLE], store=store)[1].pending_proposal(KEY, NOW)["id"]
+    assert app.created == []
+
+
+def test_the_suggestion_is_matched_by_alias_or_dropped():
+    app = category_app()
+    by_alias, _ = run_categories(app, [EXAMPLE], suggested_category="학교")
+    assert by_alias["suggested_category"] == "Event-KHU"
+    by_calendar_arg, _ = run_categories(app, [EXAMPLE], calendar="연구")  # "연구 캘린더에 넣어줘"
+    assert by_calendar_arg["suggested_category"] == "Research"
+    unknown, store = run_categories(app, [EXAMPLE], suggested_category="Lecture")
+    assert unknown["ok"] and unknown["suggested_category"] is None
+    assert unknown["confirm_question"].startswith("카테고리를 골라주세요 — 1 Family")
+    assert "'Lecture'은(는) 고를 수 있는 카테고리가 아니라서" in unknown["suggestion_problem"]
+    assert store.pending_proposal(KEY, NOW)["suggested_category"] is None
+
+
+def test_missing_category_calendars_are_not_offered_and_warned_about():
+    writable = [{"name": n, "is_default": False} for n in ("Family", "research", "Event-Outside")] + WRITABLE
+    payload, store = run_categories(category_app(writable=writable), [EXAMPLE], suggested_category="Event-KHU")
+    assert payload["ok"] and payload["categories"] == ["Family", "Research", "Event-Outside"]
+    note = "Mac 캘린더에 'Teaching', 'Event-KHU' 캘린더가 없어요. 캘린더 앱에서 그 이름으로 캘린더를 만들거나 .env의 CALENDAR_CATEGORIES를 고치세요."
+    assert payload["warnings"] == [note] and payload["preview"].endswith(f"⚠️ {note}")
+    assert payload["suggested_category"] is None  # Event-KHU is not offered
+    pending = store.pending_proposal(KEY, NOW)
+    # The calendar name as the Calendar app writes it.
+    assert [(c["label"], c["calendar"]) for c in pending["categories"]] == [
+        ("Family", "Family"), ("Research", "research"), ("Event-Outside", "Event-Outside")
+    ]
+    assert parse_answer("3", pending) == Answer(YES, "Event-Outside")
+    none_there, store = run_categories(FakeCalendarApp(), [EXAMPLE])
+    assert none_there["ok"] is False and store.pending_proposal(KEY, NOW) is None
+    assert none_there["error"].startswith("Mac 캘린더에 카테고리 캘린더('Family', 'Teaching', 'Research', 'Event-Outside', 'Event-KHU')가 하나도 없어요.")
+
+
+def test_categories_win_over_the_write_target_and_need_full_access():
+    payload, _ = run_categories(category_app(), [EXAMPLE], env={"CALENDAR_WRITE_TARGET": "Work"})
+    assert payload["categories"] == CATEGORY_NAMES and "calendar" not in payload
+    write_only, store = run_categories(category_app(status=WRITE_ONLY), [EXAMPLE])
+    assert write_only["ok"] is False and write_only["error"] == event_proposals.WRITE_ONLY_CATEGORY_TEXT
+    assert "CALENDAR_CATEGORIES를 비우세요" in write_only["error"] and store.pending_proposal(KEY, NOW) is None
+
+
+def test_empty_categories_keep_the_old_yes_no_flow():
+    app = category_app()
+    payload, store = run_categories(app, [{**EXAMPLE, "category": "Research"}], env={"CALENDAR_CATEGORIES": "", "CALENDAR_WRITE_TARGET": "Work"}, suggested_category="Research")
+    assert payload["calendar"] == "Work" and payload["confirm_question"] == CONFIRM_QUESTION
+    assert "categories" not in payload and "카테고리" not in payload["preview"]
+    pending = store.pending_proposal(KEY, NOW)
+    assert "categories" not in pending and "category" not in pending["events"][0]
+    assert parse_answer("네", pending) == Answer(YES)
+    assert confirm_proposal(store, KEY, YES, now=NOW, create=category_creator(app, {"CALENDAR_CATEGORIES": ""})).startswith(
+        "✅ 캘린더에 추가했어요\n• 10/22(목) 12:00–13:00 신임교수모임 (10월) · 캘린더: Work"
+    )
+    assert [c["calendar_name"] for c in app.created] == ["Work"]
+
+
+def test_creating_into_the_picked_category():
+    app = category_app()
+    _, store = run_categories(app, [EXAMPLE, {**EXAMPLE, "title": "신임교수모임 (11월)", "date": "2026-11-19"}], suggested_category="Event-KHU")
+    reply = confirm_proposal(store, KEY, YES, now=NOW, create=category_creator(app), category="Event-KHU")
+    assert [c["calendar_name"] for c in app.created] == ["Event-KHU", "Event-KHU"]
+    assert reply == (
+        "✅ 2건 모두 Event-KHU 캘린더에 추가했어요\n"
+        "• 10/22(목) 12:00–13:00 신임교수모임 (10월)\n"
+        "• 11/19(목) 12:00–13:00 신임교수모임 (11월)"
+    )
+    assert store.pending_proposal(KEY, NOW) is None
+
+
+def test_a_label_can_name_a_differently_named_calendar():
+    app = category_app(writable=[{"name": "가족", "is_default": False}, {"name": "Research", "is_default": False}])
+    payload, store = run_categories(app, [EXAMPLE], env={"CALENDAR_CATEGORIES": "Family=가족,Research"})
+    assert payload["categories"] == ["Family", "Research"]
+    assert parse_answer("집", store.pending_proposal(KEY, NOW)) == Answer(YES, "Family")
+    confirm_proposal(store, KEY, YES, now=NOW, create=category_creator(app), category="Family")
+    assert [c["calendar_name"] for c in app.created] == ["가족"]
+
+
+def test_per_event_categories_override_the_pick():
+    app = category_app()
+    events = [{**EXAMPLE, "category": "research"}, {**EXAMPLE, "title": "학과 회의", "date": "2026-10-23", "weekday_in_text": None}]
+    payload, store = run_categories(app, events, suggested_category="Event-KHU")
+    assert [e.get("category") for e in payload["events"]] == ["Research", None]
+    assert payload["preview"].splitlines()[0].endswith("· 카테고리: Research")
+    pending = store.pending_proposal(KEY, NOW)
+    assert [e.get("category") for e in pending["events"]] == ["Research", None]
+    reply = confirm_proposal(store, KEY, YES, now=NOW, create=category_creator(app), category="Family")
+    assert [(c["title"], c["calendar_name"]) for c in app.created] == [("신임교수모임 (10월)", "Research"), ("학과 회의", "Family")]
+    assert reply.splitlines() == [
+        "✅ 2건 모두 캘린더에 추가했어요",
+        "• 10/22(목) 12:00–13:00 신임교수모임 (10월) · 캘린더: Research",
+        "• 10/23(금) 12:00–13:00 학과 회의 · 캘린더: Family",
+    ]
+
+
+def test_per_event_categories_must_exist():
+    writable = [{"name": n, "is_default": False} for n in ("Family", "Research")]
+    unknown, store = run_categories(category_app(writable=writable), [{**EXAMPLE, "category": "Lecture"}])
+    assert unknown["ok"] is False and store.pending_proposal(KEY, NOW) is None
+    assert unknown["errors"] == ["1번 일정: 'Lecture'은(는) 고를 수 있는 카테고리가 아니에요 (고를 수 있는 카테고리: Family, Research)."]
+    missing, _ = run_categories(category_app(writable=writable), [{**EXAMPLE, "category": "Event-KHU"}], store=store)
+    assert missing["errors"][0].startswith("1번 일정: Mac 캘린더에 'Event-KHU' 캘린더가 없어요.")
+
+
+def test_every_event_with_its_own_category_needs_only_a_yes():
+    app = category_app()
+    events = [{**EXAMPLE, "category": "Research"}, {**EXAMPLE, "title": "학회", "date": "2026-10-24", "weekday_in_text": None, "category": "학회"}]
+    payload, store = run_categories(app, events)
+    assert payload["confirm_question"] == event_proposals.ASSIGNED_QUESTION
+    confirm_proposal(store, KEY, YES, now=NOW, create=category_creator(app))
+    assert [c["calendar_name"] for c in app.created] == ["Research", "Event-Outside"]
+
+
+def test_no_event_is_created_without_a_category():
+    app = category_app()
+    _, store = run_categories(app, [EXAMPLE])
+    reply = confirm_proposal(store, KEY, YES, now=NOW, create=category_creator(app))  # no pick: never a guess
+    assert app.created == [] and reply == (
+        "❌ 추가하지 못했어요\n❌ 10/22(목) 12:00–13:00 신임교수모임 (10월) 추가 실패: 카테고리를 고르지 않아 추가하지 않았어요"
+    )
+
+
+def test_taking_a_proposal_by_id_only_takes_that_one(tmp_path):
+    store = StateStore(tmp_path / "s.json")
+    store.save_pending_proposal(KEY, {"id": "new", "events": []}, NOW)
+    assert store.take_pending_proposal(KEY, NOW, proposal_id="old") is None
+    assert store.pending_proposal(KEY, NOW)["id"] == "new"  # left as it is
+    assert store.take_pending_proposal(KEY, NOW, proposal_id="new")["id"] == "new"
+    assert store.take_pending_proposal(KEY, NOW, proposal_id="new") is None
+
+
+def test_calendar_setup_lists_the_categories():
+    writable = [{"name": n, "source": "iCloud", "is_default": False} for n in ("Family", "Research")]
+    lines = write_target_lines(FakeCalendarApp(writable=writable), {"CALENDAR_CATEGORIES": "Family,Research,Event-KHU"})
+    assert lines[-2:] == [
+        "카테고리 (CALENDAR_CATEGORIES, 일정을 추가할 때 고릅니다): Family, Research",
+        "[경고] Mac 캘린더에 'Event-KHU' 캘린더가 없어요. 캘린더 앱에서 그 이름으로 캘린더를 만들거나 .env의 CALENDAR_CATEGORIES를 고치세요.",
+    ]
+    mapped = write_target_lines(FakeCalendarApp(writable=[{"name": "가족"}]), {"CALENDAR_CATEGORIES": "Family=가족"})
+    assert mapped[-1] == "카테고리 (CALENDAR_CATEGORIES, 일정을 추가할 때 고릅니다): Family(가족)"
+
+
+def test_env_example_lists_the_default_categories():
+    from pathlib import Path
+
+    from dotenv import dotenv_values
+
+    values = dotenv_values(Path(__file__).resolve().parents[1] / ".env.example")
+    assert values["CALENDAR_CATEGORIES"] == config.DEFAULT_CALENDAR_CATEGORIES
+    assert values["CALENDAR_CATEGORY_ALIASES"] == ""
+    assert config.get_calendar_categories(values) == config.get_calendar_categories({})
+
+
+# ---------------------------------------------------------------- events with a similar one: asked about one by one
+
+from mungchi.tools.event_proposals import (  # noqa: E402
+    ADD,
+    SKIP,
+    ItemAnswer,
+    decide_items,
+    item_question_key,
+    parse_item_answer,
+)
+
+ITEM_KEY = item_question_key(KEY)
+# Like the poster: four seminars; the Calendar app already has the 1st and the 3rd.
+SEMINAR_NOTE = [
+    {"title": "잡세미나 - 이승헌", "date": "2026-11-18", "start_time": "15:00", "end_time": "16:00"},
+    {"title": "잡세미나 - 한요셉", "date": "2026-11-19", "start_time": "10:00", "end_time": "11:00"},
+    {"title": "잡세미나 - 김하늘", "date": "2026-11-20", "start_time": "15:00", "end_time": "16:00"},
+    {"title": "잡세미나 - 박바다", "date": "2026-11-21", "start_time": "11:00", "end_time": "12:00"},
+]
+ALREADY_THERE = [
+    record("잡세미나(응용경제 공채) - 이승헌", at(11, 18, 15), at(11, 18, 16), calendar="Event-KHU"),
+    record("잡세미나 - 김하늘", at(11, 20, 15), at(11, 20, 16), calendar="Event-KHU"),
+]
+SIMILAR_1 = "11/18(수) 15:00–16:00 잡세미나(응용경제 공채) - 이승헌 (Event-KHU)"
+SIMILAR_3 = "11/20(금) 15:00–16:00 잡세미나 - 김하늘 (Event-KHU)"
+
+
+def seminar_proposal(tmp_path, existing=ALREADY_THERE, events=SEMINAR_NOTE, **kwargs):
+    app = category_app(existing=existing, **kwargs)
+    payload, store = run_categories(app, events, store=StateStore(tmp_path / "s.json"), suggested_category="Event-KHU")
+    assert payload["ok"]
+    return app, store
+
+
+def test_similar_events_found_when_proposed_are_kept_with_the_proposal(tmp_path):
+    app, store = seminar_proposal(tmp_path)
+    events = store.pending_proposal(KEY, NOW)["events"]
+    assert [e.get("similar") for e in events] == [[SIMILAR_1], None, [SIMILAR_3], None]
+    rebuilt = ProposedEvent.from_state(events[0], SEOUL)
+    assert rebuilt.similar == [SIMILAR_1] and rebuilt.to_state() == events[0]
+    assert ProposedEvent.from_state({**events[0], "similar": "junk"}, SEOUL).similar == []
+
+
+def test_without_similar_events_everything_is_created_as_before(tmp_path):
+    app, store = seminar_proposal(tmp_path, existing=())
+    reply = confirm_proposal(store, KEY, YES, now=NOW, create=category_creator(app), category="Event-KHU")
+    assert reply.splitlines()[0] == "✅ 4건 모두 Event-KHU 캘린더에 추가했어요" and len(app.created) == 4
+    assert store.pending_proposal(ITEM_KEY, NOW) is None
+
+
+def test_the_others_are_created_now_and_the_similar_ones_wait_for_their_own_answer(tmp_path):
+    app, store = seminar_proposal(tmp_path)
+    first = store.pending_proposal(KEY, NOW)
+    reply = confirm_proposal(store, KEY, YES, now=NOW, create=category_creator(app), category="Event-KHU")
+    assert [c["title"] for c in app.created] == ["잡세미나 - 한요셉", "잡세미나 - 박바다"]
+    assert reply == (
+        "✅ 2건 모두 Event-KHU 캘린더에 추가했어요\n"
+        "• 11/19(목) 10:00–11:00 잡세미나 - 한요셉\n"
+        "• 11/21(토) 11:00–12:00 잡세미나 - 박바다"
+    )
+    assert store.pending_proposal(KEY, NOW) is None  # nothing failed: no retry
+    question = store.pending_proposal(ITEM_KEY, NOW)
+    assert question["similar_items"] is True and question["chosen_category"] == "Event-KHU"
+    assert question["expires_at"] == first["expires_at"] and question["id"] != first["id"]
+    assert [(e["title"], e["decision"]) for e in question["events"]] == [("잡세미나 - 이승헌", "pending"), ("잡세미나 - 김하늘", "pending")]
+    assert event_proposals.item_question_text(question) == (
+        "비슷한 일정이 이미 있는 2건은 하나씩 골라 주세요, 박사님.\n"
+        "1) 11/18(수) 15:00–16:00 잡세미나 - 이승헌\n"
+        f"   ↔ 이미 있음: {SIMILAR_1}\n"
+        "2) 11/20(금) 15:00–16:00 잡세미나 - 김하늘\n"
+        f"   ↔ 이미 있음: {SIMILAR_3}\n"
+        "답장으로도 고를 수 있어요: '1 넣기', '1 건너뛰기', '모두 넣기', '모두 건너뛰기'"
+    )
+
+
+def test_when_every_event_has_a_similar_one_nothing_is_created_at_once(tmp_path):
+    app, store = seminar_proposal(tmp_path, events=[SEMINAR_NOTE[0], SEMINAR_NOTE[2]])
+    assert confirm_proposal(store, KEY, YES, now=NOW, create=category_creator(app), category="Research") == ""
+    assert app.created == [] and store.pending_proposal(KEY, NOW) is None
+    question = store.pending_proposal(ITEM_KEY, NOW)
+    assert len(question["events"]) == 2 and question["chosen_category"] == "Research"
+    # A cancel never asks anything.
+    seminar_proposal(tmp_path, events=[SEMINAR_NOTE[0]])
+    assert confirm_proposal(store, KEY, NO, now=NOW, create=category_creator(app)) == "취소했어요"
+
+
+def test_an_event_without_a_time_is_never_asked_about(tmp_path):
+    no_time = {"title": "잡세미나 - 이승헌", "date": "2026-11-18", "start_time": None}
+    app, store = seminar_proposal(tmp_path, events=[no_time, SEMINAR_NOTE[1]])
+    assert store.pending_proposal(KEY, NOW)["events"][0]["similar"]  # the whole day was checked
+    reply = confirm_proposal(store, KEY, YES, now=NOW, create=category_creator(app), category="Event-KHU")
+    assert reply.splitlines()[:2] == [
+        "✅ Event-KHU 캘린더에 추가했어요",
+        "⏭️ 11/18(수) 시간 미정 잡세미나 - 이승헌: 시작 시각이 없어 추가하지 않았어요. 시각을 알려 주시면 다시 제안할게요.",
+    ]
+    assert store.pending_proposal(ITEM_KEY, NOW) is None
+
+
+def asked(tmp_path, **kwargs):
+    app, store = seminar_proposal(tmp_path, **kwargs)
+    confirm_proposal(store, KEY, YES, now=NOW, create=category_creator(app), category="Event-KHU")
+    app.created.clear()
+    return app, store, store.pending_proposal(ITEM_KEY, NOW)
+
+
+def test_each_item_is_decided_once_and_the_question_is_gone_when_all_are(tmp_path):
+    app, store, question = asked(tmp_path)
+    added = decide_items(store, KEY, question["id"], [(0, ADD)], create=category_creator(app), now=NOW)
+    assert [(c["title"], c["calendar_name"]) for c in app.created] == [("잡세미나 - 이승헌", "Event-KHU")]
+    assert added.lines == ["1) 11/18(수) 15:00–16:00 잡세미나 - 이승헌: ✅ 넣었어요"] and added.changed == 1 and not added.done
+    # Again (a double or a late click): nothing more is created.
+    again = decide_items(store, KEY, question["id"], [(0, ADD), (0, SKIP)], create=category_creator(app), now=NOW)
+    assert again.changed == 0 and again.lines == ["1) 11/18(수) 15:00–16:00 잡세미나 - 이승헌: 이미 처리했어요(✅ 넣었어요)"]
+    assert len(app.created) == 1
+    skipped = decide_items(store, KEY, question["id"], [(1, SKIP)], create=category_creator(app), now=NOW)
+    assert skipped.lines == ["2) 11/20(금) 15:00–16:00 잡세미나 - 김하늘: ⏭️ 건너뛰었어요"] and skipped.done
+    assert len(app.created) == 1 and store.pending_proposal(ITEM_KEY, NOW) is None
+    assert event_proposals.item_question_intro(skipped.question) == "비슷한 일정이 이미 있던 2건은 이렇게 처리했어요."
+    assert decide_items(store, KEY, question["id"], [(1, ADD)], create=category_creator(app), now=NOW) is None  # gone
+    assert len(app.created) == 1
+
+
+def test_a_failed_item_shows_why_stays_open_and_is_created_once_on_retry(tmp_path):
+    app, store, question = asked(tmp_path, fail_titles={"잡세미나 - 이승헌"})
+    failed = decide_items(store, KEY, question["id"], [(0, ADD)], create=category_creator(app), now=NOW)
+    assert failed.lines == ["1) 11/18(수) 15:00–16:00 잡세미나 - 이승헌: ❌ 추가하지 못했어요: 캘린더에 저장하지 못했어요 (읽기 전용 캘린더)"]
+    item = failed.question["events"][0]
+    assert item["decision"] == "failed" and item["retry"] is True and event_proposals.open_items(failed.question) == [0, 1]
+    assert event_proposals.cli_item_prompt(failed.question, 0) == "다시 시도할까요? [다시/건너뛰기] "
+    app.fail_titles.clear()
+    retried = decide_items(store, KEY, question["id"], [(0, ADD)], create=category_creator(app), now=NOW)
+    assert retried.lines[0].endswith(": ✅ 넣었어요")
+    assert [c["title"] for c in app.created] == ["잡세미나 - 이승헌", "잡세미나 - 이승헌"]  # refused once, then added once
+    decide_items(store, KEY, question["id"], [(0, ADD)], create=category_creator(app), now=NOW)
+    assert len(app.created) == 2
+
+
+def test_an_item_that_may_have_been_added_is_never_tried_again(tmp_path):
+    app, store, question = asked(tmp_path, raise_titles={"잡세미나 - 이승헌"})
+    crashed = decide_items(store, KEY, question["id"], [(0, ADD)], create=category_creator(app), now=NOW)
+    assert crashed.question["events"][0]["retry"] is False and event_proposals.open_items(crashed.question) == [1]
+    boom = decide_items(store, KEY, question["id"], [(1, ADD)], create=lambda p: (_ for _ in ()).throw(RuntimeError("down")), now=NOW)
+    assert boom.lines == ["2) 11/20(금) 15:00–16:00 잡세미나 - 김하늘: ❌ 추가하지 못했어요: 오류가 났어요 (RuntimeError: down)"]
+    assert boom.done and store.pending_proposal(ITEM_KEY, NOW) is None
+
+
+def test_nothing_tried_because_of_the_permission_may_be_tried_again(tmp_path):
+    app, store, question = asked(tmp_path)
+    app.status = DENIED
+    denied = decide_items(store, KEY, question["id"], [(0, ADD), (1, ADD)], create=category_creator(app), now=NOW)
+    assert app.created == [] and all(e["retry"] for e in denied.question["events"])
+    app.status = GRANTED
+    all_in = decide_items(store, KEY, question["id"], [(0, ADD), (1, ADD)], create=category_creator(app), now=NOW)
+    assert all_in.done and [c["title"] for c in app.created] == ["잡세미나 - 이승헌", "잡세미나 - 김하늘"]
+
+
+def test_the_item_question_expires_with_the_proposal(tmp_path):
+    app, store, question = asked(tmp_path)
+    later = NOW + timedelta(hours=25)
+    assert decide_items(store, KEY, question["id"], [(0, ADD)], create=category_creator(app), now=later) is None
+    assert app.created == [] and store.pending_proposal(ITEM_KEY, later) is None
+
+
+def _question(*decisions):
+    return {"id": "q", "events": [{"title": f"t{i}", "decision": d, "retry": d == "failed"} for i, d in enumerate(decisions)]}
+
+
+@pytest.mark.parametrize(
+    "text,choices",
+    [
+        ("1 넣기", ((0, ADD),)), ("1 넣어", ((0, ADD),)), ("1번 넣어줘", ((0, ADD),)), ("2 건너뛰기", ((1, SKIP),)),
+        ("2 빼", ((1, SKIP),)), ("2번 빼주세요!", ((1, SKIP),)), ("1) 넣기", ((0, ADD),)), ("2 다시", ((1, ADD),)),
+        ("모두 넣기", ((0, ADD), (1, ADD))), ("전부 넣어", ((0, ADD), (1, ADD))), ("모두 건너뛰기", ((0, SKIP), (1, SKIP))),
+        ("다 빼", ((0, SKIP), (1, SKIP))), (unicodedata.normalize("NFD", "1 넣기"), ((0, ADD),)),
+    ],
+)
+def test_typed_item_answers(text, choices):
+    assert parse_item_answer(text, _question("pending", "pending")) == ItemAnswer(choices)
+
+
+@pytest.mark.parametrize("text", ["1", "2번", "3 넣기", "0 빼", "넣기", "건너뛰기", "네", "아니요", "모두", "다시"])
+def test_unclear_item_answers_get_a_hint(text):
+    hint = parse_item_answer(text, _question("pending", "pending"))
+    assert hint == ItemAnswer(hint="비슷한 일정은 번호와 함께 답해 주세요, 박사님 (1~2번): '1 넣기', '1 건너뛰기', '모두 넣기', '모두 건너뛰기'")
+
+
+@pytest.mark.parametrize("text", ["", "시간은 1시로 바꿔줘", "12시", "2026", "이 날 다른 일정 있어?", "Research", "1번은 Research로 넣고 2번은 빼줘"])
+def test_anything_else_is_not_an_item_answer(text):
+    assert parse_item_answer(text, _question("pending", "pending")) is None
+
+
+def test_item_answers_only_count_for_open_items_and_never_collide_with_categories_or_dasi():
+    mixed = _question("added", "failed", "pending")
+    assert parse_item_answer("모두 넣기", mixed) == ItemAnswer(((1, ADD), (2, ADD)))  # the added one is not open
+    assert parse_item_answer("다시", mixed) == ItemAnswer(((1, ADD),))  # only the failed one
+    assert parse_item_answer("다시 해줘", mixed) == ItemAnswer(((1, ADD),))
+    assert parse_item_answer("모두 넣기", _question("added", "skipped")) == ItemAnswer(hint="비슷한 일정은 이미 모두 처리했어요.")
+    # The terminal asks about one item: there a bare answer is for that item.
+    assert parse_item_answer("넣기", mixed, current=2) == ItemAnswer(((2, ADD),))
+    assert parse_item_answer("네", mixed, current=2) == ItemAnswer(((2, ADD),))
+    assert parse_item_answer("아니요", mixed, current=1) == ItemAnswer(((1, SKIP),))
+    assert parse_item_answer("1 넣기", _question("pending")) == ItemAnswer(((0, ADD),))
+    assert parse_item_answer("1", _question("pending")).hint.startswith("비슷한 일정은 번호와 함께 답해 주세요, 박사님 (1번)")
+    # A category question and a retry read their own answers; the item forms are not among them.
+    for text in ("1 넣기", "2 건너뛰기", "모두 넣기", "모두 건너뛰기", "2 빼"):
+        assert parse_answer(text, _pending()).kind is None
+        assert parse_answer(text, {"retry": True, "events": [{}]}).kind is None
+    assert parse_answer("다시", {"retry": True, "events": [{}]}) == Answer(YES)

@@ -5,7 +5,12 @@ import json
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
+import httpx
+
+from mungchi import config
+from mungchi.tools import calendar_tool
 from mungchi.tools.calendar_tool import build_schedule, get_schedule, parse_events, run_schedule
+from mungchi.tools.common import scrub
 
 SEOUL = ZoneInfo("Asia/Seoul")
 # Monday 2026-10-05, 10:30 in Seoul.
@@ -161,3 +166,76 @@ def test_tool_handler_unconfigured_returns_json():
     data = json.loads(result["content"][0]["text"])
     assert data["configured"] is False
     assert data["missing"] == ["CALENDAR_ICS_URLS"]
+
+
+# ---------------------------------------------------------------- webcal:// (iCloud public calendars)
+
+ICLOUD_KEY = "MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwYWJjZGVm"
+ICLOUD_WEBCAL = f"webcal://p42-caldav.icloud.com/published/2/{ICLOUD_KEY}"
+ICLOUD_HTTPS = f"https://p42-caldav.icloud.com/published/2/{ICLOUD_KEY}"
+WEBCALS = "webcals://cal.example.com/pub/secret-feed-key-0123456789.ics"
+
+
+def test_ics_fetch_url_turns_webcal_and_webcals_into_https():
+    assert config.ics_fetch_url(ICLOUD_WEBCAL) == ICLOUD_HTTPS
+    assert config.ics_fetch_url(WEBCALS) == "https://cal.example.com/pub/secret-feed-key-0123456789.ics"
+    assert config.ics_fetch_url("WEBCAL://Example.com/a.ics") == "https://Example.com/a.ics"
+    assert config.ics_fetch_url("Webcals://example.com/b.ics") == "https://example.com/b.ics"
+    # Everything else is left as it is.
+    assert config.ics_fetch_url(SECRET_URL) == SECRET_URL
+    assert config.ics_fetch_url(f"  {SECRET_URL} ") == SECRET_URL
+    assert config.ics_fetch_url("http://example.com/c.ics") == "http://example.com/c.ics"
+    assert config.ics_fetch_url("https://example.com/webcal://x") == "https://example.com/webcal://x"
+
+
+def test_mixed_comma_separated_list_is_fetched_over_https():
+    raw = f"{ICLOUD_WEBCAL}, {SECRET_URL} ,{WEBCALS}"
+    cfg = config.load_calendar_config({"CALENDAR_ICS_URLS": raw})
+    assert cfg.urls == [ICLOUD_HTTPS, SECRET_URL, "https://cal.example.com/pub/secret-feed-key-0123456789.ics"]
+
+    fetched: list[str] = []
+
+    def fetch(url):
+        fetched.append(url)
+        return ICS.encode()
+
+    payload = run_schedule("", 2, env={"CALENDAR_ICS_URLS": raw, "TIMEZONE": "Asia/Seoul"}, now=CLOCK, fetcher=fetch)
+    assert fetched == cfg.urls
+    assert payload["ok"] is True and "errors" not in payload
+
+
+def test_fetch_ics_requests_https_for_webcal(monkeypatch):
+    seen: list[str] = []
+    real_client = httpx.Client
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(200, content=ICS.encode())
+
+    monkeypatch.setattr(httpx, "Client", lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw))
+    assert calendar_tool.fetch_ics(ICLOUD_WEBCAL) == ICS.encode()
+    assert calendar_tool.fetch_ics(WEBCALS) == ICS.encode()
+    assert seen == [ICLOUD_HTTPS, "https://cal.example.com/pub/secret-feed-key-0123456789.ics"]
+
+
+def test_webcal_urls_never_appear_in_errors_or_logs():
+    def fetch(url):
+        raise RuntimeError(f"connection failed for {url} (configured as {ICLOUD_WEBCAL}, {WEBCALS})")
+
+    env = {"CALENDAR_ICS_URLS": f"{ICLOUD_WEBCAL},{WEBCALS}"}
+    payload = run_schedule("", 2, env=env, now=CLOCK, fetcher=fetch)
+    text = json.dumps(payload, ensure_ascii=False)
+    assert payload["ok"] is False and len(payload["errors"]) == 2
+    assert ICLOUD_KEY not in text and "secret-feed-key" not in text
+
+    # Every form of the address is a configured secret, for scrubbing logs and Slack replies.
+    secrets = config.secret_values(env)
+    message = (
+        f"GET {ICLOUD_HTTPS} -> 404; raw {ICLOUD_WEBCAL}; host p42-caldav.icloud.com/published/2/{ICLOUD_KEY}; "
+        "also https://cal.example.com/pub/secret-feed-key-0123456789.ics and " + WEBCALS
+    )
+    cleaned = scrub(message, secrets)
+    assert ICLOUD_KEY not in cleaned and "secret-feed-key" not in cleaned
+    # URL redaction (used by the calendar tool) also knows webcals://.
+    redacted = scrub(f"see {WEBCALS} and {ICLOUD_WEBCAL}", secrets=[], redact_urls=True)
+    assert "secret-feed-key" not in redacted and ICLOUD_KEY not in redacted

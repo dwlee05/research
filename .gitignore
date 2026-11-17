@@ -18,4 +18,6 @@ venv/
 # Mungchi runtime state and caches
 .mungchi_state.json
 .mungchi_state.json.tmp
+.mungchi_slack_threads.json
+.mungchi_slack_threads.json.tmp
 .cache/
