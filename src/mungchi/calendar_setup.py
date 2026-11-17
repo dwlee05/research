@@ -54,8 +54,13 @@ def _event_line(event: calendar_tool.Event) -> str:
 
 def write_target_lines(adapter: macos_calendar.CalendarAdapter, env: Mapping[str, str] | None = None) -> list[str]:
     """Which calendars accept new events and which one a confirmed note goes to (Korean lines)."""
+    categories = config.get_calendar_categories(env)
+    target = config.get_calendar_write_target(env)
+    required = [c.calendar for c in categories] if categories else [target] if target else []
     try:
-        writable = adapter.list_writable_calendars()
+        writable = adapter.list_writable_calendars(required=required)
+    except macos_calendar.NoCalendarsVisible as exc:
+        return [f"[경고] {exc}"]
     except Exception as exc:  # noqa: BLE001 - the rest of the setup still counts
         return [f"[경고] 일정을 추가할 수 있는 캘린더를 확인하지 못했습니다: {safe_error(exc)}"]
     lines = [f"일정을 추가할 수 있는 캘린더 {len(writable)}개 (메모로 일정 추가):"]
@@ -63,7 +68,6 @@ def write_target_lines(adapter: macos_calendar.CalendarAdapter, env: Mapping[str
         source = f" ({calendar.get('source')})" if calendar.get("source") else ""
         default = " [기본]" if calendar.get("is_default") else ""
         lines.append(f"    - {calendar.get('name') or ''}{source}{default}")
-    categories = config.get_calendar_categories(env)
     if categories:
         offered, missing = event_proposals.available_categories(categories, writable)
         shown = ", ".join(
@@ -74,7 +78,6 @@ def write_target_lines(adapter: macos_calendar.CalendarAdapter, env: Mapping[str
             quoted = ", ".join(f"'{c.calendar}'" for c in missing)
             lines.append(f"[경고] Mac 캘린더에 {quoted} 캘린더가 없어요. {event_proposals.CATEGORY_FIX_HINT}")
         return lines
-    target = config.get_calendar_write_target(env)
     name, error = macos_calendar.resolve_write_calendar(writable, None, target)
     if error:
         lines.append(f"[경고] {error}")
@@ -131,7 +134,13 @@ def run_calendar_setup(
         say("[오류] " + macos_calendar.permission_hint(status))
         return 1
 
-    calendars = adapter.list_calendars()
+    try:
+        calendars = adapter.list_calendars(required=cfg.macos_calendars)
+    except macos_calendar.NoCalendarsVisible:
+        calendars = []
+    if not calendars:  # full access, yet nothing to show: the permission, not a calendar name
+        say("[오류] " + macos_calendar.NO_CALENDARS_VISIBLE_TEXT)
+        return 1
     skip = macos_calendar.exclusion_keys(cfg.excluded_calendars)
     by_source: dict[str, list[str]] = {}
     for calendar in calendars:

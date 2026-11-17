@@ -289,11 +289,16 @@ def macos_events(
 
     Returns ``(events, warnings)``. Wanted names that match no calendar are
     reported, never fatal; if none match, nothing is read (rather than all).
+    Call with full access: no calendar at all then raises
+    ``macos_calendar.NoCalendarsVisible`` instead of reporting no events.
     """
-    available = [calendar["name"] for calendar in adapter.list_calendars()]
+    skip = macos_calendar.exclusion_keys(excluded)
+    required = [name for name in wanted if not macos_calendar.is_excluded(name, skip)]
+    available = [calendar["name"] for calendar in adapter.list_calendars(required=required)]
+    if not available:
+        raise macos_calendar.NoCalendarsVisible()
     selected, not_found = macos_calendar.select_calendars(wanted, available)
     warnings = missing_calendar_warnings(not_found)
-    skip = macos_calendar.exclusion_keys(excluded)
     if skip:
         pool = available if selected is None else selected
         selected = list(dict.fromkeys(name for name in pool if not macos_calendar.is_excluded(name, skip)))
@@ -328,7 +333,18 @@ def _read_macos(
         return [], {}, macos_unconfigured(f"permission_{status}", macos_calendar.permission_hint(status))
     start = datetime.combine(expand_start, time.min, tzinfo=tz)
     end = datetime.combine(expand_end, time.min, tzinfo=tz)
-    events, warnings = macos_events(adapter, cfg.macos_calendars, tz, start, end, cfg.excluded_calendars)
+    try:
+        events, warnings = macos_events(adapter, cfg.macos_calendars, tz, start, end, cfg.excluded_calendars)
+    except macos_calendar.NoCalendarsVisible as exc:
+        # Never "no events": the model relays this, and the user checks the permission.
+        no_calendars = {
+            "configured": True,
+            "ok": False,
+            "source": config.CALENDAR_SOURCE_MACOS,
+            "reason": "no_calendars_visible",
+            "error": str(exc),
+        }
+        return [], {}, no_calendars
     return events, ({"warnings": warnings} if warnings else {}), None
 
 
@@ -390,7 +406,8 @@ def run_schedule(
         "ICS 주소(source: ics)다. 각 일정: start, end, all_day, title, location, calendar "
         "(종일 일정의 end는 마지막 날 포함). 현재 진행 중인 일정(now), 바로 다음 일정(next_event), "
         "겹침(overlaps), 30분 이상 빈 시간(gaps)도 포함. warnings가 있으면 함께 전할 것. 읽기 전용. "
-        "configured=false면 설정이나 권한이 없는 것이니 재시도하지 말 것."
+        "configured=false면 설정이나 권한이 없는 것이니 재시도하지 말 것. "
+        "ok=false면 일정이 없다고 하지 말고 error를 그대로 전할 것."
     ),
     {
         "type": "object",

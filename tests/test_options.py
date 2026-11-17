@@ -1174,7 +1174,7 @@ def _call_propose(tool, monkeypatch, **args):
         def authorization_status(self):
             return macos_calendar.GRANTED
 
-        def list_writable_calendars(self):
+        def list_writable_calendars(self, required=()):
             return [{"name": name, "source": "iCloud", "is_default": name == "연구"} for name in ["연구", *CATEGORY_CALENDARS]]
 
         def find_similar_events(self, start, end, title):

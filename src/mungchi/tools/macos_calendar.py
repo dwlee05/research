@@ -11,18 +11,34 @@ small adapter (``authorization_status``, ``request_access``,
 only after the user said "네" (see ``event_proposals``); no agent tool can.
 
 All EventKit calls block, so callers run them in a worker thread
-(the ``get_schedule`` tool uses ``asyncio.to_thread``). Each adapter is used
-from one thread only.
+(the ``get_schedule`` tool uses ``asyncio.to_thread``).
 
-Fresh data: an ``EKEventStore`` caches calendars and events and only learns
-about changes through ``EKEventStoreChangedNotification``, which needs a
-running CFRunLoop. The bot's asyncio process (and its worker threads) never
-runs one, so a long-lived store would keep showing a calendar the user has
-since removed. The adapter therefore starts every read and write on a new
-store (``_refresh``): it costs one connection to the calendar daemon, which is
-small next to the query itself, and needs no extra permission (access belongs
-to the app, not to a store). ``refreshSourcesIfNecessary`` is then asked on the
-new store so accounts edited on another device sync soon (it returns at once).
+One store per process (``SharedEventStore``): every adapter on the real
+EventKit shares one ``EKEventStore``, made on first use and kept for the life
+of the process, as Apple recommends. Calls come from several worker threads,
+so every use of it holds one ``threading.Lock``; public methods take the lock
+and never call each other while holding it. A batch of new events
+(``create_events``) is saved one after another under a single hold. A new
+store (plus ``refreshSourcesIfNecessary``) for every read and write, as
+before, is the likely cause of the empty calendar lists seen on a real Mac.
+
+Fresh data without a run loop: a store only hears about changes made in the
+Calendar app through ``EKEventStoreChangedNotification``, which needs a
+running CFRunLoop, and this process never runs one. So each operation starts
+with ``reset()`` (drop what the store cached; the next read asks the calendar
+daemon again), at most once per ``RESET_MIN_INTERVAL_SECONDS`` so the reads of
+one request (a proposal's duplicate checks, a batch of new events) share it.
+``refreshSourcesIfNecessary`` is not called: it only asks macOS to sync the
+accounts in the background, which macOS already does on its own, and the
+operation that called it never sees the result.
+
+Safety net: with full access, an empty calendar list, or a calendar the
+operation needs (a category, the write target, a ``MACOS_CALENDARS`` name)
+that is missing, is read again up to ``CALENDAR_RETRIES`` times about a
+second apart (``reset`` in between, a new store before the last), each retry
+logged at WARNING. Full access with still no calendar at all raises
+``NoCalendarsVisible`` (writes report it per event), whose text points to the
+permission setting rather than to the calendar names.
 
 ``CALENDAR_EXCLUDE``: calendars the bots never read or write. EventKit also
 returns calendars that are only unchecked in the Calendar app's sidebar, so
@@ -34,13 +50,17 @@ calendar tool drops excluded ones itself, and ``--calendars`` marks them.
 
 from __future__ import annotations
 
+import logging
 import re
 import threading
+import time as _time
 import unicodedata
 from datetime import datetime, time, timedelta, tzinfo
-from typing import Any, Iterable, Mapping, Protocol, Sequence
+from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
 from .. import config
+
+log = logging.getLogger("mungchi.calendar")
 
 # Permission states (EKAuthorizationStatus), as plain strings.
 GRANTED = "granted"
@@ -70,6 +90,18 @@ EVENTKIT_MISSING_HINT = (
     "가상환경을 켠 상태로 저장소 폴더에서 pip install -e . 를 다시 실행하세요 "
     "(또는 .env의 CALENDAR_ICS_URLS에 ICS 주소를 넣으세요)."
 )
+# Full access, yet not one calendar after the retries: a permission problem, not a calendar name.
+NO_CALENDARS_VISIBLE_TEXT = (
+    "캘린더가 하나도 보이지 않아요. "
+    f"{SETTINGS_PATH}에서 '비서실 고뭉치'(터미널에서 봇을 띄웠다면 그 터미널 앱)가 '전체 접근'인지 확인해 주세요 "
+    "(바꾼 뒤 python -m mungchi service restart)."
+)
+
+# The safety net: reads again when the store shows no calendar or not the one needed.
+CALENDAR_RETRIES = 3
+CALENDAR_RETRY_DELAY_SECONDS = 1.0
+# Reads closer together than this share one ``reset()`` of the store.
+RESET_MIN_INTERVAL_SECONDS = 5.0
 
 
 def permission_hint(status: str) -> str:
@@ -97,19 +129,33 @@ class EventKitUnavailable(RuntimeError):
     """EventKit (pyobjc-framework-EventKit) cannot be imported here."""
 
 
+class NoCalendarsVisible(RuntimeError):
+    """Full access, but the store shows no calendar at all, even after the retries.
+
+    ``str()`` is ``NO_CALENDARS_VISIBLE_TEXT``, ready to show.
+    """
+
+    def __init__(self, message: str = NO_CALENDARS_VISIBLE_TEXT):
+        super().__init__(message)
+
+
 class CalendarAdapter(Protocol):
     """What the calendar tool, ``--calendar-setup``, ``--calendars`` and the note -> event flow need from the Calendar app.
 
-    ``fetch_events``, ``list_writable_calendars``, ``create_event`` and
+    ``fetch_events``, ``list_writable_calendars``, ``create_event(s)`` and
     ``find_similar_events`` leave out the ``CALENDAR_EXCLUDE`` calendars;
     ``list_calendars`` and ``calendar_overview`` list every calendar.
+    ``required`` names calendars the caller needs (the real adapter reads again
+    while one is missing). Reads may raise ``NoCalendarsVisible``; writes report it per event.
+    The real adapter also has ``create_events`` (a batch on one store, in
+    order); ``event_proposals`` uses it when an adapter has it, else ``create_event`` per event.
     """
 
     def authorization_status(self) -> str: ...
 
     def request_access(self, timeout: float = REQUEST_TIMEOUT_SECONDS) -> bool: ...
 
-    def list_calendars(self) -> list[dict[str, str]]: ...
+    def list_calendars(self, required: Sequence[str] = ()) -> list[dict[str, str]]: ...
 
     def fetch_events(
         self, start: datetime, end: datetime, names: Sequence[str] | None = None
@@ -117,7 +163,7 @@ class CalendarAdapter(Protocol):
 
     def calendar_overview(self, start: datetime, end: datetime) -> list[dict[str, Any]]: ...
 
-    def list_writable_calendars(self) -> list[dict[str, Any]]: ...
+    def list_writable_calendars(self, required: Sequence[str] = ()) -> list[dict[str, Any]]: ...
 
     def create_event(
         self,
@@ -409,8 +455,82 @@ def _responds_to(obj: Any, selector: str) -> bool:
         return hasattr(obj, selector.replace(":", "_"))
 
 
+class SharedEventStore:
+    """One ``EKEventStore`` for every adapter of the process, made on first use, used under ``lock``.
+
+    Every method expects ``lock`` to be held by the caller (a plain
+    ``threading.Lock``, not reentrant: holders never take it twice).
+    """
+
+    def __init__(self, eventkit: Any, *, clock: Callable[[], float] | None = None):
+        self.eventkit = eventkit
+        self.lock = threading.Lock()
+        self._clock = clock if clock is not None else _time.monotonic
+        self._store: Any = None
+        self._last_reset: float | None = None
+        # How many stores were made (the first one, after access was granted, the last resort).
+        self.created = 0
+        self.resets = 0
+
+    def store(self) -> Any:
+        """The store, made now if there is none yet."""
+        if self._store is None:
+            self._store = self.eventkit.EKEventStore.alloc().init()
+            self.created += 1
+            self._last_reset = self._clock()  # a new store has nothing stale in it
+        return self._store
+
+    def renew(self) -> Any:
+        """A new store in place of the old one: after access was granted, and as the retries' last resort."""
+        self._store = None
+        return self.store()
+
+    def reset(self) -> None:
+        """Drop what the store cached, so the next read asks the calendar daemon again."""
+        store = self.store()
+        if _responds_to(store, "reset"):
+            try:
+                store.reset()
+            except Exception as exc:  # noqa: BLE001 - reading on the old cache beats failing
+                log.warning("캘린더 저장소를 새로 고치지 못했습니다: %s", _one_line_error(exc))
+        self.resets += 1
+        self._last_reset = self._clock()
+
+    def freshen(self) -> None:
+        """``reset`` unless the store was made or reset in the last ``RESET_MIN_INTERVAL_SECONDS``."""
+        if self._store is None:
+            self.store()
+            return
+        if self._last_reset is None or self._clock() - self._last_reset >= RESET_MIN_INTERVAL_SECONDS:
+            self.reset()
+
+
+_SHARED_GUARD = threading.Lock()
+_SHARED: SharedEventStore | None = None
+
+
+def shared_event_store(eventkit: Any) -> SharedEventStore:
+    """The process's store holder for ``eventkit``.
+
+    The real EventKit module is one object, so the bots get one store per
+    process. A different module (a test's fake) gets a holder of its own.
+    """
+    global _SHARED
+    with _SHARED_GUARD:
+        if _SHARED is None or _SHARED.eventkit is not eventkit:
+            _SHARED = SharedEventStore(eventkit)
+        return _SHARED
+
+
+def _one_line_error(exc: BaseException) -> str:
+    return " ".join(f"{type(exc).__name__}: {exc}".split())[:300]
+
+
 class EventKitCalendar:
-    """The macOS Calendar app through EventKit (macOS only)."""
+    """The macOS Calendar app through EventKit (macOS only), on the process's one store.
+
+    Public methods take the store's lock; the ``_`` helpers expect it held.
+    """
 
     def __init__(
         self,
@@ -420,6 +540,8 @@ class EventKitCalendar:
         foundation: Any = None,
         local_tz: tzinfo | None = None,
         env: Mapping[str, str] | None = None,
+        shared: SharedEventStore | None = None,
+        sleep: Callable[[float], None] | None = None,
     ):
         if eventkit is None or foundation is None:
             eventkit, foundation = load_eventkit()
@@ -428,29 +550,30 @@ class EventKitCalendar:
         self._tz = tz
         self._local_tz = local_tz
         self._env = env
-        self._store = self._new_store()
+        self._shared = shared if shared is not None else shared_event_store(eventkit)
+        self._sleep = sleep if sleep is not None else _time.sleep
 
-    def _new_store(self) -> Any:
-        return self._ek.EKEventStore.alloc().init()
-
-    def _refresh(self) -> None:
-        """A new store for the next read or write, so a removed calendar never lingers (see the module docstring)."""
-        self._store = self._new_store()
-        if _responds_to(self._store, "refreshSourcesIfNecessary"):
-            try:
-                self._store.refreshSourcesIfNecessary()  # asynchronous: only asks the daemon to sync
-            except Exception:  # noqa: BLE001 - the new store is fresh enough without it
-                pass
+    @property
+    def _store(self) -> Any:
+        return self._shared.store()
 
     def _exclusions(self) -> frozenset[str]:
         return exclusion_keys(config.get_calendar_exclude(self._env))
 
-    def authorization_status(self) -> str:
+    def _status(self) -> str:
         code = self._ek.EKEventStore.authorizationStatusForEntityType_(self._ek.EKEntityTypeEvent)
         return status_name(code, self._ek)
 
+    def authorization_status(self) -> str:
+        with self._shared.lock:
+            return self._status()
+
     def request_access(self, timeout: float = REQUEST_TIMEOUT_SECONDS) -> bool:
-        """Ask macOS for full calendar access (shows the system dialog once)."""
+        """Ask macOS for full calendar access (shows the system dialog once).
+
+        The lock is held only to ask and, once granted, to make a new store;
+        never while waiting for the user's click.
+        """
         done = threading.Event()
         outcome = {"granted": False}
 
@@ -458,32 +581,82 @@ class EventKitCalendar:
             outcome["granted"] = bool(granted)
             done.set()
 
-        if _responds_to(self._store, "requestFullAccessToEventsWithCompletion:"):  # macOS 14+
-            self._store.requestFullAccessToEventsWithCompletion_(completion)
-        else:
-            self._store.requestAccessToEntityType_completion_(self._ek.EKEntityTypeEvent, completion)
+        with self._shared.lock:
+            store = self._store
+            if _responds_to(store, "requestFullAccessToEventsWithCompletion:"):  # macOS 14+
+                store.requestFullAccessToEventsWithCompletion_(completion)
+            else:
+                store.requestAccessToEntityType_completion_(self._ek.EKEntityTypeEvent, completion)
         if not done.wait(timeout):
             return False
         if outcome["granted"]:
-            # A store created before access was granted sees no calendars.
-            self._store = self._new_store()
+            with self._shared.lock:
+                # A store created before access was granted sees no calendars.
+                self._shared.renew()
         return outcome["granted"]
 
-    def _calendars(self, *, include_excluded: bool = False) -> list[Any]:
-        """The store's event calendars, without the ``CALENDAR_EXCLUDE`` ones unless ``include_excluded``."""
-        calendars = list(self._store.calendarsForEntityType_(self._ek.EKEntityTypeEvent) or [])
+    def _visible_calendars(self, required: Iterable[str] = (), *, allow_empty: bool = False) -> list[Any]:
+        """Every event calendar the store shows (``CALENDAR_EXCLUDE`` ones too), with the safety net.
+
+        With full access, an empty list or a ``required`` calendar (any case,
+        NFC) that is not there is read again up to ``CALENDAR_RETRIES`` times,
+        ``CALENDAR_RETRY_DELAY_SECONDS`` apart: ``reset`` before each new read,
+        a new store before the last. Still nothing at all: ``NoCalendarsVisible``
+        (unless ``allow_empty``). A required calendar still missing is left to
+        the caller (it names the calendar). Without full access the list is
+        returned as it is (write-only access lists none).
+        """
+        wanted = {key for key in (normalize_name(name) for name in required) if key}
+        granted = self._status() == GRANTED
+        calendars: list[Any] = []
+        for attempt in range(CALENDAR_RETRIES + 1):
+            calendars = list(self._store.calendarsForEntityType_(self._ek.EKEntityTypeEvent) or [])
+            if not granted:
+                return calendars
+            missing = wanted - {normalize_name(_text(c.title())) for c in calendars}
+            if calendars and not missing:
+                return calendars
+            if attempt == CALENDAR_RETRIES:
+                break
+            log.warning(
+                "캘린더 목록을 다시 읽습니다 (%d/%d): 보이는 캘린더 %d개%s",
+                attempt + 1,
+                CALENDAR_RETRIES,
+                len(calendars),
+                f", 안 보이는 캘린더 {len(missing)}개" if calendars and missing else "",
+            )
+            self._sleep(CALENDAR_RETRY_DELAY_SECONDS)
+            if attempt + 1 == CALENDAR_RETRIES:
+                self._shared.renew()  # the last resort: a new store
+            else:
+                self._shared.reset()
+        if not calendars:
+            log.warning("전체 접근인데 %d번 다시 읽어도 캘린더가 하나도 보이지 않습니다", CALENDAR_RETRIES)
+            if not allow_empty:
+                raise NoCalendarsVisible()
+        else:
+            log.warning("%d번 다시 읽어도 필요한 캘린더 %d개가 보이지 않습니다 (보이는 캘린더 %d개)", CALENDAR_RETRIES, len(missing), len(calendars))
+        return calendars
+
+    def _calendars(self, required: Iterable[str] = (), *, include_excluded: bool = False) -> list[Any]:
+        """The store's event calendars (see ``_visible_calendars``), without the ``CALENDAR_EXCLUDE`` ones unless ``include_excluded``."""
+        calendars = self._visible_calendars(required)
         excluded = frozenset() if include_excluded else self._exclusions()
         if not excluded:
             return calendars
         return [c for c in calendars if not is_excluded(_text(c.title()), excluded)]
 
-    def list_calendars(self) -> list[dict[str, str]]:
-        """Every calendar (``CALENDAR_EXCLUDE`` ones too): ``[{name, source}]``."""
-        self._refresh()
-        calendars = []
-        for calendar in self._calendars(include_excluded=True):
-            calendars.append({"name": _text(calendar.title()), "source": _source_title(calendar)})
-        return calendars
+    def list_calendars(self, required: Sequence[str] = ()) -> list[dict[str, str]]:
+        """Every calendar (``CALENDAR_EXCLUDE`` ones too): ``[{name, source}]``.
+
+        Read again while one of ``required`` (e.g. the ``MACOS_CALENDARS`` names) is missing.
+        """
+        with self._shared.lock:
+            self._shared.freshen()
+            return [
+                {"name": _text(calendar.title()), "source": _source_title(calendar)}
+                for calendar in self._calendars(required, include_excluded=True)
+            ]
 
     def _events(self, start: datetime, end: datetime, calendars: list[Any] | None) -> list[Any]:
         """Non-canceled EKEvents overlapping ``[start, end)`` in ``calendars`` (``None``: every calendar)."""
@@ -503,16 +676,26 @@ class EventKitCalendar:
     def fetch_events(
         self, start: datetime, end: datetime, names: Sequence[str] | None = None
     ) -> list[dict[str, Any]]:
-        """Events overlapping ``[start, end)``; recurring events come expanded. Never from ``CALENDAR_EXCLUDE`` calendars."""
-        self._refresh()
-        calendars = None  # nil: every calendar
-        if names is not None or self._exclusions():
-            calendars = self._calendars()
-            if names is not None:
-                wanted = {normalize_name(name) for name in names}
-                calendars = [c for c in calendars if normalize_name(_text(c.title())) in wanted]
-            if not calendars:
-                return []  # passing nil would read every calendar instead
+        """Events overlapping ``[start, end)``; recurring events come expanded. Never from ``CALENDAR_EXCLUDE`` calendars.
+
+        Raises ``NoCalendarsVisible`` rather than reporting no events when full
+        access shows no calendar at all.
+        """
+        with self._shared.lock:
+            self._shared.freshen()
+            calendars = None  # nil: every calendar
+            if names is not None or self._exclusions():
+                calendars = self._calendars(names or ())
+                if names is not None:
+                    wanted = {normalize_name(name) for name in names}
+                    calendars = [c for c in calendars if normalize_name(_text(c.title())) in wanted]
+                if not calendars:
+                    return []  # passing nil would read every calendar instead
+            else:
+                self._visible_calendars()  # nil on a store showing no calendar would read nothing
+            return self._records(start, end, calendars)
+
+    def _records(self, start: datetime, end: datetime, calendars: list[Any] | None) -> list[dict[str, Any]]:
         records = []
         for event in self._events(start, end, calendars):
             start_date, end_date = event.startDate(), event.endDate()
@@ -536,10 +719,15 @@ class EventKitCalendar:
 
         ``[{name, source, type, writable, events}]`` in the Calendar app's
         order; ``events`` counts the non-canceled events overlapping
-        ``[start, end)`` (one read over every calendar).
+        ``[start, end)`` (one read over every calendar). No calendar at all
+        (after the retries) is an empty list: the diagnostic says so itself.
         """
-        self._refresh()
-        calendars = self._calendars(include_excluded=True)
+        with self._shared.lock:
+            self._shared.freshen()
+            return self._overview(start, end)
+
+    def _overview(self, start: datetime, end: datetime) -> list[dict[str, Any]]:
+        calendars = self._visible_calendars(allow_empty=True)
         counts: dict[str, int] = {}
         for event in self._events(start, end, None):
             key = _calendar_key(event.calendar())
@@ -570,12 +758,13 @@ class EventKitCalendar:
         except Exception:  # noqa: BLE001 - no default calendar: the caller reports it
             return None
 
-    def _writable(self) -> list[tuple[Any, dict[str, Any]]]:
+    def _writable(self, required: Iterable[str] = ()) -> list[tuple[Any, dict[str, Any]]]:
         """``(EKCalendar, {name, source, is_default})`` for calendars that accept new events (never ``CALENDAR_EXCLUDE`` ones)."""
+        calendars = self._calendars(required)
         default = self._default_calendar()
         default_id = _calendar_id(default)
         writable = []
-        for calendar in self._calendars():
+        for calendar in calendars:
             if not _allows_modifications(calendar):
                 continue
             if default is None:
@@ -592,10 +781,15 @@ class EventKitCalendar:
             writable.append((calendar, info))
         return writable
 
-    def list_writable_calendars(self) -> list[dict[str, Any]]:
-        """Calendars new events can go to: ``[{name, source, is_default}]``."""
-        self._refresh()
-        return [info for _calendar, info in self._writable()]
+    def list_writable_calendars(self, required: Sequence[str] = ()) -> list[dict[str, Any]]:
+        """Calendars new events can go to: ``[{name, source, is_default}]``.
+
+        Read again while one of ``required`` (e.g. the category calendars) is
+        missing; ``NoCalendarsVisible`` when full access shows no calendar at all.
+        """
+        with self._shared.lock:
+            self._shared.freshen()
+            return [info for _calendar, info in self._writable(required)]
 
     def _nsdate(self, timestamp: float) -> Any:
         return self._ns.NSDate.dateWithTimeIntervalSince1970_(timestamp)
@@ -632,15 +826,66 @@ class EventKitCalendar:
         ``end`` is exclusive (an all-day event on one day ends at the next
         midnight, like ``event_record``).
         """
+        event = {
+            "title": title,
+            "start": start,
+            "end": end,
+            "all_day": all_day,
+            "location": location,
+            "notes": notes,
+            "calendar_name": calendar_name,
+        }
+        return self.create_events([event])[0]
+
+    def create_events(self, events: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        """Add several events, in order, on the one store under one hold of the lock. Never raises.
+
+        Each event is a mapping with ``create_event``'s arguments (``title``,
+        ``start``, ``end``, ``all_day``, optional ``location``, ``notes``,
+        ``calendar_name``). One result per event, like ``create_event``; each
+        succeeds or fails on its own. The calendars are read once for the batch
+        (again while one the batch needs is missing).
+        """
+        events = list(events)
+        if not events:
+            return []
+        with self._shared.lock:
+            try:
+                status = self._status()
+                if status not in WRITE_STATUSES:
+                    return [_create_failure(write_permission_hint(status)) for _ in events]
+                self._shared.freshen()
+                target = config.get_calendar_write_target(self._env)
+                needed = [str(event.get("calendar_name") or target or "") for event in events]
+                writable = self._writable(needed)
+            except NoCalendarsVisible as exc:
+                return [_create_failure(str(exc)) for _ in events]
+            except Exception as exc:  # noqa: BLE001 - nothing saved yet: every event reports it
+                return [_create_failure(f"캘린더에 저장하지 못했어요 ({_one_line_error(exc)})") for _ in events]
+            results = []
+            for event in events:  # one by one: a saved event is never reported as failed
+                try:
+                    results.append(self._save_new(writable, target, **dict(event)))
+                except Exception as exc:  # noqa: BLE001 - e.g. an unknown key; this event only
+                    results.append(_create_failure(f"캘린더에 저장하지 못했어요 ({_one_line_error(exc)})"))
+            return results
+
+    def _save_new(
+        self,
+        writable: list[tuple[Any, dict[str, Any]]],
+        target: str,
+        *,
+        title: str,
+        start: datetime,
+        end: datetime,
+        all_day: bool,
+        location: str | None = None,
+        notes: str | None = None,
+        calendar_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Save one new event with the store's calendars already read (``writable``). Lock held; never raises."""
         try:
-            status = self.authorization_status()
-            if status not in WRITE_STATUSES:
-                return _create_failure(write_permission_hint(status))
-            self._refresh()  # the calendars and the new event share this one store
-            writable = self._writable()
-            name, error = resolve_write_calendar(
-                [info for _calendar, info in writable], calendar_name, config.get_calendar_write_target(self._env)
-            )
+            name, error = resolve_write_calendar([info for _calendar, info in writable], calendar_name, target)
             if error:
                 return _create_failure(error)
             if name is None:
@@ -674,10 +919,14 @@ class EventKitCalendar:
             if not ok:
                 detail = error_text(save_error) or "알 수 없는 오류"
                 return _create_failure(f"캘린더에 저장하지 못했어요 ({detail})", label)
-            return {"ok": True, "id": _text(event.eventIdentifier()) or None, "calendar": label, "error": None}
         except Exception as exc:  # noqa: BLE001 - reported per event, never raised
-            detail = " ".join(f"{type(exc).__name__}: {exc}".split())[:300]
-            return _create_failure(f"캘린더에 저장하지 못했어요 ({detail})")
+            return _create_failure(f"캘린더에 저장하지 못했어요 ({_one_line_error(exc)})")
+        # Saved: from here on it is a success whatever happens, so a retry never adds it twice.
+        try:
+            ident = _text(event.eventIdentifier()) or None
+        except Exception:  # noqa: BLE001 - the id is only informative
+            ident = None
+        return {"ok": True, "id": ident, "calendar": label, "error": None}
 
     def find_similar_events(self, start: datetime, end: datetime, title: str) -> list[dict[str, Any]]:
         """Existing events (every calendar but ``CALENDAR_EXCLUDE``) within two hours of ``[start, end)`` on that day that look the same."""

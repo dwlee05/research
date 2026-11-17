@@ -26,6 +26,7 @@ Proposals live in the state file (``StateStore``) and expire after 24 hours.
 
 from __future__ import annotations
 
+import logging
 import re
 import secrets
 import unicodedata
@@ -39,7 +40,9 @@ from ..personas import PERSONAS
 from ..slack_format import WEEKDAYS_KO
 from ..state import StateStore, utcnow
 from . import macos_calendar
-from .common import safe_error
+from .common import safe_error, scrub
+
+log = logging.getLogger("mungchi.calendar")
 
 AdapterFactory = Callable[[tzinfo], macos_calendar.CalendarAdapter]
 
@@ -705,7 +708,11 @@ def run_propose(
         # CALENDAR_CATEGORIES wins over CALENDAR_WRITE_TARGET: the user picks a category.
         if status == macos_calendar.WRITE_ONLY:
             return {"ok": False, "error": WRITE_ONLY_CATEGORY_TEXT}
-        offered, missing = available_categories(categories, adapter.list_writable_calendars())
+        try:
+            writable = adapter.list_writable_calendars(required=[c.calendar for c in categories])
+        except macos_calendar.NoCalendarsVisible as exc:
+            return {"ok": False, "error": str(exc)}  # the permission, not the category names
+        offered, missing = available_categories(categories, writable)
         if not offered:
             names = ", ".join(f"'{c.calendar}'" for c in categories)
             return {"ok": False, "error": f"Mac 캘린더에 카테고리 캘린더({names})가 하나도 없어요. {CATEGORY_FIX_HINT}"}
@@ -732,7 +739,11 @@ def run_propose(
         target = config.get_calendar_write_target(env)
         if status == macos_calendar.WRITE_ONLY and (requested or target):
             return {"ok": False, "error": WRITE_ONLY_CHOICE_TEXT}
-        writable = adapter.list_writable_calendars() if status == macos_calendar.GRANTED else []
+        try:
+            needed = [requested or target] if requested or target else []
+            writable = adapter.list_writable_calendars(required=needed) if status == macos_calendar.GRANTED else []
+        except macos_calendar.NoCalendarsVisible as exc:
+            return {"ok": False, "error": str(exc)}
         calendar_name, calendar_error = macos_calendar.resolve_write_calendar(writable, requested, target)
         if calendar_error:
             return {"ok": False, "error": calendar_error}
@@ -903,48 +914,75 @@ def create_proposal_events(
         except Exception as exc:  # noqa: BLE001 - reported, never raised
             problem = f"Mac 캘린더를 열지 못했어요 ({safe_error(exc)})"
     if problem is not None:
+        log.warning("캘린더에 일정을 추가하지 못했습니다: %s", scrub(problem))
         outcome.fatal = problem
         return outcome
     calendar_name = proposal.get("calendar") or None
     by_label = {str(c["label"]): str(c["calendar"]) for c in proposal_categories(proposal)}
     chosen = str(proposal.get("chosen_category") or "") or None
+    # In proposal order: a result already known, or (summary, label, what to create).
+    planned: list[CreationResult | tuple[str, str, dict[str, Any]]] = []
     for event in events:
         if isinstance(event, CreationResult):
-            outcome.results.append(event)
+            planned.append(event)
             continue
         summary = event_summary(event, today)
         label = ""
         if by_label:
             label = event.category or chosen or ""
             if label not in by_label:
-                outcome.results.append(CreationResult(summary=summary, error="카테고리를 고르지 않아 추가하지 않았어요"))
+                planned.append(CreationResult(summary=summary, error="카테고리를 고르지 않아 추가하지 않았어요"))
                 continue
             calendar_name = by_label[label]
         if event.needs_time or event.start is None or event.end is None:
-            outcome.results.append(CreationResult(summary=summary, skipped=True, category=label))
+            planned.append(CreationResult(summary=summary, skipped=True, category=label))
             continue
-        try:
-            created = adapter.create_event(
-                event.title,
-                event.start,
-                event.end,
-                event.all_day,
-                location=event.location or None,
-                notes=event.notes or None,
-                calendar_name=calendar_name,
-            )
-        except Exception as exc:  # noqa: BLE001 - the other events still go in
-            created = {"ok": False, "error": safe_error(exc)}
+        new_event = {
+            "title": event.title,
+            "start": event.start,
+            "end": event.end,
+            "all_day": event.all_day,
+            "location": event.location or None,
+            "notes": event.notes or None,
+            "calendar_name": calendar_name,
+        }
+        planned.append((summary, label, new_event))
+    to_create = [item[2] for item in planned if isinstance(item, tuple)]
+    created = iter(_create_all(adapter, to_create))
+    for item in planned:
+        if isinstance(item, CreationResult):
+            outcome.results.append(item)
+            continue
+        summary, label, new_event = item
+        result = next(created, None) or {"ok": False, "error": "결과를 받지 못했어요"}
+        ok = bool(result.get("ok"))
+        error = str(result.get("error") or ("" if ok else "알 수 없는 오류"))
+        if not ok:  # the event's title stays out of the log, like every message text
+            where = label or new_event.get("calendar_name") or DEFAULT_CALENDAR_LABEL
+            log.warning("캘린더 일정 추가 실패 (%s): %s", where, scrub(error))
         outcome.results.append(
-            CreationResult(
-                summary=summary,
-                ok=bool(created.get("ok")),
-                calendar=str(created.get("calendar") or ""),
-                error=str(created.get("error") or ("" if created.get("ok") else "알 수 없는 오류")),
-                category=label,
-            )
+            CreationResult(summary=summary, ok=ok, calendar=str(result.get("calendar") or ""), error=error, category=label)
         )
     return outcome
+
+
+def _create_all(adapter: macos_calendar.CalendarAdapter, new_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """``create_event`` results for ``new_events``, in order: one batch (``create_events``) when the adapter has it."""
+    if not new_events:
+        return []
+    batch = getattr(adapter, "create_events", None)
+    if callable(batch):
+        try:
+            return list(batch(new_events))
+        except Exception as exc:  # noqa: BLE001 - adapters report per event; this is the last line
+            return [{"ok": False, "error": safe_error(exc)} for _ in new_events]
+    results = []
+    for new_event in new_events:
+        try:
+            results.append(adapter.create_event(**new_event))
+        except Exception as exc:  # noqa: BLE001 - the other events still go in
+            results.append({"ok": False, "error": safe_error(exc)})
+    return results
 
 
 def creation_report(outcome: CreationOutcome) -> str:

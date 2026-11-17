@@ -9,8 +9,12 @@ exposes (as far as they could be checked without a Mac).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import json
+import logging
+import threading
+import time as time_module
 import unicodedata
 from datetime import date, datetime, time, timedelta, timezone
 from types import SimpleNamespace
@@ -55,6 +59,7 @@ from mungchi.tools.macos_calendar import (
     similar_events,
     titles_similar,
 )
+from mungchi.tools.calendar_tool import run_schedule
 from mungchi.tools.propose_tool import make_propose_calendar_events
 
 SEOUL = ZoneInfo("Asia/Seoul")
@@ -116,7 +121,7 @@ class FakeCalendarApp:
     def authorization_status(self):
         return self.status
 
-    def list_writable_calendars(self):
+    def list_writable_calendars(self, required=()):
         return [dict(c) for c in self.writable]
 
     def fetch_events(self, start, end, names=None):
@@ -733,9 +738,12 @@ class Calendar:
 
 
 class World:
-    def __init__(self, status=3, save_result=(True, None)):
+    """``empty_reads``: how many calendar list reads come back empty (the intermittent bug on the user's Mac)."""
+
+    def __init__(self, status=3, save_result=(True, None), empty_reads=0):
         self.status = status
         self.save_result = save_result
+        self.empty_reads = empty_reads
         self.calendars: list = []
         self.default = None
         self.events: list = []  # existing EKEvents for find_similar_events
@@ -743,6 +751,27 @@ class World:
         self.saves: list = []
         self.predicates: list = []
         self.stores: list = []
+        self.resets: list = []
+        self.calendar_reads = 0
+        self.sleeps: list = []  # the waits between retries (never really slept)
+        # Concurrency check: EventKit calls running at the same time (must never exceed 1).
+        self.pause = 0.0
+        self.busy = 0
+        self.max_busy = 0
+        self.guard = threading.Lock()
+
+    @contextlib.contextmanager
+    def call(self):
+        with self.guard:
+            self.busy += 1
+            self.max_busy = max(self.max_busy, self.busy)
+        try:
+            if self.pause:
+                time_module.sleep(self.pause)
+            yield
+        finally:
+            with self.guard:
+                self.busy -= 1
 
 
 class ExistingEvent:
@@ -819,32 +848,42 @@ def fake_eventkit(world: World) -> SimpleNamespace:
             world.stores.append(self)
             return self
 
+        def reset(self):
+            world.resets.append(self)
+
         @classmethod
         def authorizationStatusForEntityType_(cls, entity_type):
             return world.status
 
         def calendarsForEntityType_(self, entity_type):
-            return list(world.calendars) if world.status == 3 else []
+            with world.call():
+                world.calendar_reads += 1
+                if world.empty_reads > 0:
+                    world.empty_reads -= 1
+                    return []
+                return list(world.calendars) if world.status == 3 else []
 
         def defaultCalendarForNewEvents(self):
             return world.default
 
         def saveEvent_span_commit_error_(self, event, span, commit, error):
             assert event.store is self  # EventKit only saves an event through the store that made it
-            world.saves.append((event, span, commit, error))
-            return world.save_result
+            with world.call():
+                world.saves.append((event, span, commit, error))
+                return world.save_result
 
         def predicateForEventsWithStartDate_endDate_calendars_(self, start, end, calendars):
             return (start, end, calendars)
 
         def eventsMatchingPredicate_(self, predicate):
-            world.predicates.append(predicate)
-            start, end, calendars = predicate
-            return [
-                e for e in world.events
-                if (calendars is None or e.calendar() in calendars)
-                and e.startDate().ts < end.ts and e.endDate().ts > start.ts
-            ]
+            with world.call():
+                world.predicates.append(predicate)
+                start, end, calendars = predicate
+                return [
+                    e for e in world.events
+                    if (calendars is None or e.calendar() in calendars)
+                    and e.startDate().ts < end.ts and e.endDate().ts > start.ts
+                ]
 
     return SimpleNamespace(
         EKEventStore=EKEventStore,
@@ -860,9 +899,17 @@ def fake_eventkit(world: World) -> SimpleNamespace:
     )
 
 
-def adapter(world, env=None):
+def adapter(world, env=None, shared=None, sleep=None):
+    """The real adapter on fake EventKit (a new fake module, so a new store holder, unless ``shared`` is given)."""
+    eventkit = shared.eventkit if shared is not None else fake_eventkit(world)
     return EventKitCalendar(
-        SEOUL, eventkit=fake_eventkit(world), foundation=SimpleNamespace(NSDate=NSDate), local_tz=SEOUL, env=env or {}
+        SEOUL,
+        eventkit=eventkit,
+        foundation=SimpleNamespace(NSDate=NSDate),
+        local_tz=SEOUL,
+        env=env or {},
+        shared=shared,
+        sleep=sleep or world.sleeps.append,
     )
 
 
@@ -979,21 +1026,250 @@ def test_find_similar_events_reads_two_hours_around_on_that_day_only():
     assert [(r["title"], r["calendar"]) for r in found] == [("신임교수모임", "연구"), ("세미나", "Work")]
 
 
-# ---------------------------------------------------------------- fresh store and CALENDAR_EXCLUDE on the write path
+# ---------------------------------------------------------------- one store, the safety net, CALENDAR_EXCLUDE on the write path
 
 
-def test_write_path_reads_on_a_new_store_every_time():
+def test_the_write_path_reuses_one_store():
     world, research, work = calendars_world()
-    app = adapter(world)
+    shared = macos_calendar.SharedEventStore(fake_eventkit(world))
+    app = adapter(world, shared=shared)
     assert [c["name"] for c in app.list_writable_calendars()] == ["연구", "Work"]
     world.calendars.remove(work)  # removed in the Calendar app while the bot runs
-    stores = len(world.stores)
-    assert [c["name"] for c in app.list_writable_calendars()] == ["연구"]
+    assert [c["name"] for c in adapter(world, shared=shared).list_writable_calendars()] == ["연구"]
     app.find_similar_events(at(10, 22, 12), at(10, 22, 13), "x")
-    assert app.create_event("x", at(10, 22, 9), at(10, 22, 10), False)["ok"] is True
-    assert len(world.stores) == stores + 3
+    assert adapter(world, shared=shared).create_event("x", at(10, 22, 9), at(10, 22, 10), False)["ok"] is True
+    [store] = world.stores
     # The event is built and saved on the store its calendar came from (asserted by the fake's saveEvent).
-    assert world.built[-1].store is world.stores[-1]
+    assert world.built[-1].store is store and shared.created == 1
+
+
+def batch(*titles, calendar_name=None, day=22):
+    return [
+        {
+            "title": title,
+            "start": at(10, day, 9 + index),
+            "end": at(10, day, 10 + index),
+            "all_day": False,
+            "location": None,
+            "notes": None,
+            "calendar_name": calendar_name,
+        }
+        for index, title in enumerate(titles)
+    ]
+
+
+def test_a_batch_is_created_on_one_store_in_order_with_the_calendars_read_once():
+    world, research, work = calendars_world()
+    shared = macos_calendar.SharedEventStore(fake_eventkit(world))
+    results = adapter(world, shared=shared).create_events(batch("a", "b", "c", "d", "e", "f", calendar_name="Work"))
+    assert [r["ok"] for r in results] == [True] * 6 and {r["calendar"] for r in results} == {"Work"}
+    assert [event.fields["title"] for event, *_ in world.saves] == ["a", "b", "c", "d", "e", "f"]
+    assert len(world.stores) == 1 and all(event.store is world.stores[0] for event in world.built)
+    assert world.calendar_reads == 1  # one read of the calendars for the whole batch
+    assert adapter(world, shared=shared).create_events([]) == []
+
+
+def test_a_batch_holds_the_lock_so_other_reads_wait_until_it_is_done():
+    world, research, work = calendars_world()
+    world.pause = 0.01
+    shared = macos_calendar.SharedEventStore(fake_eventkit(world))
+    order: list[str] = []
+    real_save = shared.eventkit.EKEventStore.saveEvent_span_commit_error_
+
+    def save(store, event, span, commit, error):
+        order.append(f"save {event.fields['title']}")
+        return real_save(store, event, span, commit, error)
+
+    shared.eventkit.EKEventStore.saveEvent_span_commit_error_ = save
+    writer = threading.Thread(target=lambda: adapter(world, shared=shared).create_events(batch("a", "b", "c", "d")))
+    writer.start()
+    while not world.saves:  # the batch has started saving
+        time_module.sleep(0.001)
+    reader = threading.Thread(
+        target=lambda: order.append(f"read {len(adapter(world, shared=shared).fetch_events(at(10, 22), at(10, 23)))}")
+    )
+    reader.start()
+    writer.join(5)
+    reader.join(5)
+    assert order == ["save a", "save b", "save c", "save d", "read 0"]
+    assert world.max_busy == 1 and len(world.stores) == 1
+
+
+def test_one_saved_event_is_never_reported_as_failed():
+    world, research, work = calendars_world()
+    results = adapter(world).create_events([*batch("a"), {**batch("b")[0], "unknown": 1}, *batch("c", day=23)])
+    assert [r["ok"] for r in results] == [True, False, True]
+    assert "TypeError" in results[1]["error"] and len(world.saves) == 2
+
+    # An event id that cannot be read after a successful save is still a success (a retry would add it twice).
+    class NoId:
+        def __init__(self, event):
+            self.event = event
+
+        def __getattr__(self, name):
+            return getattr(self.event, name)
+
+        def eventIdentifier(self):
+            raise RuntimeError("gone")
+
+    world, research, work = calendars_world()
+    shared = macos_calendar.SharedEventStore(fake_eventkit(world))
+    make = shared.eventkit.EKEvent.eventWithEventStore_
+    shared.eventkit.EKEvent.eventWithEventStore_ = lambda store: NoId(make(store))
+    real_save = shared.eventkit.EKEventStore.saveEvent_span_commit_error_
+    shared.eventkit.EKEventStore.saveEvent_span_commit_error_ = lambda store, event, *rest: real_save(store, event.event, *rest)
+    assert adapter(world, shared=shared).create_event("x", at(10, 22, 9), at(10, 22, 10), False) == {
+        "ok": True, "id": None, "calendar": "연구", "error": None
+    }
+
+
+def category_world(**kwargs):
+    world = World(**kwargs)
+    world.calendars = [Calendar(name) for name in CATEGORY_NAMES] + [Calendar("연구")]
+    world.default = world.calendars[-1]
+    return world
+
+
+def test_the_production_path_uses_one_store_for_reads_proposals_and_creations(monkeypatch):
+    world = category_world()
+    eventkit = fake_eventkit(world)
+    monkeypatch.setattr(macos_calendar, "load_eventkit", lambda: (eventkit, SimpleNamespace(NSDate=NSDate)))
+    store = StateStore(config.get_state_path())
+    env = {**CAT_ENV, "CALENDAR_EXCLUDE": "대한민국 공휴일"}
+    for _ in range(2):
+        assert run_schedule(env=env, now=NOW, platform="darwin")["ok"] is True
+    payload = run_propose({"events": [EXAMPLE, {**EXAMPLE, "date": "2026-10-29"}]}, KEY, env=env, now=NOW, store=store, platform="darwin")
+    assert payload["ok"] is True and payload["categories"] == CATEGORY_NAMES
+    proposal = {**store.pending_proposal(KEY, NOW), "chosen_category": "Event-KHU"}
+    outcome = create_proposal_events(proposal, env=env, now=NOW, platform="darwin")
+    assert outcome.created == 2
+    assert len(world.stores) == 1  # every read and write of the process on one store
+
+
+def test_concurrent_proposals_and_creations_share_one_store_one_call_at_a_time():
+    world = category_world()
+    world.pause = 0.002
+    shared = macos_calendar.SharedEventStore(fake_eventkit(world))
+    errors: list = []
+
+    def work(index):
+        try:
+            app = adapter(world, shared=shared)
+            if index % 2:
+                assert all(r["ok"] for r in app.create_events(batch(f"w{index}", calendar_name="Research")))
+            else:
+                assert len(app.list_writable_calendars(required=CATEGORY_NAMES)) == 6
+                app.find_similar_events(at(10, 22, 12), at(10, 22, 13), "x")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=work, args=(i,)) for i in range(16)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    assert errors == [] and len(world.saves) == 8
+    assert len(world.stores) == 1 and world.max_busy == 1
+
+
+def real_categories(world, events, env=None, store=None):
+    store = store or StateStore(config.get_state_path())
+    payload = run_propose(
+        {"events": events, "source_note": NOTE}, KEY, env={**CAT_ENV, **(env or {})}, now=NOW, store=store,
+        adapter_factory=lambda tz: adapter(world, env={**CAT_ENV, **(env or {})}), platform="darwin",
+    )
+    return payload, store
+
+
+def test_proposals_and_creations_succeed_after_empty_reads(caplog):
+    world = category_world(empty_reads=2)
+    with caplog.at_level(logging.WARNING, logger="mungchi.calendar"):
+        payload, store = real_categories(world, [EXAMPLE])
+    assert payload["ok"] is True and payload["categories"] == CATEGORY_NAMES
+    assert world.sleeps == [1.0, 1.0] and len(world.resets) == 2
+    assert "캘린더 목록을 다시 읽습니다 (1/3): 보이는 캘린더 0개" in caplog.text
+
+    world.empty_reads = 2
+    proposal = {**store.pending_proposal(KEY, NOW), "chosen_category": "Event-KHU"}
+    outcome = create_proposal_events(
+        proposal, env=CAT_ENV, now=NOW, adapter_factory=lambda tz: adapter(world, env=CAT_ENV), platform="darwin"
+    )
+    assert outcome.created == 1 and world.saves[-1][0].fields["calendar"].title() == "Event-KHU"
+
+
+def test_a_missing_category_calendar_is_read_again_before_a_creation():
+    world = category_world()
+    khu = world.calendars.pop(4)
+
+    def sleep(seconds):  # the calendar shows up again by the next read
+        world.sleeps.append(seconds)
+        if khu not in world.calendars:
+            world.calendars.insert(4, khu)
+
+    [result] = adapter(world, sleep=sleep).create_events(batch("x", calendar_name="Event-KHU"))
+    assert result["ok"] is True and result["calendar"] == "Event-KHU" and world.sleeps == [1.0]
+
+
+def test_no_calendar_at_all_gives_the_permission_message_not_the_category_hint():
+    world = category_world(empty_reads=99)
+    payload, store = real_categories(world, [EXAMPLE])
+    assert payload == {"ok": False, "error": macos_calendar.NO_CALENDARS_VISIBLE_TEXT}
+    assert event_proposals.CATEGORY_FIX_HINT not in payload["error"] and store.pending_proposal(KEY, NOW) is None
+    assert world.sleeps == [1.0, 1.0, 1.0]
+    # Without categories (the yes / no flow) too.
+    world = category_world(empty_reads=99)
+    payload, _ = real_categories(world, [EXAMPLE], env={"CALENDAR_CATEGORIES": ""})
+    assert payload == {"ok": False, "error": macos_calendar.NO_CALENDARS_VISIBLE_TEXT}
+    # Creating: every event says so.
+    world = category_world(empty_reads=99)
+    proposal = {
+        "calendar": None,
+        "categories": [{"label": "Event-KHU", "calendar": "Event-KHU", "aliases": []}],
+        "chosen_category": "Event-KHU",
+        "events": [ProposedEvent(title=t, day=date(2026, 10, 22), start=at(10, 22, 9), end=at(10, 22, 10)).to_state() for t in "ab"],
+    }
+    outcome = create_proposal_events(proposal, env=CAT_ENV, now=NOW, adapter_factory=lambda tz: adapter(world), platform="darwin")
+    assert [r.error for r in outcome.results] == [macos_calendar.NO_CALENDARS_VISIBLE_TEXT] * 2 and world.saves == []
+
+
+def test_calendars_visible_but_no_category_calendar_gives_the_category_hint():
+    world = World()
+    world.calendars = [Calendar("연구"), Calendar("Work")]
+    payload, _ = real_categories(world, [EXAMPLE])
+    assert payload["ok"] is False and payload["error"].endswith(event_proposals.CATEGORY_FIX_HINT)
+    assert macos_calendar.NO_CALENDARS_VISIBLE_TEXT not in payload["error"]
+    assert world.sleeps == [1.0, 1.0, 1.0]  # the category calendars were looked for again first
+
+
+def test_a_fake_adapter_that_sees_no_calendar_can_say_so():
+    class Empty(FakeCalendarApp):
+        def list_writable_calendars(self, required=()):
+            raise macos_calendar.NoCalendarsVisible()
+
+    payload, _ = run_categories(Empty(), [EXAMPLE])
+    assert payload == {"ok": False, "error": macos_calendar.NO_CALENDARS_VISIBLE_TEXT}
+
+
+def test_failed_proposals_and_creations_are_logged_at_warning(caplog, monkeypatch):
+    monkeypatch.setattr(config, "current_platform", lambda: "darwin")
+    monkeypatch.setattr(macos_calendar, "default_adapter", lambda tz: FakeCalendarApp(fail_titles={"실패할 일정"}))
+    monkeypatch.setenv("CALENDAR_CATEGORIES", "")
+    secret = "-".join(["xoxb", "123456789012", "abcdefghijklmnop"])  # a token shape, built so scanners skip it
+    tool = make_propose_calendar_events(KEY)
+    with caplog.at_level(logging.WARNING, logger="mungchi.calendar"):
+        asyncio.run(tool.handler({"events": [{"title": "", "date": f"x {secret}"}]}))
+    [record] = [r for r in caplog.records if "propose_calendar_events 실패" in r.getMessage()]
+    assert record.levelno == logging.WARNING
+    assert "일정을 제안하지 못했어요. 아래를 고쳐 다시 부르세요. / 1번 일정: 제목(title)이 없어요." in record.getMessage()
+    assert secret not in record.getMessage()
+
+    caplog.clear()
+    app = FakeCalendarApp(fail_titles={"실패할 일정"})
+    _, proposal = stored_proposal(app, [EXAMPLE, {"title": "실패할 일정", "date": "2026-10-23", "start_time": "10:00"}])
+    with caplog.at_level(logging.WARNING, logger="mungchi.calendar"):
+        create_proposal_events(proposal, env=ENV, now=NOW, adapter_factory=lambda tz: app, platform="darwin")
+    failures = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert failures == ["캘린더 일정 추가 실패 (연구): 캘린더에 저장하지 못했어요 (읽기 전용 캘린더)"]
 
 
 def test_excluded_calendars_are_never_write_targets_or_duplicates():
@@ -1041,7 +1317,7 @@ def test_calendar_setup_lists_where_new_events_go():
     assert write_target_lines(app, {**ENV, "CALENDAR_WRITE_TARGET": "가족"})[-1].startswith("[경고] CALENDAR_WRITE_TARGET의 '가족'")
 
     class Broken(FakeCalendarApp):
-        def list_writable_calendars(self):
+        def list_writable_calendars(self, required=()):
             raise RuntimeError("EKErrorDomain")
 
     assert write_target_lines(Broken(), {})[0].startswith("[경고] 일정을 추가할 수 있는 캘린더를 확인하지 못했습니다")
@@ -1049,7 +1325,7 @@ def test_calendar_setup_lists_where_new_events_go():
 
 def test_calendar_setup_run_shows_the_write_target():
     class SetupApp(FakeCalendarApp):
-        def list_calendars(self):
+        def list_calendars(self, required=()):
             return [{"name": c["name"], "source": c["source"]} for c in self.writable]
 
     out = io.StringIO()

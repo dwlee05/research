@@ -900,6 +900,19 @@ def calendar_preflight(
     def label(status: str) -> str:
         return macos_calendar.STATUS_LABELS.get(status, status)
 
+    def say_granted(adapter: macos_calendar.CalendarAdapter, note: str = "") -> None:
+        """The status line with how many calendars the service sees (``service status`` shows it); a warning when none."""
+        try:
+            count: int | None = len(adapter.list_calendars())
+            seen = f"캘린더 {count}개 보임"
+        except macos_calendar.NoCalendarsVisible:
+            count, seen = 0, "캘린더 0개 보임"
+        except Exception as exc:  # noqa: BLE001 - only informative; the bots start anyway
+            count, seen = None, f"캘린더 수 확인 못 함 ({safe_error(exc)})"
+        say(f"{CALENDAR_LOG_KEY} {label(macos_calendar.GRANTED)}{note} · {seen}")
+        if count == 0:
+            say(f"[경고] {macos_calendar.NO_CALENDARS_VISIBLE_TEXT}")
+
     def check() -> str | None:
         try:
             adapter = (adapter_factory or macos_calendar.default_adapter)(config.get_timezone(env))
@@ -907,7 +920,9 @@ def calendar_preflight(
             say(f"{CALENDAR_LOG_KEY} 확인 못 함 (EventKit을 불러오지 못했습니다). {macos_calendar.EVENTKIT_MISSING_HINT}")
             return None
         status = adapter.authorization_status()
-        if status != macos_calendar.NOT_DETERMINED:
+        if status == macos_calendar.GRANTED:
+            say_granted(adapter)
+        elif status != macos_calendar.NOT_DETERMINED:
             say(f"{CALENDAR_LOG_KEY} {label(status)}")
         else:
             say(
@@ -921,6 +936,8 @@ def calendar_preflight(
                     f"{CALENDAR_LOG_KEY} {label(status)} (확인 창의 응답을 받지 못했습니다. 봇은 그대로 시작합니다. "
                     f"다시 물으려면 {COMMAND} restart)"
                 )
+            elif status == macos_calendar.GRANTED:
+                say_granted(adapter, " (요청 결과)")
             else:
                 say(f"{CALENDAR_LOG_KEY} {label(status)} (요청 결과)")
         if status not in (macos_calendar.GRANTED, macos_calendar.NOT_DETERMINED):

@@ -47,6 +47,7 @@ from mungchi.service import (
     tail_lines,
 )
 from mungchi.state import StateStore
+from mungchi.tools import macos_calendar
 from mungchi.tools.macos_calendar import DENIED, GRANTED, NOT_DETERMINED, EventKitUnavailable
 from mungchi.version import run_git as real_run_git  # conftest swaps version.run_git for "no git"
 
@@ -1017,9 +1018,10 @@ def test_tail_lines_reads_backwards_in_blocks(tmp_path):
 
 
 class FakeAdapter:
-    def __init__(self, status=GRANTED, grant=True):
+    def __init__(self, status=GRANTED, grant=True, calendars=10):
         self.status = status
         self.grant = grant
+        self.calendars = calendars  # how many it sees, or an exception to raise
         self.calls: list = []
 
     def authorization_status(self):
@@ -1030,6 +1032,12 @@ class FakeAdapter:
         self.calls.append(("request", timeout))
         self.status = GRANTED if self.grant else DENIED
         return self.grant
+
+    def list_calendars(self, required=()):
+        self.calls.append("list")
+        if isinstance(self.calendars, Exception):
+            raise self.calendars
+        return [{"name": f"캘린더 {i}", "source": "iCloud"} for i in range(self.calendars)]
 
 
 def run_service(adapter_factory, env=None, platform="darwin", slack_code=0):
@@ -1058,13 +1066,13 @@ def test_run_asks_for_calendar_access_once_then_starts_the_bots():
     before = signal.getsignal(signal.SIGTERM)
     code, log, events = run_service(lambda tz: adapter)
     assert code == 0
-    assert adapter.calls == ["status", ("request", 300)]
+    assert adapter.calls == ["status", ("request", 300), "list"]
     assert events == ["load_env", "slack", "sigterm=True"]  # SIGTERM stops the bots like Ctrl+C
     assert signal.getsignal(signal.SIGTERM) is before  # and is restored afterwards
     lines = log.splitlines()
     assert lines[0].startswith("2026-10-06 08:00:00 [서비스] Slack 봇 서비스를 시작합니다 (PID ")
     assert "[서비스] 캘린더 접근 권한: 아직 정하지 않음 → 지금 요청합니다. '비서실 고뭉치' 확인 창에서 '허용'을 눌러 주세요" in log
-    assert "[서비스] 캘린더 접근 권한: 허용됨(전체 접근) (요청 결과)" in log
+    assert "[서비스] 캘린더 접근 권한: 허용됨(전체 접근) (요청 결과) · 캘린더 10개 보임\n" in log
     assert log.index("요청 결과") < log.index("Slack 봇을 시작합니다")
     assert lines[-1] == "2026-10-06 08:00:00 [서비스] Slack 봇이 끝났습니다 (종료 코드 0)."
 
@@ -1072,8 +1080,28 @@ def test_run_asks_for_calendar_access_once_then_starts_the_bots():
 def test_run_does_not_ask_when_already_granted():
     adapter = FakeAdapter(status=GRANTED)
     code, log, events = run_service(lambda tz: adapter)
-    assert code == 0 and adapter.calls == ["status"] and "slack" in events
-    assert "[서비스] 캘린더 접근 권한: 허용됨(전체 접근)\n" in log
+    assert code == 0 and adapter.calls == ["status", "list"] and "slack" in events
+    assert "[서비스] 캘린더 접근 권한: 허용됨(전체 접근) · 캘린더 10개 보임\n" in log
+    assert "[경고]" not in log
+
+
+@pytest.mark.parametrize("calendars", [0, macos_calendar.NoCalendarsVisible()])
+def test_run_warns_when_full_access_shows_no_calendar(calendars, tmp_path):
+    code, log, events = run_service(lambda tz: FakeAdapter(status=GRANTED, calendars=calendars))
+    assert code == 0 and "slack" in events
+    assert "[서비스] 캘린더 접근 권한: 허용됨(전체 접근) · 캘린더 0개 보임\n" in log
+    assert f"[경고] {macos_calendar.NO_CALENDARS_VISIBLE_TEXT}" in log
+    assert log.index("캘린더 0개 보임") < log.index("[경고]")
+    # ``service status`` shows the newest calendar line as it is, count included.
+    path = tmp_path / "bot.log"
+    path.write_text(log, encoding="utf-8")
+    assert service.last_calendar_record(path) == ("2026-10-06 08:00:00", "허용됨(전체 접근) · 캘린더 0개 보임")
+
+
+def test_run_still_starts_when_the_calendars_cannot_be_counted():
+    code, log, events = run_service(lambda tz: FakeAdapter(calendars=RuntimeError("EKErrorDomain 3")))
+    assert code == 0 and "slack" in events
+    assert "캘린더 접근 권한: 허용됨(전체 접근) · 캘린더 수 확인 못 함 (RuntimeError: EKErrorDomain 3)" in log
 
 
 def test_run_logs_a_refused_permission_with_the_service_fix_and_continues():

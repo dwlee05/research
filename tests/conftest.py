@@ -4,6 +4,7 @@ import httpx
 import pytest
 
 from mungchi import briefing, config, version
+from mungchi.tools import macos_calendar
 
 MUNGCHI_ENV_VARS = (
     "MUNGCHI_MODEL",
@@ -76,8 +77,10 @@ def isolated_env(monkeypatch: pytest.MonkeyPatch, tmp_path):
     git is never run either: the running-version lookup sees no git (the
     package version) unless a test gives it a fake git. The morning
     briefing's greeting never reaches a model: without a ``greeting_generate``
-    of its own a test gets a template greeting.
+    of its own a test gets a template greeting. Each test starts without the
+    process-wide EventKit store (``macos_calendar.shared_event_store``).
     """
+    monkeypatch.setattr(macos_calendar, "_SHARED", None)
     for name in MUNGCHI_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("BRIEF_WEATHER", "off")

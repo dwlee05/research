@@ -8,11 +8,14 @@ Foundation objects that answer the same selectors PyObjC exposes.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import json
+import logging
 import subprocess
 import sys
 import threading
+import time
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -122,6 +125,7 @@ class FakeAdapter:
         self.calls: list[str] = []
         self.fetches: list[tuple] = []
         self.threads: set[str] = set()
+        self.required: list[list[str]] = []
 
     def authorization_status(self):
         self.calls.append("status")
@@ -134,11 +138,12 @@ class FakeAdapter:
         self.status = GRANTED if self.grant else DENIED
         return self.grant
 
-    def list_calendars(self):
+    def list_calendars(self, required=()):
         self.calls.append("list")
+        self.required.append(list(required))
         return [dict(c) for c in self.calendars]
 
-    def list_writable_calendars(self):
+    def list_writable_calendars(self, required=()):
         self.calls.append("writable")
         return [{**c, "is_default": i == 0} for i, c in enumerate(self.calendars) if c["name"] != "생일"]
 
@@ -300,7 +305,7 @@ def test_missing_pyobjc_on_a_mac_points_to_pip_install(monkeypatch):
 
 def test_calendar_app_errors_are_reported_not_raised():
     class Broken(FakeAdapter):
-        def list_calendars(self):
+        def list_calendars(self, required=()):
             raise RuntimeError("EKErrorDomain error 1")
 
     payload = run_mac(Broken())
@@ -579,17 +584,42 @@ class FakeEvent:
 
 
 class World:
-    """What macOS knows: the permission, the calendars, the events."""
+    """What macOS knows: the permission, the calendars, the events.
 
-    def __init__(self, status=0, modern=True, answer=True, respond=True, refresh_fails=False):
+    ``empty_reads``: how many calendar list reads (from now on) come back
+    empty, like the intermittent empty lists seen on the user's Mac.
+    """
+
+    def __init__(self, status=0, modern=True, answer=True, respond=True, empty_reads=0, reset_fails=False):
         self.status, self.modern, self.answer, self.respond = status, modern, answer, respond
-        self.refresh_fails = refresh_fails
+        self.empty_reads = empty_reads
+        self.reset_fails = reset_fails
         self.stores: list = []
         self.requests: list = []
         self.predicates: list = []
         self.refreshes: list = []
+        self.resets: list = []
+        self.calendar_reads = 0
         self.calendars: list = []
         self.events: list = []
+        # Concurrency check: EventKit calls running at the same time (must never exceed 1).
+        self.pause = 0.0
+        self.busy = 0
+        self.max_busy = 0
+        self._guard = threading.Lock()
+
+    @contextlib.contextmanager
+    def call(self):
+        with self._guard:
+            self.busy += 1
+            self.max_busy = max(self.max_busy, self.busy)
+        try:
+            if self.pause:
+                time.sleep(self.pause)
+            yield
+        finally:
+            with self._guard:
+                self.busy -= 1
 
 
 def fake_eventkit(world: World) -> SimpleNamespace:
@@ -601,15 +631,20 @@ def fake_eventkit(world: World) -> SimpleNamespace:
         def init(self):
             # Like EventKit: a store created before access was granted sees no calendars.
             self.sees_calendars = world.status == 3
-            # Like EventKit without a run loop: a store keeps what it saw when it was made.
+            # Like EventKit without a run loop: a store keeps what it saw until it is reset.
             self.calendars, self.events = list(world.calendars), list(world.events)
             world.stores.append(self)
             return self
 
+        def reset(self):
+            world.resets.append(self)
+            if world.reset_fails:
+                raise RuntimeError("daemon busy")
+            self.sees_calendars = world.status == 3
+            self.calendars, self.events = list(world.calendars), list(world.events)
+
         def refreshSourcesIfNecessary(self):
             world.refreshes.append(self)
-            if world.refresh_fails:
-                raise RuntimeError("daemon busy")
 
         @classmethod
         def authorizationStatusForEntityType_(cls, entity_type):
@@ -639,19 +674,25 @@ def fake_eventkit(world: World) -> SimpleNamespace:
 
         def calendarsForEntityType_(self, entity_type):
             assert entity_type == 0
-            return list(self.calendars) if self.sees_calendars else []
+            with world.call():
+                world.calendar_reads += 1
+                if world.empty_reads > 0:
+                    world.empty_reads -= 1
+                    return []
+                return list(self.calendars) if self.sees_calendars else []
 
         def predicateForEventsWithStartDate_endDate_calendars_(self, start, end, calendars):
             return (start, end, calendars)
 
         def eventsMatchingPredicate_(self, predicate):
-            world.predicates.append(predicate)
-            start, end, calendars = predicate
-            return [
-                e for e in self.events
-                if (calendars is None or e.calendar() in calendars)
-                and e.startDate().ts < end.ts and e.endDate().ts > start.ts
-            ]
+            with world.call():
+                world.predicates.append(predicate)
+                start, end, calendars = predicate
+                return [
+                    e for e in self.events
+                    if (calendars is None or e.calendar() in calendars)
+                    and e.startDate().ts < end.ts and e.endDate().ts > start.ts
+                ]
 
     return SimpleNamespace(
         EKEventStore=EKEventStore,
@@ -675,8 +716,29 @@ def fake_eventkit(world: World) -> SimpleNamespace:
 FOUNDATION = SimpleNamespace(NSDate=FakeNSDate)
 
 
-def real_adapter(world: World) -> EventKitCalendar:
-    return EventKitCalendar(SEOUL, eventkit=fake_eventkit(world), foundation=FOUNDATION, local_tz=SEOUL)
+def real_adapter(world: World, env=None, shared=None, sleep=None) -> EventKitCalendar:
+    """The real adapter on fake EventKit; a new fake module (so a new store holder) unless ``shared`` is given."""
+    eventkit = shared.eventkit if shared is not None else fake_eventkit(world)
+    return EventKitCalendar(
+        SEOUL, eventkit=eventkit, foundation=FOUNDATION, local_tz=SEOUL, env=env, shared=shared, sleep=sleep
+    )
+
+
+class Clock:
+    """A monotonic clock the test moves by hand."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+class Sleeps(list):
+    """Records the waits between retries instead of sleeping."""
+
+    def __call__(self, seconds):
+        self.append(seconds)
 
 
 @pytest.mark.parametrize("modern, expected_request", [(True, "full access"), (False, ("entity", 0))])
@@ -727,7 +789,8 @@ def test_fetch_events_converts_eventkit_objects():
         FakeEvent(None, at(6, 9), at(6, 10), family),
         FakeEvent("창 밖 일정", at(9, 9), at(9, 10), research),
     ]
-    adapter = real_adapter(world)
+    sleeps = Sleeps()
+    adapter = real_adapter(world, sleep=sleeps)
     assert adapter.list_calendars() == [
         {"name": "연구", "source": "iCloud"},
         {"name": "Work", "source": "Exchange"},
@@ -749,6 +812,7 @@ def test_fetch_events_converts_eventkit_objects():
     seen = len(world.predicates)
     assert adapter.fetch_events(at(5), at(7), names=["없음"]) == []
     assert len(world.predicates) == seen  # no predicate with nil calendars (= all) was made
+    assert len(sleeps) == macos_calendar.CALENDAR_RETRIES  # a named calendar that is missing is read again first
 
 
 def test_real_adapter_through_the_calendar_tool():
@@ -776,30 +840,177 @@ def china_world(**kwargs):
     return world, research, china
 
 
-def test_every_read_starts_on_a_new_store_so_a_removed_calendar_disappears():
-    """The bot is one long-lived process without a run loop: a store would never notice the removal."""
+def test_one_store_is_reset_so_a_removed_calendar_disappears():
+    """One long-lived store without a run loop: ``reset()`` before a read is what drops a removed calendar."""
     world, research, china = china_world()
-    adapter = real_adapter(world)
+    clock = Clock()
+    shared = macos_calendar.SharedEventStore(fake_eventkit(world), clock=clock)
+    adapter = real_adapter(world, shared=shared)
     assert {r["title"] for r in adapter.fetch_events(at(5), at(6))} == {"주간 랩미팅", "한로"}
-    first = world.stores[-1]
+    [store] = world.stores
 
     # The user removes the Chinese calendar in the Calendar app.
     world.calendars = [research]
     world.events = [e for e in world.events if e.calendar() is research]
-    assert china in first.calendarsForEntityType_(0)  # an old store still has it (the bug)
+    assert china in store.calendarsForEntityType_(0)  # the store still has it until it is reset
 
-    stores = len(world.stores)
+    # Reads in one burst share the store as it is (no reset within RESET_MIN_INTERVAL_SECONDS).
+    clock.now += macos_calendar.RESET_MIN_INTERVAL_SECONDS - 1
+    assert "한로" in {r["title"] for r in adapter.fetch_events(at(5), at(6))}
+    assert world.resets == []
+
+    clock.now += 1
     assert [r["title"] for r in adapter.fetch_events(at(5), at(6))] == ["주간 랩미팅"]
     assert adapter.list_calendars() == [{"name": "연구", "source": "iCloud"}]
     assert [c["name"] for c in adapter.calendar_overview(at(5), at(12))] == ["연구"]
-    assert len(world.stores) == stores + 3  # one new store per read
-    assert world.refreshes == world.stores[1:]  # each new store is asked to sync its accounts (not the initial one)
+    # Another adapter (the next tool call) on the same holder: still the same store.
+    clock.now += macos_calendar.RESET_MIN_INTERVAL_SECONDS
+    assert real_adapter(world, shared=shared).list_calendars() == [{"name": "연구", "source": "iCloud"}]
+    assert world.stores == [store] and world.resets == [store, store] and shared.created == 1
+    assert world.refreshes == []  # refreshSourcesIfNecessary is no longer called
 
 
-def test_reads_still_work_when_refresh_sources_fails():
-    world, _, _ = china_world(refresh_fails=True)
-    assert len(real_adapter(world).fetch_events(at(5), at(6))) == 2
-    assert len(world.refreshes) == 1
+def test_reads_still_work_when_reset_fails(caplog):
+    world, _, _ = china_world(reset_fails=True)
+    clock = Clock()
+    adapter = real_adapter(world, shared=macos_calendar.SharedEventStore(fake_eventkit(world), clock=clock))
+    assert len(adapter.fetch_events(at(5), at(6))) == 2
+    clock.now += macos_calendar.RESET_MIN_INTERVAL_SECONDS
+    with caplog.at_level(logging.WARNING, logger="mungchi.calendar"):
+        assert len(adapter.fetch_events(at(5), at(6))) == 2  # on the old cache
+    assert len(world.resets) == 1 and "캘린더 저장소를 새로 고치지 못했습니다: RuntimeError: daemon busy" in caplog.text
+
+
+def test_the_process_shares_one_store_holder_per_eventkit_module(monkeypatch):
+    world, _, _ = china_world()
+    eventkit = fake_eventkit(world)
+    monkeypatch.setattr(macos_calendar, "load_eventkit", lambda: (eventkit, FOUNDATION))
+    first, second = macos_calendar.default_adapter(SEOUL), macos_calendar.default_adapter(SEOUL)
+    assert first._shared is second._shared is macos_calendar.shared_event_store(eventkit)
+    first.list_calendars()
+    second.fetch_events(at(5), at(6))
+    assert len(world.stores) == 1
+    # Another EventKit module (a test's fake) gets a holder of its own.
+    assert macos_calendar.shared_event_store(fake_eventkit(world)) is not first._shared
+
+
+def test_concurrent_reads_from_worker_threads_use_one_store_one_at_a_time():
+    world, research, china = china_world()
+    world.pause = 0.002  # long enough for unlocked calls to overlap
+    shared = macos_calendar.SharedEventStore(fake_eventkit(world))
+    results: list = []
+    errors: list = []
+
+    def work(index):
+        try:
+            adapter = real_adapter(world, shared=shared)  # a new adapter per call, like the tools make
+            if index % 3 == 0:
+                results.append(len(adapter.list_calendars()))
+            elif index % 3 == 1:
+                results.append(len(adapter.fetch_events(at(5), at(6))))
+            else:
+                results.append(len(adapter.calendar_overview(at(5), at(6))))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=work, args=(i,)) for i in range(24)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    assert errors == [] and len(results) == 24 and set(results) == {2}
+    assert len(world.stores) == 1 and world.max_busy == 1  # never two EventKit calls at once
+
+
+# ---------------------------------------------------------------- the safety net: retries when calendars do not show
+
+
+def test_an_empty_calendar_list_is_read_again_after_a_reset(caplog):
+    world, _, _ = china_world(empty_reads=2)
+    sleeps = Sleeps()
+    adapter = real_adapter(world, sleep=sleeps)
+    with caplog.at_level(logging.WARNING, logger="mungchi.calendar"):
+        assert [c["name"] for c in adapter.list_calendars()] == ["연구", CHINA]
+    assert sleeps == [1.0, 1.0] and world.calendar_reads == 3
+    assert len(world.resets) == 2 and len(world.stores) == 1  # reset between attempts, same store
+    retries = [r for r in caplog.records if r.levelno == logging.WARNING and "다시 읽습니다" in r.getMessage()]
+    assert [r.getMessage() for r in retries] == [
+        "캘린더 목록을 다시 읽습니다 (1/3): 보이는 캘린더 0개",
+        "캘린더 목록을 다시 읽습니다 (2/3): 보이는 캘린더 0개",
+    ]
+
+
+def test_the_last_retry_uses_a_new_store():
+    world, _, _ = china_world(empty_reads=3)
+    sleeps = Sleeps()
+    assert len(real_adapter(world, sleep=sleeps).fetch_events(at(5), at(6))) == 2
+    assert sleeps == [1.0, 1.0, 1.0] and len(world.resets) == 2 and len(world.stores) == 2
+
+
+def test_a_missing_named_calendar_is_read_again_and_then_left_to_the_caller(caplog):
+    world, research, china = china_world()
+    sleeps = Sleeps()
+    adapter = real_adapter(world, sleep=sleeps)
+    with caplog.at_level(logging.WARNING, logger="mungchi.calendar"):
+        assert [c["name"] for c in adapter.list_calendars(required=["연구", "없는 캘린더"])] == ["연구", CHINA]
+    assert sleeps == [1.0, 1.0, 1.0]
+    assert "캘린더 목록을 다시 읽습니다 (1/3): 보이는 캘린더 2개, 안 보이는 캘린더 1개" in caplog.text
+    assert "3번 다시 읽어도 필요한 캘린더 1개가 보이지 않습니다 (보이는 캘린더 2개)" in caplog.text
+    # Present (any case, NFC): no retry at all.
+    sleeps.clear()
+    adapter.list_calendars(required=[unicodedata.normalize("NFD", "연구")])
+    assert sleeps == []
+
+
+def test_no_calendar_at_all_with_full_access_raises_no_calendars_visible(caplog):
+    world, _, _ = china_world(empty_reads=99)
+    sleeps = Sleeps()
+    adapter = real_adapter(world, sleep=sleeps)
+    with caplog.at_level(logging.WARNING, logger="mungchi.calendar"):
+        for read in (adapter.list_calendars, lambda: adapter.fetch_events(at(5), at(6))):
+            with pytest.raises(macos_calendar.NoCalendarsVisible) as caught:
+                read()
+            assert str(caught.value) == macos_calendar.NO_CALENDARS_VISIBLE_TEXT
+    assert "전체 접근인데 3번 다시 읽어도 캘린더가 하나도 보이지 않습니다" in caplog.text
+    # The diagnostic lists nothing instead (and says so itself).
+    assert adapter.calendar_overview(at(5), at(12)) == []
+    # Without full access an empty list is just that: no retry, no error.
+    for status in (0, 2, 4):
+        quiet = World(status=status, empty_reads=99)
+        sleeps.clear()
+        assert real_adapter(quiet, sleep=sleeps).list_calendars() == [] and sleeps == []
+
+
+def test_the_calendar_tool_reports_no_calendars_instead_of_no_events():
+    world, _, _ = china_world(empty_reads=99)
+    payload = run_schedule(
+        env={**ENV, "CALENDAR_EXCLUDE": CHINA}, now=CLOCK, platform="darwin",
+        adapter_factory=lambda tz: real_adapter(world, sleep=Sleeps()),
+    )
+    assert payload == {
+        "configured": True,
+        "ok": False,
+        "source": "macos",
+        "reason": "no_calendars_visible",
+        "error": macos_calendar.NO_CALENDARS_VISIBLE_TEXT,
+    }
+    assert "'비서실 고뭉치'" in payload["error"] and "'전체 접근'" in payload["error"] and "service restart" in payload["error"]
+    # Any adapter that lists no calendar with full access gets the same error, never "events: []".
+    assert run_mac(FakeAdapter(calendars=[]))["reason"] == "no_calendars_visible"
+
+
+def test_reads_succeed_after_the_retries():
+    world, _, _ = china_world(empty_reads=2)
+    payload = run_schedule(
+        env=ENV, now=CLOCK, platform="darwin", adapter_factory=lambda tz: real_adapter(world, sleep=Sleeps())
+    )
+    assert payload["ok"] is True and [e["title"] for e in payload["events"]] == ["한로", "주간 랩미팅"]
+
+
+def test_macos_calendars_names_are_required_when_listing():
+    adapter = FakeAdapter()
+    run_mac(adapter, {"MACOS_CALENDARS": "연구, Work"})
+    assert adapter.required == [["연구", "Work"]]
 
 
 def test_real_adapter_skips_excluded_calendars_in_reads():
@@ -917,6 +1128,20 @@ def test_setup_shows_the_filter_and_which_source_the_bot_reads():
     assert "[경고] MACOS_CALENDARS의 '없는 캘린더' 캘린더를" in out
     assert "오늘 (2026-10-05 월요일): 일정 1개\n    - 09:00–09:15 Standup [Work]\n" in out
     assert "[참고] 지금은 .env의 CALENDAR_ICS_URLS(ICS 주소)를 읽습니다" in out
+
+
+def test_setup_with_full_access_but_no_calendar_points_to_the_permission():
+    class Unseen(FakeAdapter):
+        def list_calendars(self, required=()):
+            raise macos_calendar.NoCalendarsVisible()
+
+    for adapter in (FakeAdapter(calendars=[]), Unseen()):
+        code, out = setup(adapter, {"MACOS_CALENDARS": "연구"})
+        assert code == 1 and f"[오류] {macos_calendar.NO_CALENDARS_VISIBLE_TEXT}" in out
+        assert "캘린더 0개" not in out
+    adapter = FakeAdapter()
+    setup(adapter, {"MACOS_CALENDARS": "연구"})
+    assert adapter.required[0] == ["연구"]  # listed with the names it should find
 
 
 def test_setup_off_mac_or_without_pyobjc():

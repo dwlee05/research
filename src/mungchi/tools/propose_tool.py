@@ -12,12 +12,15 @@ says "네" (``event_proposals``). The model only suggests a category.
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 from claude_agent_sdk import SdkMcpTool, ToolAnnotations
 
 from . import event_proposals
-from .common import MAX_RESULT_SIZE_CHARS, safe_error, tool_result
+from .common import MAX_RESULT_SIZE_CHARS, safe_error, scrub, tool_result
+
+log = logging.getLogger("mungchi.calendar")
 
 TOOL_NAME = "propose_calendar_events"
 
@@ -97,6 +100,13 @@ INPUT_SCHEMA: dict[str, Any] = {
 }
 
 
+def log_failure(payload: dict[str, Any]) -> None:
+    """A failed proposal at WARNING, so ``service logs`` shows why (error and errors, secrets scrubbed)."""
+    details = [str(payload.get("error") or "알 수 없는 오류")]
+    details += [str(problem) for problem in payload.get("errors") or []]
+    log.warning("%s 실패: %s", TOOL_NAME, scrub(" / ".join(" ".join(d.split()) for d in details)))
+
+
 def make_propose_calendar_events(conversation_key: str | None = None) -> SdkMcpTool[Any]:
     """A ``propose_calendar_events`` tool bound to one run's conversation key.
 
@@ -109,6 +119,8 @@ def make_propose_calendar_events(conversation_key: str | None = None) -> SdkMcpT
             payload = await asyncio.to_thread(event_proposals.run_propose, args, conversation_key)
         except Exception as exc:  # noqa: BLE001 - last line of defence
             payload = {"ok": False, "error": f"일정을 제안하지 못했어요: {safe_error(exc)}"}
+        if not payload.get("ok"):
+            log_failure(payload)
         return tool_result(payload)
 
     return SdkMcpTool(
